@@ -1,0 +1,9 @@
+.git
+runs/
+screenshots/
+data/
+browser-driver/node_modules/
+browser-driver/.chrome-profile/
+__pycache__/
+*.pyc
+.venv/

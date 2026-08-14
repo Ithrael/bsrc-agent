@@ -1,0 +1,4 @@
+{
+  "flag 提交需容器 running": "容器 stopped 状态下提交 flag 会被拒（correct:false），先 start 容器再提交同一 flag 立即 accepted（二进制不变、flag 不随启动变化）",
+  "JDWP 平台加固": "JDWP 端口（如 5005）的 VM 级命令正常，但所有 invoke 类命令（InvokeMethod/NewInstance/CreateString 用作参数）返回 INVALID_STRING（err 10）——JDWP RCE 路线在此靶场不可行，别在 JDWP 上死磕"
+}

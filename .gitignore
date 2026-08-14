@@ -1,0 +1,43 @@
+# 敏感配置
+.env
+*.ovpn
+
+# 大文件 / 构建产物
+*.tar.gz
+*.tgz
+*.tar
+
+# Python 运行时
+__pycache__/
+*.pyc
+.venv/
+
+# 运行产物 / 工作区
+runs/
+screenshots/
+work*/
+data/
+cb_bodies/
+e2-*/
+
+# 浏览器 / 工具产物（含登录态，不入库）
+.playwright-mcp/
+.reasonix/
+browser-driver/
+
+# 临时文件 / 状态
+NOTES.md
+STATE.md
+*.log
+
+# 散落解题脚本（非项目核心代码，留工作区）
+exfil.sh
+fire.py
+mysqlcli*.pl
+oa_brute*.php
+oa_diag.php
+cb_server.py
+fetch_image.sh
+fullscan.txt
+http_cb.log
+agent-*.txt

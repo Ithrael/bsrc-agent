@@ -1,0 +1,89 @@
+"""claude code 直接解题模式（CLAUDE_WORKER=1）测试：fake claude CLI 模拟 stream-json 输出，
+验证 prompt 打包、submit_flag.sh 生成、flag 双通道提交、解法落库、无输出超时判定。"""
+import json
+import time
+
+import pytest
+
+from agent import worker as worker_mod
+from agent.config import Config
+from agent.tsec_api import Challenge, TsecClient
+from agent.worker import Worker
+from tests.mock_server import TOKEN, make_server
+
+
+def _fake_claude(tmp_path, lines: list[str]) -> str:
+    """假 claude CLI：逐行输出 stream-json 事件后退出。"""
+    p = tmp_path / "fake-claude.sh"
+    p.write_text("#!/bin/bash\n" + "\n".join(f"echo '{l}'" for l in lines) + "\n")
+    p.chmod(0o755)
+    return str(p)
+
+
+@pytest.mark.asyncio
+async def test_claude_worker_solves_and_submits(tmp_path, monkeypatch):
+    """claude 输出流含 flag → 双通道提交成功、completed、解法落库、submit_flag.sh 生成。"""
+    srv = make_server()
+    host, port = srv.server_address
+    api = TsecClient(f"http://{host}:{port}", TOKEN)
+    ch = next(c for c in await api.list_challenges() if c.unique_code == "mock_web_01")
+    addrs = await api.start_challenge(ch.unique_code)
+
+    # 解法库重定向到 tmp_path，防污染真实 solutions.json
+    sol_path = tmp_path / "solutions.json"
+    sol_path.write_text("{}")
+    notes_path = tmp_path / "notes.json"
+    notes_path.write_text("{}")
+    monkeypatch.setattr(worker_mod, "solution_lib_path", lambda: str(sol_path))
+    monkeypatch.setattr(worker_mod, "notes_lib_path", lambda: str(notes_path))
+
+    cfg = Config()
+    cfg.claude_worker = True
+    cfg.harness_backend = _fake_claude(tmp_path, [
+        '{"type":"system","subtype":"init","session_id":"s1"}',
+        '{"type":"assistant","message":{"content":[{"type":"text","text":"shell 输出发现 flag{mock-1}"}]}}',
+        '{"type":"result","result":"solved mock_web_01"}',
+    ])
+    cfg.recon_boot = False
+    cfg.record_solutions = True
+
+    ws = tmp_path / "ws"
+    w = Worker(cfg, object(), api, ch, addrs, str(ws), deadline=time.monotonic() + 600)
+    res = await w.run()
+
+    assert res.completed
+    assert res.score == 100
+    assert res.flags == ["flag{mock-1}"]
+    assert res.reason == "all flags captured"
+    # submit_flag.sh 生成且内容含本题 unique_code
+    sh = (ws / "submit_flag.sh").read_text()
+    assert "mock_web_01" in sh and "BENCHMARK_TOKEN" in sh
+    # 解法落库：completed + note
+    lib = json.loads(sol_path.read_text())
+    assert lib["mock_web_01"]["completed"] is True
+    assert "solved mock_web_01" in lib["mock_web_01"]["note"]
+    await api.close()
+
+
+@pytest.mark.asyncio
+async def test_claude_worker_no_output(tmp_path):
+    """claude 无任何输出（模拟超时被杀）→ 不误报完成，解法不落库。"""
+    srv = make_server()
+    host, port = srv.server_address
+    api = TsecClient(f"http://{host}:{port}", TOKEN)
+    ch = next(c for c in await api.list_challenges() if c.unique_code == "mock_web_01")
+    addrs = await api.start_challenge(ch.unique_code)
+
+    cfg = Config()
+    cfg.claude_worker = True
+    cfg.harness_backend = _fake_claude(tmp_path, [])  # 无输出直接退出
+    cfg.recon_boot = False
+    cfg.record_solutions = False
+
+    w = Worker(cfg, object(), api, ch, addrs, str(tmp_path / "ws2"),
+               deadline=time.monotonic() + 600)
+    res = await w.run()
+    assert not res.completed
+    assert res.score == 0
+    assert res.reason == "claude no output (timeout?)"
+    await api.close()
