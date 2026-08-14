@@ -80,6 +80,9 @@ class Config:
     # 该模式下双 worker（pair_workers）自动禁用、harness 升级逻辑不再触发（claude 就是主体）。
     claude_worker: bool = field(default_factory=lambda: os.environ.get("CLAUDE_WORKER", "0") != "0")
     harness_timeout_min: int = field(default_factory=lambda: _int("HARNESS_TIMEOUT_MIN", 15))
+    # claude 单题 token 熔断（P1，run 9054 复盘 b-02 单会话烧 920 万 token 仍 0 解）：
+    # 0 = 按难度分层自动（easy 100万 / medium 300万 / hard 500万）；>0 = 固定值；<0 = 禁用
+    claude_token_budget: int = field(default_factory=lambda: _int("CLAUDE_TOKEN_BUDGET", 0))
     # 永不停止：只要平台还有未解出的题就一直跑，全部解开才退出。
     # 单题超时/失败一律临时放弃（状态落库）+ 轮转续跑，不再受全局时限提前掐断。
     # NEVER_STOP=0 时才退回「受 GLOBAL_BUDGET_MIN 约束」的有界模式（调试用）。

@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 
 log = logging.getLogger("harness")
 
@@ -30,9 +31,22 @@ class HarnessResult:
         self.output_text = ""   # 最终文本输出
         self.collected = ""     # 事件流全部文本（含 bash 输出，复盘落盘用）
         self.events = 0
+        self.total_tokens = 0   # assistant 步级 usage 累计（token 熔断用）
 
     def digest(self) -> str:
         return self.collected[-6000:]
+
+
+def _kill_proc(proc) -> None:
+    """杀整个进程组（claude 会 fork 子进程跑 bash 工具，只杀主进程会留孤儿占用 stdout 管道，
+    导致 proc.wait() 等到管道 EOF 才返回——实测 macOS 上多等 10s）。"""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
 
 
 def _claude_env(cfg) -> dict:
@@ -69,6 +83,10 @@ def _parse_jsonl(line: str, res: HarnessResult, on_text=None):
     except json.JSONDecodeError:
         return  # 非 JSON 行（zsh 噪音等）直接丢
     res.events += 1
+    # token 熔断统计：只累计 assistant 事件的步级 usage（result 事件是总量，重复计入会翻倍）
+    if ev.get("type") == "assistant":
+        u = (ev.get("message") or {}).get("usage") or ev.get("usage") or {}
+        res.total_tokens += int(u.get("input_tokens", 0) or 0) + int(u.get("output_tokens", 0) or 0)
     t = ev.get("type")
     item = ev.get("item") or {}
     if t == "item.completed" and item.get("text"):
@@ -85,10 +103,12 @@ def _parse_jsonl(line: str, res: HarnessResult, on_text=None):
 
 
 async def run_harness(cfg, prompt: str, cwd: str, timeout_s: int,
-                      on_text=None) -> HarnessResult:
+                      on_text=None, token_budget: int = 0) -> HarnessResult:
     """spawn 外部 agent CLI 跑一次攻坚。backend 支持：
     - "claude"：内置后端（ClawGod 版 claude code）
-    - 其他值：当作可执行脚本路径（测试/自定义后端用），参数只有 cwd。"""
+    - 其他值：当作可执行脚本路径（测试/自定义后端用），参数只有 cwd。
+    流式逐行读 stdout（原 communicate 一次性读完）：支持 token 熔断——
+    assistant 步级 usage 累计超 token_budget 就 kill（run 9054 复盘 b-02 单会话 920 万 token）。"""
     if cfg.harness_backend == "claude":
         env, cmd = _claude_env(cfg), _claude_cmd(cfg)
     else:
@@ -98,25 +118,34 @@ async def run_harness(cfg, prompt: str, cwd: str, timeout_s: int,
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-        cwd=cwd, env=env)
+        cwd=cwd, env=env, start_new_session=True)
     try:
-        assert proc.stdin
+        assert proc.stdin and proc.stdout
         proc.stdin.write(prompt.encode())
         await proc.stdin.drain()
         proc.stdin.close()
+
+        async def _read_loop():
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                _parse_jsonl(line.decode(errors="replace"), res, on_text)
+                if token_budget and res.total_tokens > token_budget:
+                    _kill_proc(proc)
+                    res.collected += "\n[HARNESS TOKEN BUDGET EXCEEDED]\n"
+                    log.warning("[harness] %s token 熔断（%d > %d）", cmd[0], res.total_tokens, token_budget)
+                    break
+
         try:
-            out = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+            await asyncio.wait_for(_read_loop(), timeout=timeout_s)
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+            _kill_proc(proc)
             res.collected += "\n[HARNESS TIMEOUT]\n"
             log.warning("[harness] %s 超时被杀（%ds）", cmd[0], timeout_s)
-            return res
-        text = (out[0] or b"").decode(errors="replace")
-        for line in text.splitlines():
-            _parse_jsonl(line, res, on_text)
+        await proc.wait()
     finally:
         if proc.returncode is None:
-            proc.kill()
-    log.info("[harness] 结束 rc=%s events=%d", proc.returncode, res.events)
+            _kill_proc(proc)
+    log.info("[harness] 结束 rc=%s events=%d tokens=%d", proc.returncode, res.events, res.total_tokens)
     return res

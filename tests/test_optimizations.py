@@ -43,9 +43,10 @@ def test_sanitize_keeps_relative_commands():
 
 # ---- 超时分级 ----
 
-def test_timeout_first_attempt_capped_at_60min():
+def test_timeout_first_attempt_hard_fast_fail():
+    """hard 首轮 20min 快速失败（P1，run 9054 复盘：40min 白耗，断点留 NOTES.md 进 retry 轮续跑）。"""
     w = _mk_worker(unique_code="b-02", flag_count=4, difficulty="hard")
-    assert w._scaled_timeout_s() == 40 * 60  # hard 单次 40min 封顶（run 8629 复盘：堵槽位）
+    assert w._scaled_timeout_s() == 20 * 60
 
 
 def test_timeout_extended_allows_long():
@@ -130,15 +131,15 @@ def test_priority_round1_unknown_boosted(monkeypatch):
 
 
 def test_timeout_round1_short_cap():
-    """ROUND=1 覆盖优先：无完整解法的题压到 20min（hard 30min）；有解法的复现题不受影响。"""
+    """ROUND=1 覆盖优先：无完整解法的题压到 20min（hard 首轮 20min 快速失败）；有解法的复现题不受影响。"""
     hard = _mk_worker(unique_code="b-02", flag_count=4, difficulty="hard")
     hard.cfg.round_num = 1
-    assert hard._scaled_timeout_s(has_completed_sol=False) == 30 * 60
+    assert hard._scaled_timeout_s(has_completed_sol=False) == 20 * 60
     easy = _mk_worker(unique_code="a-01", flag_count=1, difficulty="easy")
     easy.cfg.round_num = 1
     assert easy._scaled_timeout_s(has_completed_sol=False) == 20 * 60
-    # 有完整解法：ROUND=1 不额外压（run() 里另有 15min 复现封顶）；hard 仍受 40min 单次封顶
-    assert hard._scaled_timeout_s(has_completed_sol=True) == 40 * 60
+    # 有完整解法：ROUND=1 不额外压（run() 里另有 15min 复现封顶）；hard 首轮仍 20min 封顶
+    assert hard._scaled_timeout_s(has_completed_sol=True) == 20 * 60
 
 
 def test_state_append_dedup(tmp_path):

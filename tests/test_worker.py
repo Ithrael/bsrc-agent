@@ -164,3 +164,31 @@ async def test_chat_reraises_non_context_error():
     messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
     with pytest.raises(RuntimeError):
         await w._chat(messages, [])
+
+
+@pytest.mark.asyncio
+async def test_submit_cb_rejects_non_flag_format():
+    """P3：tsec{...} 等非 flag{...} 格式直接拒绝，不打平台；记入 tried 防重复尝试。"""
+    from agent.flagger import FlagSubmitter
+    calls = []
+
+    class _NoCall:
+        async def submit_flag(self, *a, **k):
+            calls.append(1)
+            raise RuntimeError("unreachable")
+
+    w = Worker.__new__(Worker)
+    w.submitter = FlagSubmitter("x-01", 1)
+    w.api = _NoCall()
+    from agent.tsec_api import Challenge
+    w.ch = Challenge.from_dict({"unique_code": "x-01", "description": "", "difficulty": "easy",
+                                "level": 1, "total_score": 100, "flag_count": 1,
+                                "correct_flag_count": 0, "is_completed": False,
+                                "container_status": "stopped", "container_addr": []})
+    r = await w._submit_cb("tsec{fake-guess}")
+    assert "格式拒绝" in r
+    assert calls == []                       # 平台未被调用
+    assert "tsec{fake-guess}" in w.submitter.tried
+    # flag{...} 格式通过校验（会尝试打平台，这里平台是 _NoCall → 验证走到了提交路径）
+    with pytest.raises(RuntimeError, match="unreachable"):
+        await w._submit_cb("flag{real-flag}")
