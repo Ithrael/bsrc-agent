@@ -65,7 +65,8 @@ async def test_run_harness_token_budget_kills(tmp_path):
     t0 = time.time()
     res = await run_harness(cfg, "p", str(tmp_path), 60, token_budget=200)
     elapsed = time.time() - t0
-    assert res.total_tokens == 300          # assistant 步级 usage 累计（含 cache_read）
+    # cache_read 按成本加权 1/10：每事件 100 + 4 + 10 = 114，两个 228
+    assert res.total_tokens == 228
     assert elapsed < 5, f"熔断未生效：{elapsed:.1f}s（预期 <5s，否则等到 sleep 10s 结束）"
     assert "TOKEN BUDGET" in res.collected
     assert res.output_text == ""            # result 事件没来得及输出

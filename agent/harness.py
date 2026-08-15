@@ -102,15 +102,14 @@ def _parse_jsonl(line: str, res: HarnessResult, on_text=None):
         return  # 非 JSON 行（zsh 噪音等）直接丢
     res.events += 1
     # token 熔断统计：只累计 assistant 事件的步级 usage（result 事件是总量，重复计入会翻倍）。
-    # cache_read/cache_creation 也计入：claude 每步重发 context，缓存读取是 token 成本大头
-    # （run 9222 复盘：b-01 分治线 16 分钟烧 988 万 token 未触发 300 万熔断——
-    # 平台口径含 cache_read，仅统计 input+output 低估约 4 倍）。
+    # 按成本加权：cache_read 是缓存命中重读，价格约 input 的 1/10——全额计入会虚高 5 倍
+    # 误杀正常题（run 9228 复盘：a-07 正常题 1.9 分钟被 300 万熔断误杀，cache_read 占 97%）。
     if ev.get("type") == "assistant":
         u = (ev.get("message") or {}).get("usage") or ev.get("usage") or {}
         res.total_tokens += (int(u.get("input_tokens", 0) or 0)
-                             + int(u.get("cache_read_input_tokens", 0) or 0)
                              + int(u.get("cache_creation_input_tokens", 0) or 0)
-                             + int(u.get("output_tokens", 0) or 0))
+                             + int(u.get("output_tokens", 0) or 0)
+                             + int(u.get("cache_read_input_tokens", 0) or 0) // 10)
     t = ev.get("type")
     item = ev.get("item") or {}
     if t == "item.completed" and item.get("text"):
