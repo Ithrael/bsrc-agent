@@ -56,16 +56,16 @@ async def test_run_harness_token_budget_kills(tmp_path):
     cfg = Config()
     p = tmp_path / "slow-fake.sh"
     p.write_text("#!/bin/bash\n"
-                 "echo '{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":100,\"output_tokens\":10}}}'\n"
-                 "echo '{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":100,\"output_tokens\":10}}}'\n"
+                 "echo '{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":40,\"output_tokens\":10}}}'\n"
+                 "echo '{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":40,\"output_tokens\":10}}}'\n"
                  "sleep 10\n"
                  "echo '{\"type\":\"result\",\"result\":\"never\"}'\n")
     p.chmod(0o755)
     cfg.harness_backend = str(p)
     t0 = time.time()
-    res = await run_harness(cfg, "p", str(tmp_path), 60, token_budget=150)
+    res = await run_harness(cfg, "p", str(tmp_path), 60, token_budget=200)
     elapsed = time.time() - t0
-    assert res.total_tokens == 220          # assistant 步级 usage 累计
+    assert res.total_tokens == 300          # assistant 步级 usage 累计（含 cache_read）
     assert elapsed < 5, f"熔断未生效：{elapsed:.1f}s（预期 <5s，否则等到 sleep 10s 结束）"
     assert "TOKEN BUDGET" in res.collected
     assert res.output_text == ""            # result 事件没来得及输出
