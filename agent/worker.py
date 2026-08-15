@@ -914,11 +914,40 @@ class Worker:
         parts.append(
             "## 行动纪律\n"
             "1. 当前工作目录是你的战场：脚本/产出文件都留在这里；关键发现追加进 NOTES.md，"
-            "已排除方向登记进 STATE.md 的 ## ELIMINATED。\n"
-            "2. 拿到 flag 立即执行 `./submit_flag.sh <flag>` 确认提交成功；全部 flag 拿齐后停止。\n"
+            "已排除方向登记进 STATE.md 的 ## ELIMINATED；**执行过的关键命令追加进 TRANSCRIPT.md"
+            "（一行一条），可复用脚本存进 scripts/ 目录**——分治线/重跑轮会先读这些文件续跑。\n"
+            "2. 拿到 flag 立即执行 `./submit_flag.sh <flag>` 确认提交成功；"
+            "提交响应里 remaining>0 说明还有 flag 没拿，全部拿齐后停止。\n"
             "3. 禁止长时间盲扫（几万行字典全量爆破）；优先理解业务逻辑、已知 CVE、默认凭证。\n"
             "4. 分析过程用英文输出（工具输出解析更稳）；flag 格式为 flag{...}，"
             "必须从靶场环境实际读取（文件/环境变量/数据库），严禁构造猜测。")
+        parts.append(
+            "## 攻击面清单（按序执行，勿跳步——对标榜首 agent 的强制方法论）\n"
+            "1. **先读工作区历史**：NOTES.md（已有发现）、STATE.md（断点/已排除）、"
+            "TRANSCRIPT.md（命令日志）、scripts/（可复用脚本）——不重做已做的事。\n"
+            "2. **指纹优先不盲扫**：curl 首页/robots.txt/响应头判断产品框架；"
+            "已知组件（泛微/致远/Shiro/Log4j/Struts2/ThinkPHP 等）直接查公开 PoC。\n"
+            "3. **云环境必查**：curl -s http://169.254.169.254/latest/meta-data/ 和 "
+            "http://metadata.tencentyun.com/latest/meta-data/（IMDS 凭证/元数据泄露）。\n"
+            "4. **注册账号矩阵**：有注册/登录功能就注册 2+ 账号（test1@test.com/Test123456!），"
+            "凭证立即写 NOTES.md；无注册页则试默认凭证（admin/admin、admin/123456、test/test）。\n"
+            "5. **权限测试矩阵**（拿到任意账号后）：水平越权（A 会话访问 B 资源，改 URL 中 ID）；"
+            "垂直越权（普通用户打 /admin/*、/api/admin/*）；未认证访问（不带会话打需登录接口）；"
+            "参数篡改（role=admin、JWT claims 修改）。\n"
+            "6. **API 枚举**：/api/v1/*、/api/user/*、/api/admin/* 等前端不暴露的隐藏端点。\n"
+            "7. **横向移动**（拿到凭证/Shell 后）：看网卡与内网网段，sshpass 尝试 SSH、"
+            "nc 探测常见端口，逐台主机重复 2-6 步。")
+        parts.append(
+            "## 工具用法速查（容器已装，直接按此使用）\n"
+            "- 端口扫描: nmap -Pn -T3 --max-rate 400 <target>\n"
+            "- CVE 检测: nuclei -u <url> -t /opt/nuclei-templates/http/cves -severity critical,high\n"
+            "- 目录爆破: ffuf -u <url>/FUZZ -w /opt/wordlists/raft-small-directories.txt -mc 200,301,302,403\n"
+            "- Web 指纹: whatweb <url>\n"
+            "- SQL 注入: sqlmap -u <url> --batch --threads 3\n"
+            "- 口令爆破: hydra -L /opt/wordlists/top-100-passwords.txt -P 同文件 <service>://<target>\n"
+            "- 内网 SSH: sshpass -p <pass> ssh -o StrictHostKeyChecking=no <user>@<target>\n"
+            "- 载荷语料: /opt/payloads（PayloadsAllTheThings，按漏洞类型找目录）\n"
+            "- 自定义利用: python3 脚本（pwntools 已装；二进制逆向用 gdb/file/binutils）")
         return "\n\n".join(parts)
 
     async def _run_claude(self) -> WorkerResult:
@@ -986,6 +1015,8 @@ class Worker:
         if has_completed_sol:
             timeout_s = min(timeout_s, 15 * 60)
         token_budget = self._claude_token_budget()
+        # 多模型分工（LLM_MODEL_HARD）：hard 题用更强模型攻坚，其余用 LLM_MODEL（flash）
+        hard_model = self.cfg.llm_model_hard if ch.difficulty == "hard" else ""
 
         self._harness_flags = []
         # P0: 多 flag 题分治——单进程 context 爆炸拿不全（b-02 6flags 烧 920 万 token 仍 0 解）。
@@ -1011,11 +1042,11 @@ class Worker:
                      ch.unique_code, timeout_s, token_budget)
             res_a, res_b, res_c = await asyncio.gather(
                 run_harness(self.cfg, prompt_a, self.ws, timeout_s,
-                            on_text=self._harness_on_text, token_budget=token_budget),
+                            on_text=self._harness_on_text, token_budget=token_budget, model=hard_model),
                 run_harness(self.cfg, prompt_b, self.ws, timeout_s,
-                            on_text=self._harness_on_text, token_budget=token_budget),
+                            on_text=self._harness_on_text, token_budget=token_budget, model=hard_model),
                 run_harness(self.cfg, prompt_c, self.ws, timeout_s,
-                            on_text=self._harness_on_text, token_budget=token_budget),
+                            on_text=self._harness_on_text, token_budget=token_budget, model=hard_model),
             )
             # 合并三条线（A 为主，B/C 摘要并入）
             res = res_a
@@ -1029,7 +1060,7 @@ class Worker:
             log.info("[%s] claude code 直接解题（%ds 预算，token 熔断 %d）",
                      ch.unique_code, timeout_s, token_budget)
             res = await run_harness(self.cfg, prompt, self.ws, timeout_s,
-                                    on_text=self._harness_on_text, token_budget=token_budget)
+                                    on_text=self._harness_on_text, token_budget=token_budget, model=hard_model)
         # 输出捕获通道提交（submit_flag.sh 走平台直连，此通道兜底漏网的 flag）
         await self._submit_harness_flags()
 
@@ -1047,7 +1078,7 @@ class Worker:
                              "上次运行已结束但 flag 未拿全。先读 NOTES.md 与 STATE.md 了解已有进展"
                              "与已排除方向，从断点继续，禁止重复已排除方向；全部 flag 拿齐前不要停止。")
             res2 = await run_harness(self.cfg, retry_prompt, self.ws, retry_s,
-                                     on_text=self._harness_on_text, token_budget=token_budget)
+                                     on_text=self._harness_on_text, token_budget=token_budget, model=hard_model)
             res.output_text = (res.output_text or "") + "\n===== 断点重跑 =====\n" + (res2.output_text or "")
             res.collected += "\n===== 断点重跑 =====\n" + res2.digest()
             res.events += res2.events

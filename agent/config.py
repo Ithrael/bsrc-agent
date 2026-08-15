@@ -50,6 +50,9 @@ class Config:
     llm_base_url: str = field(default_factory=lambda: os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/v1"))
     llm_api_key: str = field(default_factory=lambda: os.environ.get("LLM_API_KEY", ""))
     llm_model: str = field(default_factory=lambda: os.environ.get("LLM_MODEL", "deepseek-v4-flash"))
+    # 多模型分工（对标榜首 agent-hehua：flash 主力 + pro 攻坚 + 第三模型兜底）：
+    # 非空时 hard 难度的 claude 会话用该模型，其余难度用 llm_model
+    llm_model_hard: str = field(default_factory=lambda: os.environ.get("LLM_MODEL_HARD", ""))
     llm_max_tokens: int = field(default_factory=lambda: _int("LLM_MAX_TOKENS", 8192))
     llm_temperature: float = field(default_factory=lambda: float(os.environ.get("LLM_TEMPERATURE", "0.2")))
     llm_timeout_s: int = field(default_factory=lambda: _int("LLM_TIMEOUT_S", 300))

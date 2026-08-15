@@ -14,6 +14,7 @@ RUN (sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g; s|security.debian.
           nmap curl wget git netcat-openbsd dnsutils iputils-ping \
           procps file binutils gdb openssl ca-certificates \
           jq rlwrap sshpass proxychains4 socat tmux unzip ripgrep xz-utils \
+          sqlmap ffuf whatweb hydra \
           -o Acquire::Retries=8 -o Acquire::http::Timeout=180 \
       || apt-get install -y --no-install-recommends \
           nmap curl wget git netcat-openbsd dnsutils iputils-ping \

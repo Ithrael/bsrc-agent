@@ -67,17 +67,18 @@ async def _wait_proc(proc, timeout: float = 5.0) -> None:
         await asyncio.sleep(0.05)
 
 
-def _claude_env(cfg) -> dict:
+def _claude_env(cfg, model_override: str = "") -> dict:
     from .llm import anthropic_gateway_url
     env = dict(os.environ)
     env.pop("ANTHROPIC_API_KEY", None)  # 避免与 AUTH_TOKEN 冲突提示
     # Anthropic 端点从域名根派生（LLM_BASE_URL 自带 /v1，直接拼 /anthropic → 404）
     env["ANTHROPIC_BASE_URL"] = anthropic_gateway_url(cfg.llm_base_url)
     env["ANTHROPIC_AUTH_TOKEN"] = cfg.llm_api_key
-    env["ANTHROPIC_MODEL"] = cfg.llm_model
-    env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = cfg.llm_model
-    env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = cfg.llm_model
-    env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = cfg.llm_model
+    model = model_override or cfg.llm_model
+    env["ANTHROPIC_MODEL"] = model
+    env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = model
+    env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = model
+    env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = model
     env["SHELL"] = "/bin/bash"
     return env
 
@@ -126,14 +127,15 @@ def _parse_jsonl(line: str, res: HarnessResult, on_text=None):
 
 
 async def run_harness(cfg, prompt: str, cwd: str, timeout_s: int,
-                      on_text=None, token_budget: int = 0) -> HarnessResult:
+                      on_text=None, token_budget: int = 0, model: str = "") -> HarnessResult:
     """spawn 外部 agent CLI 跑一次攻坚。backend 支持：
     - "claude"：内置后端（ClawGod 版 claude code）
     - 其他值：当作可执行脚本路径（测试/自定义后端用），参数只有 cwd。
     流式逐行读 stdout（原 communicate 一次性读完）：支持 token 熔断——
-    assistant 步级 usage 累计超 token_budget 就 kill（run 9054 复盘 b-02 单会话 920 万 token）。"""
+    assistant 步级 usage 累计超 token_budget 就 kill（run 9054 复盘 b-02 单会话 920 万 token）。
+    model：非空时覆盖该会话的 ANTHROPIC_MODEL（多模型分工：hard 题用更强模型）。"""
     if cfg.harness_backend == "claude":
-        env, cmd = _claude_env(cfg), _claude_cmd(cfg)
+        env, cmd = _claude_env(cfg, model), _claude_cmd(cfg)
     else:
         env, cmd = dict(os.environ), [cfg.harness_backend]
     res = HarnessResult()
