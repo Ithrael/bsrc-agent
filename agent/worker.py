@@ -760,6 +760,15 @@ class Worker:
             if flag not in self._harness_flags:
                 self._harness_flags.append(flag)
 
+    async def _submit_harness_flags(self):
+        """输出捕获通道提交：submit_flag.sh 走平台直连，此通道兜底漏网的 flag。"""
+        for flag in self._harness_flags:
+            if self.submitter.should_try(flag):
+                r = await self._submit_cb(flag)
+                log.info("[%s] claude flag 提交 %s -> %s", self.ch.unique_code, flag[:60], r[:40])
+                if self.submitter.completed:
+                    break
+
     async def _run_harness_retry(self, messages: list[dict], timeout_s: int) -> str:
         """打包当前进展 → spawn 外部 agent CLI 重探索 → 提交捕获的 flag → 返回摘要。
 
@@ -964,35 +973,42 @@ class Worker:
         token_budget = self._claude_token_budget()
 
         self._harness_flags = []
-        # P0: 多 flag 题分治——单进程 context 爆炸拿不全（b-02 6flags 烧 920 万 token 仍 0 解），
-        # 双线并行：A 主攻入口面 / B 主攻内网横向，共享 NOTES.md 与提交通道。
+        # P0: 多 flag 题分治——单进程 context 爆炸拿不全（b-02 6flags 烧 920 万 token 仍 0 解）。
+        # 三线并行（run 9234 复盘：双线「入口/横向」在 b 系列 4flags 上仍拿不全，
+        # 加提权收尾线专攻其他线没拿到的面）：A 入口面 / B 内网横向 / C 提权与收尾，
+        # 共享 NOTES.md 认领进度与提交通道。
         if ch.flag_count >= 3 and not has_completed_sol:
-            role_a = (f"## 你的分工（双线并行攻坚）\n"
-                      f"本题共 {ch.flag_count} 面 flag。你主攻**入口面**：目标 Web 服务的初始突破"
-                      f"（默认凭证/已知 CVE/文件上传等），拿到入口 flag 立即 ./submit_flag.sh 提交，"
-                      f"然后继续向内网横向推进。另一条线也在攻本题，NOTES.md 里可能有它的发现，"
-                      f"开动前先读 NOTES.md 与 STATE.md 避免重复；你的发现也追加进 NOTES.md。")
-            role_b = (f"## 你的分工（双线并行攻坚）\n"
-                      f"本题共 {ch.flag_count} 面 flag。你主攻**内网横向与提权**：从已知凭证/入口出发，"
-                      f"枚举内网主机与服务，逐面拿 flag（每拿到立即 ./submit_flag.sh 提交）。"
-                      f"另一条线主攻入口面，NOTES.md 里可能有它的进展，"
-                      f"开动前先读 NOTES.md 与 STATE.md；你的发现也追加进 NOTES.md。")
+            common = (f"本题共 {ch.flag_count} 面 flag（多线并行攻坚）。"
+                      "开动前先读 NOTES.md 与 STATE.md：已拿到的 flag 与已排除方向不要重复攻；"
+                      "拿到一个 flag 立即 ./submit_flag.sh 提交，然后继续攻下一面；"
+                      "全部 flag 拿齐前不要停止。你的发现也追加进 NOTES.md。")
+            role_a = ("## 你的分工（三线并行攻坚）\n" + common
+                      + "\n你主攻**入口面**：目标 Web 服务的初始突破（默认凭证/已知 CVE/文件上传等）。")
+            role_b = ("## 你的分工（三线并行攻坚）\n" + common
+                      + "\n你主攻**内网横向**：从已知凭证/入口出发，枚举内网主机与服务，逐面拿 flag。")
+            role_c = ("## 你的分工（三线并行攻坚）\n" + common
+                      + "\n你主攻**提权与收尾**：对已发现的主机/服务做提权与深入利用，"
+                        "专攻其他线没拿到的面；若无现成断点，先做一轮自主侦察。")
             prompt_a = self._build_claude_prompt(ch, sol, notes, has_completed_sol, desc_hints, recon_report, role_a)
             prompt_b = self._build_claude_prompt(ch, sol, notes, has_completed_sol, desc_hints, recon_report, role_b)
-            log.info("[%s] claude code 直接解题（分治 2×%ds 预算，token 熔断 %d）",
+            prompt_c = self._build_claude_prompt(ch, sol, notes, has_completed_sol, desc_hints, recon_report, role_c)
+            log.info("[%s] claude code 直接解题（分治 3×%ds 预算，token 熔断 %d）",
                      ch.unique_code, timeout_s, token_budget)
-            res_a, res_b = await asyncio.gather(
+            res_a, res_b, res_c = await asyncio.gather(
                 run_harness(self.cfg, prompt_a, self.ws, timeout_s,
                             on_text=self._harness_on_text, token_budget=token_budget),
                 run_harness(self.cfg, prompt_b, self.ws, timeout_s,
                             on_text=self._harness_on_text, token_budget=token_budget),
+                run_harness(self.cfg, prompt_c, self.ws, timeout_s,
+                            on_text=self._harness_on_text, token_budget=token_budget),
             )
-            # 合并两条线（A 为主，B 摘要并入）
+            # 合并三条线（A 为主，B/C 摘要并入）
             res = res_a
-            res.output_text = (res_a.output_text or "") + "\n===== B 线 =====\n" + (res_b.output_text or "")
-            res.collected += "\n===== B 线 =====\n" + res_b.digest()
-            res.events += res_b.events
-            res.total_tokens += res_b.total_tokens
+            res.output_text = (res_a.output_text or "") + "\n===== B 线 =====\n" + (res_b.output_text or "") \
+                + "\n===== C 线 =====\n" + (res_c.output_text or "")
+            res.collected += "\n===== B 线 =====\n" + res_b.digest() + "\n===== C 线 =====\n" + res_c.digest()
+            res.events += res_b.events + res_c.events
+            res.total_tokens += res_b.total_tokens + res_c.total_tokens
         else:
             prompt = self._build_claude_prompt(ch, sol, notes, has_completed_sol, desc_hints, recon_report, "")
             log.info("[%s] claude code 直接解题（%ds 预算，token 熔断 %d）",
@@ -1000,12 +1016,28 @@ class Worker:
             res = await run_harness(self.cfg, prompt, self.ws, timeout_s,
                                     on_text=self._harness_on_text, token_budget=token_budget)
         # 输出捕获通道提交（submit_flag.sh 走平台直连，此通道兜底漏网的 flag）
-        for flag in self._harness_flags:
-            if self.submitter.should_try(flag):
-                r = await self._submit_cb(flag)
-                log.info("[%s] claude flag 提交 %s -> %s", ch.unique_code, flag[:60], r[:40])
-                if self.submitter.completed:
-                    break
+        await self._submit_harness_flags()
+
+        # 快速重跑（run 9234 复盘）：claude 提前退出（非超时/熔断）且 flag 没拿全——
+        # e1-03 2.8min 就退、a-05 12.7min 退，9054 里都能解出。当场断点重跑一次，
+        # 不等 retry 队列（排队到最后浪费空窗期）。
+        if (not self.submitter.completed
+                and (res.output_text or res.events)
+                and "[HARNESS TIMEOUT]" not in res.collected
+                and "[HARNESS TOKEN BUDGET" not in res.collected):
+            retry_s = max(300, timeout_s // 2)
+            log.info("[%s] claude 提前退出未拿全 flag，断点重跑一次（%ds）", ch.unique_code, retry_s)
+            retry_prompt = self._build_claude_prompt(ch, sol, notes, has_completed_sol, desc_hints, recon_report, "")
+            retry_prompt += ("\n\n## 断点续跑（第二次尝试）\n"
+                             "上次运行已结束但 flag 未拿全。先读 NOTES.md 与 STATE.md 了解已有进展"
+                             "与已排除方向，从断点继续，禁止重复已排除方向；全部 flag 拿齐前不要停止。")
+            res2 = await run_harness(self.cfg, retry_prompt, self.ws, retry_s,
+                                     on_text=self._harness_on_text, token_budget=token_budget)
+            res.output_text = (res.output_text or "") + "\n===== 断点重跑 =====\n" + (res2.output_text or "")
+            res.collected += "\n===== 断点重跑 =====\n" + res2.digest()
+            res.events += res2.events
+            res.total_tokens += res2.total_tokens
+            await self._submit_harness_flags()
 
         self.result.completed = self.submitter.completed
         self.result.score = self.submitter.score
@@ -1050,6 +1082,14 @@ class Worker:
                 os.replace(tmp, solution_lib_path())
                 log.info("[%s] claude 解法已记录（completed=%s, %s min）",
                          self.ch.unique_code, self.result.completed, entry["elapsed_min"])
+                # 解法 stdout 回传：托管容器跑完即销毁，solutions.json 取不出来；
+                # 把 note 分块打到 stdout（平台日志），赛后 grep SOLNOTE 重建解法库，
+                # 下一轮镜像打包复用（已解题直接复现，时间全留给难题）。
+                tag = "SOLVED" if self.result.completed else "PARTIAL"
+                note = entry.get("note") or ""
+                for i in range(0, len(note), 1000):
+                    log.info("[SOLNOTE] %s|%s|%d|%s",
+                             self.ch.unique_code, tag, i // 1000, note[i:i + 1000].replace("\n", " "))
         except OSError:
             pass
 

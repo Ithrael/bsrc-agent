@@ -67,7 +67,7 @@ async def test_claude_worker_solves_and_submits(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_claude_worker_pair_split(tmp_path, monkeypatch):
-    """P0 分治：flag≥3 的题 spawn 2 个 claude（入口面 + 内网横向），两条线 flag 合并提交。"""
+    """P0 分治：flag≥3 的题 spawn 3 个 claude（入口/横向/提权收尾），三条线 flag 合并提交。"""
     srv = make_server()
     srv.state.update({
         "mock_pair_01": {
@@ -96,14 +96,17 @@ async def test_claude_worker_pair_split(tmp_path, monkeypatch):
     monkeypatch.setattr(worker_mod, "solution_lib_path", lambda: str(sol_path))
     monkeypatch.setattr(worker_mod, "notes_lib_path", lambda: str(notes_path))
 
-    # fake claude：读 stdin 按分工提示区分 A/B 线，各自输出对应 flag；调用次数落盘
+    # fake claude：读 stdin 按分工提示区分 A/B/C 线，各自输出对应 flag；调用次数落盘
     calls_log = tmp_path / "calls.log"
     p = tmp_path / "fake-claude.sh"
     p.write_text("#!/bin/bash\n"
                  f"echo call >> {calls_log}\n"
                  "prompt=$(cat)\n"
-                 "if echo \"$prompt\" | grep -q '内网横向与提权'; then\n"
-                 "  echo '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"横向 flag{p-2} flag{p-3}\"}]}}'\n"
+                 "if echo \"$prompt\" | grep -q '提权与收尾'; then\n"
+                 "  echo '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"提权 flag{p-3}\"}]}}'\n"
+                 "  echo '{\"type\":\"result\",\"result\":\"C done\"}'\n"
+                 "elif echo \"$prompt\" | grep -q '内网横向'; then\n"
+                 "  echo '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"横向 flag{p-2}\"}]}}'\n"
                  "  echo '{\"type\":\"result\",\"result\":\"B done\"}'\n"
                  "else\n"
                  "  echo '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"入口 flag{p-1}\"}]}}'\n"
@@ -124,7 +127,53 @@ async def test_claude_worker_pair_split(tmp_path, monkeypatch):
     assert res.completed, res.reason
     assert res.score == 1200
     assert sorted(res.flags) == ["flag{p-1}", "flag{p-2}", "flag{p-3}"]
-    assert calls_log.read_text().strip().splitlines() == ["call", "call"]  # 两个进程都跑过
+    assert calls_log.read_text().strip().splitlines() == ["call", "call", "call"]  # 三个进程都跑过
+    await api.close()
+
+
+@pytest.mark.asyncio
+async def test_claude_worker_quick_retry(tmp_path, monkeypatch):
+    """快速重跑：claude 提前退出（有输出但没拿全 flag）→ 当场断点重跑一次拿全。"""
+    srv = make_server()
+    host, port = srv.server_address
+    api = TsecClient(f"http://{host}:{port}", TOKEN)
+    ch = next(c for c in await api.list_challenges() if c.unique_code == "mock_web_01")
+    addrs = await api.start_challenge(ch.unique_code)
+
+    sol_path = tmp_path / "solutions.json"
+    sol_path.write_text("{}")
+    notes_path = tmp_path / "notes.json"
+    notes_path.write_text("{}")
+    monkeypatch.setattr(worker_mod, "solution_lib_path", lambda: str(sol_path))
+    monkeypatch.setattr(worker_mod, "notes_lib_path", lambda: str(notes_path))
+
+    # 第 1 次调用：正常退出但没拿 flag（"gave up"）；第 2 次（重跑）：输出 flag
+    calls_log = tmp_path / "calls.log"
+    p = tmp_path / "fake-claude.sh"
+    p.write_text("#!/bin/bash\n"
+                 f"n=$(wc -l < {calls_log} 2>/dev/null || echo 0)\n"
+                 f"echo call >> {calls_log}\n"
+                 "if [ \"$n\" -eq 0 ]; then\n"
+                 "  echo '{\"type\":\"result\",\"result\":\"gave up\"}'\n"
+                 "else\n"
+                 "  echo '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"断点续跑拿到 flag{mock-1}\"}]}}'\n"
+                 "  echo '{\"type\":\"result\",\"result\":\"solved on retry\"}'\n"
+                 "fi\n")
+    p.chmod(0o755)
+
+    cfg = Config()
+    cfg.claude_worker = True
+    cfg.harness_backend = str(p)
+    cfg.recon_boot = False
+    cfg.record_solutions = False
+
+    w = Worker(cfg, object(), api, ch, addrs, str(tmp_path / "ws"),
+               deadline=time.monotonic() + 600)
+    res = await w.run()
+
+    assert res.completed, res.reason
+    assert res.flags == ["flag{mock-1}"]
+    assert calls_log.read_text().strip().splitlines() == ["call", "call"]  # 首跑 + 重跑
     await api.close()
 
 
