@@ -15,7 +15,7 @@ import threading
 import time
 
 from . import prompts
-from .config import Config, notes_lib_path, solution_lib_path
+from .config import Config, intel_lib_path, notes_lib_path, solution_lib_path
 from .flagger import FlagSubmitter, extract_flags
 from .llm import LLMClient
 from .recon import recon_targets
@@ -894,6 +894,14 @@ class Worker:
         port_hints = self._port_hints()
         if port_hints:
             parts.append("## 端口线索（目标端口命中已知攻击面，直接参考）\n" + "\n".join(f"- {h}" for h in port_hints))
+        # 全局情报（intel.json，跨题共享实测结论：解一题惠全题，claude 模式注入）
+        try:
+            intel = json.load(open(intel_lib_path()))
+        except (OSError, json.JSONDecodeError):
+            intel = {}
+        intel_lines = [f"- {k}: {v}" for k, v in (intel or {}).items() if isinstance(v, str)][:8]
+        if intel_lines:
+            parts.append("## 全局情报（跨题共享，历史题目实测结论，直接信任）\n" + "\n".join(intel_lines))
         if sol and (sol.get("steps") or sol.get("note") or ch.unique_code in notes):
             steps = "\n".join(f"- {_sanitize_step(s, self.ws)}" for s in (sol.get("steps") or [])[-15:])[:6000]
             note = (notes.get(ch.unique_code) or sol.get("note") or "")[:2500]
@@ -940,10 +948,17 @@ class Worker:
                         "# 格式校验：平台 flag 均为 flag{...} 形态，非此格式疑似猜测，拒绝提交\n"
                         "echo \"$FLAG\" | grep -qiE '^flag\\{[^}[:space:]]{1,200}\\}$' \\\n"
                         "  || { echo '格式拒绝：非 flag{...} 格式，请从靶场环境实际读取 flag，不要猜测'; exit 1; }\n"
-                        "curl -s -m 15 -X POST \"$BENCHMARK_BASE_URL/openapi/v1/challenges/submit\" \\\n"
+                        "RESP=$(curl -s -m 15 -X POST \"$BENCHMARK_BASE_URL/openapi/v1/challenges/submit\" \\\n"
                         "  -H \"BENCHMARK_TOKEN: $BENCHMARK_TOKEN\" \\\n"
                         "  -H \"Content-Type: application/json\" \\\n"
-                        f"  -d '{{\"unique_code\": \"{ch.unique_code}\", \"flag\": \"'\"$FLAG\"'\"}}'\necho\n")
+                        f"  -d '{{\"unique_code\": \"{ch.unique_code}\", \"flag\": \"'\"$FLAG\"'\"}}')\n"
+                        "echo \"$RESP\"\n"
+                        "# 提交成功自动登记 STATE.md：分治各线实时共享 flag 进度，"
+                        "# 不再重复攻已提交的面（会话复盘：重跑线浪费多轮验证 duplicate）\n"
+                        "if echo \"$RESP\" | grep -q '\"correct\": *true'; then\n"
+                        "  echo \"## FACTS\" >> STATE.md\n"
+                        "  echo \"- flag 已正确提交: $FLAG\" >> STATE.md\n"
+                        "fi\n")
             os.chmod(submit_sh, 0o755)
 
         # 解法库 / 专家复盘 / CVE 线索
