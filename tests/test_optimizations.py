@@ -13,6 +13,7 @@ def _mk_worker(**ch_fields):
     w = Worker.__new__(Worker)
     w.cfg = cfg
     w.allow_extended = ch_fields.pop("allow_extended", False)
+    w.first_attempt = ch_fields.pop("first_attempt", True)
     fields = {"unique_code": "a-01", "flag_count": 1,
               "total_score": 500, "difficulty": "easy"}
     fields.update(ch_fields)
@@ -49,9 +50,10 @@ def test_timeout_first_attempt_hard_fast_fail():
     assert w._scaled_timeout_s() == 20 * 60
 
 
-def test_timeout_extended_allows_long():
-    w = _mk_worker(unique_code="b-02", flag_count=4, difficulty="hard", allow_extended=True)
-    assert w._scaled_timeout_s() == 40 * 60  # hard 40min 封顶（extended 也封，快速轮转）
+def test_timeout_retry_hard_40min():
+    """retry 轮（first_attempt=False）hard 给足 40min 攻坚（run 9054 复盘 a-16 retry 轮解出）。"""
+    w = _mk_worker(unique_code="b-02", flag_count=4, difficulty="hard", first_attempt=False)
+    assert w._scaled_timeout_s() == 40 * 60
 
 
 def test_timeout_easy_below_cap():

@@ -169,7 +169,8 @@ class Scheduler:
     def _on_task_done(self, t: asyncio.Task):
         self._live -= 1
 
-    async def _run_one(self, ch: Challenge, allow_extended: bool = False):
+    async def _run_one(self, ch: Challenge, allow_extended: bool = False,
+                       first_attempt: bool = True):
         code = ch.unique_code
         async with self._sem:
             ws = os.path.join(self.run_dir, code)
@@ -242,7 +243,7 @@ class Scheduler:
                 await self._run_paired(ch, addrs, ws, allow_extended)
                 return
             worker = Worker(self.cfg, self.llm, self.api, ch, addrs, ws, self.deadline,
-                            allow_extended=allow_extended)
+                            allow_extended=allow_extended, first_attempt=first_attempt)
             self.active_workers[code] = [worker]
             try:
                 res = await worker.run()
@@ -560,10 +561,12 @@ class Scheduler:
                 skipped = 0
                 n = self._attempts.get(ch.unique_code, 0)
                 self._attempts[ch.unique_code] = n + 1
-                # 第二轮（ROUND=2）不设熔断：所有题给足长超时（跳过首轮 60min 封顶），
-                # 首轮 retry（n>0）仍放长。
+                # first_attempt 与 allow_extended 解耦（run 9054/9222 复盘）：ROUND=2 下
+                # allow_extended 恒 True 导致「首轮快速失败」完全失效（b-01 首轮 120min 堵槽）。
+                # first_attempt=n==0 决定「首轮限长超时快速轮转」，retry 轮（n>0）给足长超时。
                 allow_extended = n > 0 or self.cfg.round_num >= 2
-                t = asyncio.create_task(self._run_one(ch, allow_extended=allow_extended))
+                t = asyncio.create_task(self._run_one(ch, allow_extended=allow_extended,
+                                                      first_attempt=(n == 0)))
                 self._live += 1
                 tasks.add(t)
                 t.add_done_callback(tasks.discard)

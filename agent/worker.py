@@ -267,6 +267,7 @@ class Worker:
     def __init__(self, cfg: Config, llm: LLMClient, api: TsecClient,
                  challenge: Challenge, addrs: list[str], workspace: str,
                  deadline: float, allow_extended: bool = False,
+                 first_attempt: bool = True,
                  submitter: FlagSubmitter | None = None,
                  notes_path: str | None = None,
                  state_path: str | None = None,
@@ -286,6 +287,9 @@ class Worker:
         self.ws = workspace
         self.deadline = deadline  # 全局截止时间（monotonic）
         self.allow_extended = allow_extended  # retry 轮允许长超时（首轮封顶 60min 防堵槽位）
+        # first_attempt 与 allow_extended 解耦（run 9222 复盘）：ROUND=2 下 allow_extended 恒 True，
+        # 首轮快速失败必须单独按尝试次数判断（scheduler 传 n==0）
+        self.first_attempt = first_attempt
         self.started = time.monotonic()
         self.result = WorkerResult()
         # 双 worker 模式：submitter/notes_path/state_path 共享，role_extra 分工提示
@@ -454,8 +458,9 @@ class Worker:
 
     def _scaled_timeout_s(self, has_completed_sol: bool = False) -> int:
         """按难度定 base（以 CHALLENGE_TIMEOUT_MIN 为 medium 基准派生），多 flag 题按比例放宽，上限 150 分钟。
-        首轮尝试封顶 60 分钟：从未解出的题（如 b-02）不能一次占 150 分钟堵死 3 个槽位，
-        超时后部分进展落库、进 retry 队列，重试轮（allow_extended）再给足时间。
+        首轮尝试（first_attempt）限长快速轮转：hard 20min、其他 60min 封顶——run 9054 复盘
+        a-16/c-02 首轮 40min 白耗、run 9222 复盘 b-01 首轮 120min 堵槽位；断点留 NOTES.md
+        后进 retry 轮（first_attempt=False）再给足时间攻坚（hard 40min，其余 150min 上限）。
         ROUND=1 覆盖优先：无完整解法的题再压到 20min（hard 30min）——两轮赛制下第 1 轮
         的任务是全题过手留解法，不是死磕一道。
         复盘：run 7947 中 5 道 hard 题全部死于 30min 超时；easy 题历史 2-8 分钟即解出。"""
@@ -463,10 +468,8 @@ class Worker:
         base = {"easy": max(10, m * 2 // 3), "medium": m, "hard": m * 3 // 2}.get(self.ch.difficulty, m)
         minutes = min(base * max(1, self.ch.flag_count), 150)
         if self.ch.difficulty == "hard":
-            # hard 多阶段题快速失败：首轮 20min 封顶（run 9054 复盘 a-16/c-02 首轮 40min 白耗，
-            # 断点留 NOTES.md 后进 retry 轮更快续跑）；retry 轮（allow_extended）再给 40min 攻坚。
-            minutes = min(minutes, 20 if not self.allow_extended else 40)
-        if not self.allow_extended:
+            minutes = min(minutes, 20 if self.first_attempt else 40)
+        elif self.first_attempt:
             minutes = min(minutes, 60)
         if self.cfg.round_num == 1 and not has_completed_sol:
             minutes = min(minutes, 30 if self.ch.difficulty == "hard" else 20)

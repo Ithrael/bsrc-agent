@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import signal
+import time
 
 log = logging.getLogger("harness")
 
@@ -38,15 +39,32 @@ class HarnessResult:
 
 
 def _kill_proc(proc) -> None:
-    """杀整个进程组（claude 会 fork 子进程跑 bash 工具，只杀主进程会留孤儿占用 stdout 管道，
-    导致 proc.wait() 等到管道 EOF 才返回——实测 macOS 上多等 10s）。"""
+    """杀整个进程组（claude 会 fork 子进程跑 bash 工具，只杀主进程会留孤儿占用 stdout 管道）。
+    macOS 内核竞态：killpg 与子进程 fork 的窗口可能漏杀孤儿，循环补刀 3 次直到组消失。"""
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return
+    for _ in range(3):
         try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            return
+        time.sleep(0.05)
+        try:
+            os.killpg(pgid, 0)  # 探测：组还在（含刚 fork 的漏网孤儿）就再杀一轮
+        except (ProcessLookupError, PermissionError, OSError):
+            return
+
+
+async def _wait_proc(proc, timeout: float = 5.0) -> None:
+    """等进程退出但不依赖 stdout 管道 EOF：killpg 竞态漏杀的孤儿持有管道时
+    proc.wait() 会阻塞到孤儿退出（实测 10s+），这里轮询 returncode（child watcher
+    在进程退出时即设置，不等管道），最多 timeout 秒。"""
+    for _ in range(int(timeout / 0.05)):
+        if proc.returncode is not None:
+            return
+        await asyncio.sleep(0.05)
 
 
 def _claude_env(cfg) -> dict:
@@ -124,8 +142,10 @@ async def run_harness(cfg, prompt: str, cwd: str, timeout_s: int,
         proc.stdin.write(prompt.encode())
         await proc.stdin.drain()
         proc.stdin.close()
+        killed = False
 
         async def _read_loop():
+            nonlocal killed
             while True:
                 line = await proc.stdout.readline()
                 if not line:
@@ -133,6 +153,7 @@ async def run_harness(cfg, prompt: str, cwd: str, timeout_s: int,
                 _parse_jsonl(line.decode(errors="replace"), res, on_text)
                 if token_budget and res.total_tokens > token_budget:
                     _kill_proc(proc)
+                    killed = True
                     res.collected += "\n[HARNESS TOKEN BUDGET EXCEEDED]\n"
                     log.warning("[harness] %s token 熔断（%d > %d）", cmd[0], res.total_tokens, token_budget)
                     break
@@ -141,9 +162,13 @@ async def run_harness(cfg, prompt: str, cwd: str, timeout_s: int,
             await asyncio.wait_for(_read_loop(), timeout=timeout_s)
         except asyncio.TimeoutError:
             _kill_proc(proc)
+            killed = True
             res.collected += "\n[HARNESS TIMEOUT]\n"
             log.warning("[harness] %s 超时被杀（%ds）", cmd[0], timeout_s)
-        await proc.wait()
+        if killed:
+            await _wait_proc(proc)
+        else:
+            await proc.wait()
     finally:
         if proc.returncode is None:
             _kill_proc(proc)
