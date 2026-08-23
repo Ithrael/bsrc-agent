@@ -14,11 +14,11 @@ class FakeLLM:
     """无状态：从 system prompt 抓题目代码，echo 该题全部 mock flag（真实 LLMClient 也是无状态的）。"""
 
     FLAGS = {
-        "mock_web_01": ["flag{mock-1}"],
-        "mock_bin_01": ["flag{mock-a}", "flag{mock-b}"],
-        "mock_web_02": ["flag{mock-2}"],
-        "mock_web_03": ["flag{mock-3}"],
-        "mock_pair_01": ["flag{p-1}", "flag{p-2}", "flag{p-3}"],
+        "mock_web_01": ["flag{mock_flag_01}"],
+        "mock_bin_01": ["flag{mock_flag_2a}", "flag{mock_flag_2b}"],
+        "mock_web_02": ["flag{mock_flag_02}"],
+        "mock_web_03": ["flag{mock_flag_03}"],
+        "mock_pair_01": ["flag{p_line_01}", "flag{p_line_02}", "flag{p_line_03}"],
     }
 
     def __init__(self):
@@ -88,23 +88,22 @@ def _extra_challenge(code: str, flag: str, score: int = 100) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_auto_concurrency_converges(tmp_path):
-    """超配场景：MAX_CONCURRENT=10 > 平台实际上限 2。
+async def test_fixed_concurrency_no_convergence(tmp_path):
+    """并发写死：409 不降级（run 10048 复盘 effective_max 收敛致后半程单线程）。
 
-    旧逻辑 11 次 409 判死会把排队中的题随机废掉；现在应：
-    effective_max 收敛到 2、所有题最终都跑完（无一判死）、start 调用次数有界（无疯狂轮询）。
+    409 时题轮转队尾 + 冷却重试；所有题最终都跑完（无一判死）；
+    start 调用次数有界（冷却机制防空转）。
     """
     srv = make_server(instance_limit=2)
     srv.state.update({
-        "mock_web_02": _extra_challenge("mock_web_02", "flag{mock-2}"),
-        "mock_web_03": _extra_challenge("mock_web_03", "flag{mock-3}"),
+        "mock_web_02": _extra_challenge("mock_web_02", "flag{mock_flag_02}"),
+        "mock_web_03": _extra_challenge("mock_web_03", "flag{mock_flag_03}"),
     })
     host, port = srv.server_address
     api = TsecClient(f"http://{host}:{port}", TOKEN)
     cfg = Config()
     cfg.challenge_timeout_min = 5
-    cfg.max_concurrent = 10
-    cfg.auto_concurrency = True
+    cfg.max_concurrent = 3
     cfg.recon_boot = False
     cfg.record_solutions = False
     sched = Scheduler(cfg, FakeLLM(), api, str(tmp_path))
@@ -112,7 +111,7 @@ async def test_auto_concurrency_converges(tmp_path):
     sched.start_backoff_s = 1  # 缩短 409 冷却，加速测试
     done = await sched.run()
     try:
-        assert sched.effective_max == 2, f"应收敛到平台上限 2，实际 {sched.effective_max}"
+        assert sched.effective_max == 3, f"并发写死不降级，实际 {sched.effective_max}"
         assert len(done) == 4, done
         assert all(v["completed"] for v in done.values()), done
         assert srv.start_calls < 30, f"start 调用应有界，实际 {srv.start_calls}"
@@ -137,7 +136,7 @@ async def test_paired_workers(tmp_path):
             "is_completed": False,
             "container_status": "stopped",
             "container_addr": [],
-            "_flags": ["flag{p-1}", "flag{p-2}", "flag{p-3}"],
+            "_flags": ["flag{p_line_01}", "flag{p_line_02}", "flag{p_line_03}"],
         },
     })
     host, port = srv.server_address
@@ -185,7 +184,7 @@ async def test_no_pair_when_solution_exists(tmp_path):
             "is_completed": False,
             "container_status": "stopped",
             "container_addr": [],
-            "_flags": ["flag{p-1}", "flag{p-2}", "flag{p-3}"],
+            "_flags": ["flag{p_line_01}", "flag{p_line_02}", "flag{p_line_03}"],
         },
     })
     host, port = srv.server_address

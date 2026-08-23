@@ -21,7 +21,7 @@ class FakeLLM:
         if self.n == 1:
             return {"role": "assistant", "content": "先侦察", "tool_calls": [{
                 "id": "c1", "type": "function",
-                "function": {"name": "shell", "arguments": json.dumps({"command": "echo 得到 flag{mock-1} 了"})},
+                "function": {"name": "shell", "arguments": json.dumps({"command": "echo 得到 flag{mock_flag_01} 了"})},
             }]}
         return {"role": "assistant", "content": "做完了", "tool_calls": [{
             "id": "c2", "type": "function",
@@ -46,7 +46,7 @@ async def test_worker_auto_capture_and_finish(tmp_path):
     res = await w.run()
     assert res.completed
     assert res.score == 100
-    assert res.flags == ["flag{mock-1}"]
+    assert res.flags == ["flag{mock_flag_01}"]
     await api.close()
 
 
@@ -168,7 +168,7 @@ async def test_chat_reraises_non_context_error():
 
 @pytest.mark.asyncio
 async def test_submit_cb_rejects_non_flag_format():
-    """P3：tsec{...} 等非 flag{...} 格式直接拒绝，不打平台；记入 tried 防重复尝试。"""
+    """P3：tsec{...}/占位符/含标点垃圾直接拒绝，不打平台；UUID 与 leetspeak 两形态放行。"""
     from agent.flagger import FlagSubmitter
     calls = []
 
@@ -185,10 +185,16 @@ async def test_submit_cb_rejects_non_flag_format():
                                 "level": 1, "total_score": 100, "flag_count": 1,
                                 "correct_flag_count": 0, "is_completed": False,
                                 "container_status": "stopped", "container_addr": []})
-    r = await w._submit_cb("tsec{fake-guess}")
-    assert "格式拒绝" in r
-    assert calls == []                       # 平台未被调用
-    assert "tsec{fake-guess}" in w.submitter.tried
-    # flag{...} 格式通过校验（会尝试打平台，这里平台是 _NoCall → 验证走到了提交路径）
+    # 非 flag 前缀 / 占位符 / 含标点垃圾（10585 复盘 LLM 解不出时的瞎编）全部拒绝
+    for bad in ("tsec{fake-guess}", "flag{...}", "flag{,.txt}", "flag{hexhex...}"):
+        r = await w._submit_cb(bad)
+        assert "格式拒绝" in r, bad
+        assert calls == []                       # 平台未被调用
+        assert bad.strip() in w.submitter.tried
+    # UUID 形态（主流）与 leetspeak 形态（f 系列二进制题）通过校验，
+    # 会尝试打平台（这里平台是 _NoCall → 验证走到了提交路径）
     with pytest.raises(RuntimeError, match="unreachable"):
-        await w._submit_cb("flag{real-flag}")
+        await w._submit_cb("flag{509672c2-5854-47ff-bbab-da37ecd3472f}")
+    calls.clear()
+    with pytest.raises(RuntimeError, match="unreachable"):
+        await w._submit_cb("flag{x73a_f31st3l_k3y_5ch3d_fr0m_fw}")

@@ -136,7 +136,7 @@ async def test_worker_harness_upgrade_submits_flag(tmp_path):
     cfg.record_solutions = False
     cfg.harness_enabled = True
     cfg.harness_backend = _fake_backend(tmp_path, [
-        '{"type":"item.completed","item":{"text":"拿到 flag{mock-1} 了"}}',
+        '{"type":"item.completed","item":{"text":"拿到 flag{mock_flag_01} 了"}}',
     ])
     w = Worker(cfg, NoFlagLLM(), api, ch, addrs, str(tmp_path / "mock_web_01"),
                deadline=time.monotonic() + 600)
@@ -144,7 +144,7 @@ async def test_worker_harness_upgrade_submits_flag(tmp_path):
     res = await w.run()
     assert res.completed, res.reason
     assert res.score == 100
-    assert res.flags == ["flag{mock-1}"]
+    assert res.flags == ["flag{mock_flag_01}"]
     # harness 复盘落盘
     assert (tmp_path / "mock_web_01" / "harness-transcript.jsonl").exists()
     await api.close()

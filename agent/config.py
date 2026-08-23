@@ -40,6 +40,35 @@ def intel_lib_path() -> str:
     return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "intel.json")
 
 
+def read_intel() -> dict:
+    """读全局情报：intel.json（人工维护 dict）+ intel.json.new（agent 运行中追加的
+    JSONL 行，claude 用 bash echo 追加 JSON 行最稳，写坏单行不影响其他）。"""
+    import json as _json
+    out: dict = {}
+    try:
+        with open(intel_lib_path()) as f:
+            d = _json.load(f)
+            if isinstance(d, dict):
+                out.update(d)
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(intel_lib_path() + ".new") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = _json.loads(line)
+                    if isinstance(d, dict):
+                        out.update(d)
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return out
+
+
 @dataclass
 class Config:
     # 平台接入
@@ -53,20 +82,26 @@ class Config:
     # 多模型分工（对标榜首 agent-hehua：flash 主力 + pro 攻坚 + 第三模型兜底）：
     # 非空时 hard 难度的 claude 会话用该模型，其余难度用 llm_model
     llm_model_hard: str = field(default_factory=lambda: os.environ.get("LLM_MODEL_HARD", ""))
+    # hard 会话 effort（思考预算）：默认 max（run 10048 hard 题 20min 0 分复盘——
+    # 深度不够在瞎转）；置空关闭。easy/medium 不用（flash 秒解，省时省钱）。
+    claude_hard_effort: str = field(default_factory=lambda: os.environ.get("CLAUDE_HARD_EFFORT", "max"))
     llm_max_tokens: int = field(default_factory=lambda: _int("LLM_MAX_TOKENS", 8192))
     llm_temperature: float = field(default_factory=lambda: float(os.environ.get("LLM_TEMPERATURE", "0.2")))
     llm_timeout_s: int = field(default_factory=lambda: _int("LLM_TIMEOUT_S", 300))
 
     # 调度
-    # MAX_CONCURRENT 是并发探测上限（非写死值）：AUTO_CONCURRENCY=1 时按平台
-    # start 409 invalid_state（实例数达上限）自动收敛到平台实际允许的并发数。
-    max_concurrent: int = field(default_factory=lambda: _int("MAX_CONCURRENT", 10))
-    auto_concurrency: bool = field(default_factory=lambda: os.environ.get("AUTO_CONCURRENCY", "1") != "0")
+    # MAX_CONCURRENT 写死为平台上限 3（run 10048 复盘：409 自适应收敛只降不升致
+    # 后半程单线程——并发不降级，题轮转队尾等槽位，槽位空出立即补位）。
+    max_concurrent: int = field(default_factory=lambda: _int("MAX_CONCURRENT", 3))
+    # Agent 级并发与平台题目槽位分离：3 道题各跑 8 条思考线时最多 24 个 Claude，
+    # semaphore 上限 24（对标榜首 Cairn 24 路：小会话高并行是差距所在）。
+    # 网关若限流可下调（429 重试会自动退避）；调度器只在 semaphore 层排队，不影响题目槽位占满。
+    max_agent_concurrent: int = field(default_factory=lambda: _int("MAX_AGENT_CONCURRENT", 24))
     # 双 worker 并行：总分≥1000 且 flag≥3 且无完整解法的大题，1 容器 2 条思考线
     # （共享 NOTES.md 与 flag 进度，worker-A 主攻入口面 / worker-B 主攻内网横向）
     pair_workers: bool = field(default_factory=lambda: os.environ.get("PAIR_WORKERS", "1") != "0")
-    # 轮次模式：ROUND=1 覆盖优先（无解法记录的题优先、单题限时 20min/hard 30min、
-    # 不配双 worker，把解法留给第 2 轮）；ROUND=2 收割（expected_value + 解法库加权 + 双 worker 攻坚）。
+    # 轮次模式：ROUND=1 覆盖优先（短时过手并留断点、不配双 worker）；
+    # ROUND=2 收割（按完整解题数/墙钟时间 + 解法库 + 双线/三线攻坚）。
     round_num: int = field(default_factory=lambda: _int("ROUND", 2))
 
     # harness 攻坚：外部 agent CLI（claude code + ClawGod patch）接手难题。
@@ -84,8 +119,8 @@ class Config:
     claude_worker: bool = field(default_factory=lambda: os.environ.get("CLAUDE_WORKER", "0") != "0")
     harness_timeout_min: int = field(default_factory=lambda: _int("HARNESS_TIMEOUT_MIN", 15))
     # claude 单题 token 熔断（P1，run 9054 复盘 b-02 单会话烧 920 万 token 仍 0 解）：
-    # 0 = 按难度分层自动（easy 100万 / medium 300万 / hard 500万）；>0 = 固定值；<0 = 禁用
-    claude_token_budget: int = field(default_factory=lambda: _int("CLAUDE_TOKEN_BUDGET", 0))
+    # 0 = 按难度分层自动；>0 = 固定值；<0 = 禁用。6 小时最大解题数量模式默认不熔断。
+    claude_token_budget: int = field(default_factory=lambda: _int("CLAUDE_TOKEN_BUDGET", -1))
     # 永不停止：只要平台还有未解出的题就一直跑，全部解开才退出。
     # 单题超时/失败一律临时放弃（状态落库）+ 轮转续跑，不再受全局时限提前掐断。
     # NEVER_STOP=0 时才退回「受 GLOBAL_BUDGET_MIN 约束」的有界模式（调试用）。
@@ -99,9 +134,9 @@ class Config:
     round1_token_budget: int = field(default_factory=lambda: _int("ROUND1_TOKEN_BUDGET", 200_000))
     retry_unsolved: bool = field(default_factory=lambda: os.environ.get("RETRY_UNSOLVED", "1") != "0")
 
-    # hint 策略：never / stuck / free
-    hint_policy: str = field(default_factory=lambda: os.environ.get("HINT_POLICY", "stuck"))
-    hint_after_min: int = field(default_factory=lambda: _int("HINT_AFTER_MIN", 12))
+    # hint 策略：never / stuck / free。6 小时目标是最大化解题数量，默认直接使用提示。
+    hint_policy: str = field(default_factory=lambda: os.environ.get("HINT_POLICY", "free"))
+    hint_after_min: int = field(default_factory=lambda: _int("HINT_AFTER_MIN", 8))
 
     # Cairn 式 explore 切片（run 8900 复盘：单题 30min 长循环死磕 0 分题是最大失分源）：
     # 单段最长分钟数，段边界强制收尾（已确认发现写 NOTES/STATE，模拟 conclude 语义）。
@@ -140,4 +175,8 @@ class Config:
             errs.append("LLM_API_KEY 未设置")
         if self.hint_policy not in ("never", "stuck", "free"):
             errs.append(f"HINT_POLICY 非法: {self.hint_policy}")
+        if self.max_concurrent < 1:
+            errs.append("MAX_CONCURRENT 必须 >= 1")
+        if self.max_agent_concurrent < 1:
+            errs.append("MAX_AGENT_CONCURRENT 必须 >= 1")
         return errs

@@ -7,3 +7,4 @@ browser-driver/.chrome-profile/
 __pycache__/
 *.pyc
 .venv/
+*.tar.gz

@@ -14,6 +14,7 @@ def _mk_worker(**ch_fields):
     w.cfg = cfg
     w.allow_extended = ch_fields.pop("allow_extended", False)
     w.first_attempt = ch_fields.pop("first_attempt", True)
+    w.attempt = ch_fields.pop("attempt", 0)
     fields = {"unique_code": "a-01", "flag_count": 1,
               "total_score": 500, "difficulty": "easy"}
     fields.update(ch_fields)
@@ -45,28 +46,35 @@ def test_sanitize_keeps_relative_commands():
 # ---- 超时分级 ----
 
 def test_timeout_first_attempt_hard_fast_fail():
-    """hard 首轮 20min 快速失败（P1，run 9054 复盘：40min 白耗，断点留 NOTES.md 进 retry 轮续跑）。"""
-    w = _mk_worker(unique_code="b-02", flag_count=4, difficulty="hard")
+    """hard 首轮 20min（step 碎片化 v0：短会话+蒸馏接力，轮转快上下文短）。"""
+    w = _mk_worker(unique_code="b-02", flag_count=4, difficulty="hard", attempt=0)
     assert w._scaled_timeout_s() == 20 * 60
 
 
 def test_timeout_retry_hard_40min():
-    """retry 轮（first_attempt=False）hard 给足 40min 攻坚（run 9054 复盘 a-16 retry 轮解出）。"""
-    w = _mk_worker(unique_code="b-02", flag_count=4, difficulty="hard", first_attempt=False)
-    assert w._scaled_timeout_s() == 40 * 60
+    """hard retry 轮（attempt≥1）统一 25min（碎片化后不再逐次加长）。"""
+    w = _mk_worker(unique_code="b-02", flag_count=4, difficulty="hard", attempt=1)
+    assert w._scaled_timeout_s() == 25 * 60
+
+
+def test_timeout_hard_third_round_90min():
+    """hard 第 3 次及以后尝试同样 25min。"""
+    w = _mk_worker(unique_code="b-02", flag_count=4, difficulty="hard", attempt=2)
+    assert w._scaled_timeout_s() == 25 * 60
 
 
 def test_timeout_easy_below_cap():
+    """easy 首轮 8min（AePis 复盘：easy/medium 全扫 <2h，首轮快速轮转）。"""
     w = _mk_worker(unique_code="a-01", flag_count=1, difficulty="easy")
-    assert w._scaled_timeout_s() == 20 * 60
+    assert w._scaled_timeout_s() == 8 * 60
 
 
-def test_completed_sol_timeout_cap_15min():
-    """有完整解法的复现题：run() 把超时压到 15min（快速失败，把时间留给新题）。"""
-    base = _mk_worker(unique_code="a-01", flag_count=1, difficulty="easy")._scaled_timeout_s()
-    assert min(base, 15 * 60) == 15 * 60
-    hard_base = _mk_worker(unique_code="b-01", flag_count=4, difficulty="hard")._scaled_timeout_s()
-    assert min(hard_base, 15 * 60) == 15 * 60  # hard 复现题同样封顶
+def test_completed_sol_timeout_cap():
+    """有完整解法的复现题快速止损：单 flag 5min，多 flag 10min。"""
+    easy = _mk_worker(unique_code="a-01", flag_count=1, difficulty="easy")
+    assert easy._scaled_timeout_s(has_completed_sol=True) == 5 * 60
+    hard = _mk_worker(unique_code="b-01", flag_count=4, difficulty="hard")
+    assert hard._scaled_timeout_s(has_completed_sol=True) == 10 * 60
 
 
 # ---- token 估算 ----
@@ -108,7 +116,7 @@ def test_priority_known_completed_hard_is_boosted(monkeypatch):
     hard = _ch("b-01", score=1200, difficulty="hard", flags=4)
     easy = _ch("a-02", score=500, difficulty="easy")
     # known hard: 1200/25*3 = 144 > easy: 500/4 = 125
-    assert _priority(hard) < _priority(easy)  # 负值越小越优先
+    assert _priority(hard) < _priority(easy)  # 已有完整解法优先复现
 
 
 def test_priority_partial_boosted(monkeypatch):
@@ -116,32 +124,31 @@ def test_priority_partial_boosted(monkeypatch):
     monkeypatch.setattr(sched, "_LIB", {"b-02": {"partial": True}})
     partial = _ch("b-02", score=1200, difficulty="hard", flags=4)
     unknown_easy = _ch("a-02", score=500, difficulty="easy")
-    # partial hard: 1200/25*2 = 96 < unknown easy: 125 —— 注意：easy 仍优先是合理的
-    assert _priority(partial) < _priority(_ch("a-02", score=300, difficulty="easy"))
-    assert _priority(partial) > _priority(unknown_easy)
+    # 题数目标：只剩一面的题优先于 partial 多 flag 题，不再按分值押注大题。
+    assert _priority(unknown_easy) < _priority(partial)
+    assert _priority(_ch("a-02", score=300, difficulty="easy")) < _priority(partial)
 
 
 def test_priority_round1_unknown_boosted(monkeypatch):
-    """ROUND=1 覆盖优先：没碰过的题 ×5，压过 completed 复现题（解法留给第 2 轮收割）。"""
+    """ROUND=1 覆盖优先：没碰过的题压过 completed 复现题。"""
     import agent.scheduler as sched
     monkeypatch.setattr(sched, "_LIB", {"b-01": {"completed": True}})
-    known = _ch("b-01", score=1200, difficulty="hard", flags=4)   # 1200/25*3 = 144
-    unknown = _ch("a-02", score=500, difficulty="easy")           # 500/4*5 = 625
+    known = _ch("b-01", score=1200, difficulty="hard", flags=4)
+    unknown = _ch("a-02", score=500, difficulty="easy")
     assert _priority(unknown, round_num=1) < _priority(known, round_num=1)
     # ROUND=2 行为不变：completed 复现题仍优先
     assert _priority(known, round_num=2) < _priority(unknown, round_num=2)
 
 
 def test_timeout_round1_short_cap():
-    """ROUND=1 覆盖优先：无完整解法的题压到 20min（hard 首轮 20min 快速失败）；有解法的复现题不受影响。"""
+    """ROUND=1 仍沿用快速轮转预算；完整解法题走更短复现预算。"""
     hard = _mk_worker(unique_code="b-02", flag_count=4, difficulty="hard")
     hard.cfg.round_num = 1
     assert hard._scaled_timeout_s(has_completed_sol=False) == 20 * 60
     easy = _mk_worker(unique_code="a-01", flag_count=1, difficulty="easy")
     easy.cfg.round_num = 1
-    assert easy._scaled_timeout_s(has_completed_sol=False) == 20 * 60
-    # 有完整解法：ROUND=1 不额外压（run() 里另有 15min 复现封顶）；hard 首轮仍 20min 封顶
-    assert hard._scaled_timeout_s(has_completed_sol=True) == 20 * 60
+    assert easy._scaled_timeout_s(has_completed_sol=False) == 8 * 60
+    assert hard._scaled_timeout_s(has_completed_sol=True) == 10 * 60
 
 
 def test_state_append_dedup(tmp_path):

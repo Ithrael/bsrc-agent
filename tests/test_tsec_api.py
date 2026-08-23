@@ -30,11 +30,11 @@ async def test_list_start_submit_close(client):
     wrong = await client.submit_flag("mock_web_01", "flag{nope}")
     assert not wrong.correct
 
-    ok = await client.submit_flag("mock_web_01", "flag{mock-1}")
+    ok = await client.submit_flag("mock_web_01", "flag{mock_flag_01}")
     assert ok.correct and ok.awarded == 100
 
     with pytest.raises(ApiError) as ei:
-        await client.submit_flag("mock_web_01", "flag{mock-1}")
+        await client.submit_flag("mock_web_01", "flag{mock_flag_01}")
     assert ei.value.code == "duplicate"
 
     with pytest.raises(ApiError) as ei2:

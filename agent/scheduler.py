@@ -1,7 +1,7 @@
-"""调度器：3 并发槽位 + 优先级队列 + 全局时限。
+"""调度器：3 个题目槽位 + Agent 并发上限 + 优先级队列 + 全局时限。
 
-选题启发式：expected_value = total_score / 预估耗时（easy 4min / medium 10min / hard 25min），
-多 flag 题按剩余 flag 比例折算剩余价值。未解出的题在队列尾重排一次（retry）。
+选题目标是完整解出题数/墙钟时间：优先已知解法和只剩一面 flag 的题，
+再处理新单 flag，最后轮转 hard/多 flag 大题。未解出的题在队列尾重排（retry）。
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from .worker import Worker, WorkerResult
 log = logging.getLogger("scheduler")
 
 _EST_MIN = {"easy": 4, "medium": 10, "hard": 25}
+_PLATFORM_MAX_CONCURRENT = 3
 
 # 解法库（solutions.json）：completed=上轮已解出（快速锁分）；partial=上轮有断点（尽早续跑）
 _LIB: dict[str, dict] = {}
@@ -41,32 +42,40 @@ def _reload_lib():
         pass
 
 
+def _challenge_completed(ch: Challenge) -> bool:
+    """平台布尔字段与计数字段任一确认全通即可，防止状态快照短暂不同步。"""
+    return ch.is_completed or (
+        ch.flag_count > 0 and ch.correct_flag_count >= ch.flag_count
+    )
+
+
 def _priority(ch: Challenge, round_num: int = 2) -> float:
-    info = _LIB.get(ch.unique_code)
+    """按「完整解出题目数 / 墙钟时间」排序，而不是按分值排序。
+
+    多 flag 题只有全部 flag 都拿到才增加一道已解题，因此剩余一面应显著
+    优先于全新的多 flag 大题；同一档内 easy/medium/hard 依次尝试。
+    """
+    info = _LIB.get(ch.unique_code) or {}
+    difficulty_rank = {"easy": 0, "medium": 1, "hard": 2}.get(ch.difficulty, 3)
     est = _EST_MIN.get(ch.difficulty, 12)
-    # 有真实解题时长（completed 题）：用实际耗时校准预估，elapsed 越短期望越高
-    if info and info.get("completed") and info.get("elapsed_min"):
+    if info.get("elapsed_min"):
         est = max(1.0, float(info["elapsed_min"]))
-    elif not info:
-        # 无解法记录的题（现场解）：多 flag 题实际耗时≈flag×单题（run 8629 复盘：
-        # b 系列各占 120-150min 堵死槽位），放大 est 让单 flag 低分题优先拿稳分。
-        # completed/partial 题不放大（有解法/断点可快速复现，保持原加成）。
-        est *= max(1, ch.flag_count)
-    remaining_ratio = ch.remaining_flags / max(1, ch.flag_count)
-    v = ch.total_score * remaining_ratio / est
-    if info:
-        if info.get("completed"):
-            # 已有完整解法：全部大幅优先快速锁分——含 hard。
-            # 复盘：b-01 有解法库后 6.4 分钟拿满 1200 分，押后 hard 是纯亏。
-            v *= 3.0
-        elif info.get("partial"):
-            # 有上轮断点：尽早续跑（b-02 这类 1200 分大题曾拿 600 分，续跑期望高）
-            v *= 2.0
-    elif round_num == 1:
-        # ROUND=1 覆盖优先：没碰过的题最优先（解法留给第 2 轮收割）。
-        # 两轮赛制下第 1 轮的首要目标是全题过手 + 收割解题方向，不是分数。
-        v *= 5.0
-    return -v  # 大者优先
+
+    remaining = ch.remaining_flags
+    if info.get("completed"):
+        rank = 0                         # 已知解法：优先快速复现
+    elif info.get("partial") and remaining <= 1:
+        rank = 1                         # 断点只剩最后一面：最高命中率
+    elif remaining <= 1:
+        rank = 2 + difficulty_rank      # 新的单 flag 题：优先解题数量
+    elif info.get("partial"):
+        rank = 5 + difficulty_rank      # 有断点但仍多面
+    else:
+        rank = 8 + difficulty_rank      # 全新多 flag 题最后处理
+
+    if round_num == 1 and not info:
+        rank -= 10                       # 保留 ROUND=1 的全题覆盖语义
+    return rank * 1000 + est
 
 
 class Scheduler:
@@ -85,14 +94,18 @@ class Scheduler:
         self.retry_queue: list[Challenge] = []
         self.done: dict[str, dict] = {}
         self.running: dict[str, asyncio.Task] = {}
-        self._sem = asyncio.Semaphore(cfg.max_concurrent)
+        # 平台题目槽位硬上限为 3；即使环境变量误填更大，也不能把 start 打爆。
+        self.effective_max = min(_PLATFORM_MAX_CONCURRENT, max(1, cfg.max_concurrent))
+        self._sem = asyncio.Semaphore(self.effective_max)
+        # challenge 槽位与 Claude Agent 槽位分离：最多 3 题、默认最多 9 条思考线。
+        self._agent_sem = asyncio.Semaphore(cfg.max_agent_concurrent)
         self._start_attempts: dict[str, int] = {}   # start 接口 invalid_state 重试计数
         self._attempts: dict[str, int] = {}         # 选题尝试次数（0=首轮限长超时，≥1=retry 放长）
         self._last_start_ts = 0.0                   # start 限速时间戳
         self.active_workers: dict[str, Worker] = {}
         self._watchdog_stop = False
-        # 自适应并发：MAX_CONCURRENT 只是探测上限，start 409 时收敛到平台实际上限
-        self.effective_max = cfg.max_concurrent
+        # 并发写死 3（平台同时最多 3 题）：409 不降级，题轮转队尾等槽位（run 10048
+        # 复盘：409 收敛只降不升致后半程单线程，吞吐损失 2/3——宁可轮转不可塌缩）
         self._live = 0                              # 运行中的 _run_one 任务数（含 start 中的）
         self._start_backoff: dict[str, float] = {}  # 409 轮转的题 -> 可重试时间戳
         self._task_finished = False  # 平台任务已结束（start/close 报 already finished）时置位停止空转
@@ -120,11 +133,25 @@ class Scheduler:
                     continue
                 if addrs:
                     if addrs != workers[0].addrs:
-                        log.warning("[watchdog] %s 新地址 %s（旧 %s），写入 NOTES.md", code, addrs, workers[0].addrs)
+                        old_addrs = list(workers[0].addrs)
+                        log.warning("[watchdog] %s 新地址 %s（旧 %s），写入 NOTES.md/STATE.md",
+                                    code, addrs, old_addrs)
+                        # 地址记录行只写新地址（旧地址换行写）：worker 的 _rotation_notice
+                        # 按行解析"最后记录的目标"，混写旧地址会导致重复告警
                         try:
                             with open(workers[0].notes_path, "a") as f:
-                                f.write(f"\n\n[watchdog] 容器已重启，新地址: {', '.join(addrs)}（旧地址已失效）\n")
+                                f.write(f"\n\n[watchdog] 容器已轮换，新地址: {', '.join(addrs)}\n"
+                                        f"（旧地址 {', '.join(old_addrs)} 已失效：旧登录态/cookie/"
+                                        "后台任务/半成品连接作废。按 NOTES.md 恢复已发现凭据与路径，"
+                                        "对新地址快速重验入口后从断点继续，禁止从头全量侦察。）\n")
                         except OSError:
+                            pass
+                        try:
+                            with open(workers[0].state_path, "a") as f:
+                                f.write("## FACTS\n"
+                                        f"- 容器已轮换: 当前目标 {', '.join(addrs)}"
+                                        f"（旧 {', '.join(old_addrs)} 已失效，登录态需重建）\n")
+                        except (OSError, AttributeError):
                             pass
                     for w in workers:
                         w.addrs = addrs
@@ -169,69 +196,85 @@ class Scheduler:
     def _on_task_done(self, t: asyncio.Task):
         self._live -= 1
 
+    async def _close_safely(self, code: str) -> None:
+        """close + 失败重试一次：实例泄漏会占平台槽位（3 上限写死，泄漏=槽位永久少一个）。"""
+        try:
+            await self.api.close_challenge(code)
+            return
+        except ApiError as e:
+            log.warning("[%s] close 失败: %s", code, e)
+        await asyncio.sleep(2)
+        try:
+            await self.api.close_challenge(code)
+        except ApiError as e2:
+            log.warning("[%s] close 重试仍失败: %s", code, e2)
+
+    async def _start_flow(self, ch: Challenge) -> tuple[list[str], bool]:
+        """启动流程：复用存活容器 → start → 等待就绪。返回 (addrs, requeued)。
+        requeued=True 表示题已轮转队尾（409/start 失败/平台结束），调用方直接 return。
+        调用方用 8min 保险丝包裹：run 10048 复盘 bctf-05/08 卡在启动阶段 40+ 分钟堵槽。"""
+        code = ch.unique_code
+        # 先查是否已有活体容器可复用（重跑/平台残留时避免重复 start）
+        addrs: list[str] = []
+        try:
+            for c in await self._refresh():
+                if c.unique_code == code and c.container_status == "available" and c.container_addr:
+                    addrs = c.container_addr
+                    log.info("[%s] 复用存活容器: %s", code, ", ".join(addrs))
+                    break
+        except ApiError:
+            pass
+        if not addrs:
+            try:
+                addrs = await self._start_throttled(code)
+            except ApiError as e:
+                if e.code == CODE_INVALID_STATE:
+                    if "already finished" in (e.message or ""):
+                        # 平台任务已结束（时限到/平台终止，run 8629 复盘 16:37 发生）：
+                        # 之后所有 start 都会 409，停止空转并退出调度。
+                        log.warning("[%s] 平台任务已结束：%s，停止调度", code, e.message)
+                        self._task_finished = True
+                        self.pending.clear()
+                        return [], True
+                    # 平台活跃实例数达上限（api-doc §5.2）。并发写死 3（不降级，
+                    # run 10048 复盘 effective_max 收敛致后半程单线程、吞吐损失 2/3）：
+                    # 题轮转队尾 + 冷却重试，槽位空出后立即补位。
+                    log.warning("[%s] start 409（平台实例满，3 槽位），题轮转队尾", code)
+                    self._start_backoff[code] = time.monotonic() + self.start_backoff_s
+                    self.pending.append(ch)
+                    return [], True
+                log.error("[%s] start 失败: %s", code, e)
+                self.done[code] = {"completed": False, "score": 0, "reason": f"start: {e.code}"}
+                # 永不停止：start 失败也冷却轮转重试，不终局丢弃（防单题永久丢失）。
+                self._start_backoff[code] = time.monotonic() + self.start_backoff_s
+                self.pending.append(ch)
+                return [], True
+        if not addrs:
+            addrs = await self._wait_available(code)
+        return addrs, False
+
     async def _run_one(self, ch: Challenge, allow_extended: bool = False,
-                       first_attempt: bool = True):
+                       first_attempt: bool = True, attempt: int = 0):
         code = ch.unique_code
         async with self._sem:
             ws = os.path.join(self.run_dir, code)
             os.makedirs(ws, exist_ok=True)
             log.info("[%s] 启动容器 (%s/%d 分, %d flags)", code, ch.difficulty, ch.total_score, ch.flag_count)
-            # 先查是否已有活体容器可复用（重跑/平台残留时避免重复 start）
             try:
-                for c in await self._refresh():
-                    if c.unique_code == code and c.container_status == "available" and c.container_addr:
-                        addrs = c.container_addr
-                        log.info("[%s] 复用存活容器: %s", code, ", ".join(addrs))
-                        break
-                else:
-                    addrs = []
-            except ApiError:
-                addrs = []
-            if not addrs:
-                try:
-                    addrs = await self._start_throttled(code)
-                except ApiError as e:
-                    if e.code == CODE_INVALID_STATE:
-                        if "already finished" in (e.message or ""):
-                            # 平台任务已结束（时限到/平台终止，run 8629 复盘 16:37 发生）：
-                            # 之后所有 start 都会 409，停止空转并退出调度。
-                            log.warning("[%s] 平台任务已结束：%s，停止调度", code, e.message)
-                            self._task_finished = True
-                            self.pending.clear()
-                            return
-                        # 平台活跃实例数达上限（api-doc §5.2）。轮转队尾 + 冷却重试，
-                        # 不消耗尝试次数——旧逻辑 11 次 409 后判死，超配场景会把
-                        # 排队中的题随机废掉（MAX_CONCURRENT > 平台上限时的必现 bug）。
-                        if self.cfg.auto_concurrency:
-                            # 自己之外仍在跑的任务都占着槽（或正在 start），
-                            # 平台在此刻已满 → 有效并发收敛到它们之上。
-                            new_max = max(1, self._live - 1)
-                            if new_max < self.effective_max:
-                                log.warning("[%s] start 409（实例数达上限）：effective_max %d→%d，题轮转队尾",
-                                            code, self.effective_max, new_max)
-                                self.effective_max = new_max
-                            else:
-                                log.warning("[%s] start 409（实例数达上限），题轮转队尾", code)
-                        else:
-                            log.warning("[%s] 槽位已满，题轮转队尾", code)
-                        self._start_backoff[code] = time.monotonic() + self.start_backoff_s
-                        self.pending.append(ch)
-                        return
-                    log.error("[%s] start 失败: %s", code, e)
-                    self.done[code] = {"completed": False, "score": 0, "reason": f"start: {e.code}"}
-                    # 永不停止：start 失败也冷却轮转重试，不终局丢弃（防单题永久丢失）。
-                    self._start_backoff[code] = time.monotonic() + self.start_backoff_s
-                    self.pending.append(ch)
-                    return
-            if not addrs:
-                addrs = await self._wait_available(code)
+                addrs, requeued = await asyncio.wait_for(self._start_flow(ch), timeout=480)
+            except asyncio.TimeoutError:
+                log.error("[%s] 启动流程超时（8min 保险丝），放弃本轮", code)
+                self.done[code] = {"completed": False, "score": 0, "reason": "start flow timeout"}
+                await self._close_safely(code)  # 释放可能残留的容器实例
+                self._start_backoff[code] = time.monotonic() + self.start_backoff_s
+                self.pending.append(ch)
+                return
+            if requeued:
+                return
             if not addrs:
                 log.error("[%s] 容器未就绪，放弃", code)
                 self.done[code] = {"completed": False, "score": 0, "reason": "container not ready"}
-                try:
-                    await self.api.close_challenge(code)  # start 已成功但未就绪：释放槽位防泄漏
-                except ApiError:
-                    pass
+                await self._close_safely(code)  # start 已成功但未就绪：释放槽位防泄漏
                 self._start_backoff[code] = time.monotonic() + self.start_backoff_s
                 self.pending.append(ch)
                 return
@@ -243,7 +286,8 @@ class Scheduler:
                 await self._run_paired(ch, addrs, ws, allow_extended)
                 return
             worker = Worker(self.cfg, self.llm, self.api, ch, addrs, ws, self.deadline,
-                            allow_extended=allow_extended, first_attempt=first_attempt)
+                            allow_extended=allow_extended, first_attempt=first_attempt,
+                            attempt=attempt, agent_semaphore=self._agent_sem)
             self.active_workers[code] = [worker]
             try:
                 res = await worker.run()
@@ -332,10 +376,11 @@ class Scheduler:
                 if fl not in flags:
                     flags.append(fl)
 
-        submitter = FlagSubmitter(code, ch.flag_count)
+        submitter = FlagSubmitter(code, ch.flag_count, ch.correct_flag_count)
         h_timeout = min(90, self.cfg.harness_timeout_min * max(1, ch.flag_count)) * 60
         try:
-            res = await run_harness(self.cfg, prompt, ws, h_timeout, on_text=_on_text)
+            async with self._agent_sem:
+                res = await run_harness(self.cfg, prompt, ws, h_timeout, on_text=_on_text)
         except Exception as e:
             log.exception("[%s] harness worker 崩溃", code)
             res = None
@@ -345,11 +390,13 @@ class Scheduler:
                     r = await self.api.submit_flag(code, flag)
                 except ApiError as e:
                     if e.code == "duplicate":
+                        # duplicate 不能盲目把进度 +1：同题多 Agent 可能同时提交同一面，
+                        # 否则会把 2/3 误判为 3/3。后续正常响应会用平台计数校准。
                         submitter.record(flag, True, 0)
                         continue
                     log.warning("[%s] harness flag 提交失败: %s", code, e)
                     continue
-                submitter.record(flag, r.correct, r.awarded)
+                submitter.record(flag, r.correct, r.awarded, r.correct_flag_count)
                 if r.correct:
                     log.info("[%s] harness FLAG 正确 +%d (%d/%d)", code, r.awarded,
                              r.correct_flag_count, r.total_flag_count)
@@ -396,7 +443,8 @@ class Scheduler:
         工作区隔离（worker-A / worker-B），A 主攻入口面、B 主攻内网/横向。"""
         code = ch.unique_code
         log.info("[%s] 双 worker 并行（%d 分 %d flags）", code, ch.total_score, ch.flag_count)
-        submitter = FlagSubmitter(code, ch.flag_count)
+        submitter = FlagSubmitter(code, ch.flag_count, ch.correct_flag_count)
+        completion_event = asyncio.Event()
         notes_path = os.path.join(ws, "NOTES.md")
         if not os.path.exists(notes_path):
             with open(notes_path, "w") as f:
@@ -420,18 +468,33 @@ class Scheduler:
                      allow_extended=allow_extended, submitter=submitter,
                      notes_path=notes_path, state_path=state_path,
                      state_lock=state_lock, role_extra=role_a,
-                     transcripts=both_transcripts)
+                     transcripts=both_transcripts, agent_semaphore=self._agent_sem,
+                     completion_event=completion_event)
         w_b = Worker(self.cfg, self.llm, self.api, ch, addrs,
                      os.path.join(ws, "worker-B"), self.deadline,
                      allow_extended=allow_extended, submitter=submitter,
                      notes_path=notes_path, state_path=state_path,
                      state_lock=state_lock, role_extra=role_b,
                      transcripts=both_transcripts,
-                     write_notes_injection=False)  # 解法注入只由 A 写共享笔记
+                     write_notes_injection=False, agent_semaphore=self._agent_sem,
+                     completion_event=completion_event)  # 解法注入只由 A 写共享笔记
         self.active_workers[code] = [w_a, w_b]
         merged = WorkerResult()
         try:
-            res_a, res_b = await asyncio.gather(w_a.run(), w_b.run(), return_exceptions=True)
+            tasks = [asyncio.create_task(w_a.run()), asyncio.create_task(w_b.run())]
+
+            async def _cancel_loser_workers():
+                await completion_event.wait()
+                if submitter.completed:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+
+            stopper = asyncio.create_task(_cancel_loser_workers())
+            try:
+                res_a, res_b = await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                stopper.cancel()
             merged.completed = submitter.completed or any(
                 r.completed for r in (res_a, res_b) if isinstance(r, WorkerResult))
             merged.score = submitter.score
@@ -470,10 +533,7 @@ class Scheduler:
             "elapsed_min": round(res.elapsed_min, 1),
         }
         log.info("[%s] 结束: %s (+%d 分, %.1f 分钟)", code, res.reason, res.score, res.elapsed_min)
-        try:
-            await self.api.close_challenge(code)
-        except ApiError as e:
-            log.warning("[%s] close 失败: %s", code, e)
+        await self._close_safely(code)
         if not res.completed and self.cfg.retry_unsolved and "deadline" not in res.reason:
             self.retry_queue.append(ch)
 
@@ -488,7 +548,7 @@ class Scheduler:
                 await asyncio.sleep(30)
         # 清理孤儿容器：available 但既未完成也无 worker 的（历史残留会占 3 槽位）
         for c in challenges:
-            if c.container_status == "available" and not c.is_completed and c.unique_code not in self.active_workers:
+            if c.container_status == "available" and not _challenge_completed(c) and c.unique_code not in self.active_workers:
                 log.warning("关闭孤儿容器 %s（占槽位）", c.unique_code)
                 try:
                     await self.api.close_challenge(c.unique_code)
@@ -498,8 +558,8 @@ class Scheduler:
             challenges = await self._refresh()
         except ApiError:
             log.warning("二次拉取失败，用首次结果继续")
-        todo = [c for c in challenges if not c.is_completed]
-        already = sum(c.total_score for c in challenges if c.is_completed)
+        todo = [c for c in challenges if not _challenge_completed(c)]
+        already = sum(c.total_score for c in challenges if _challenge_completed(c))
         log.info("共 %d 题，已完成 %d（已有 %d 分），待解 %d", len(challenges),
                  len(challenges) - len(todo), already, len(todo))
         self.pending = sorted(todo, key=lambda c: _priority(c, self.cfg.round_num))
@@ -522,7 +582,7 @@ class Scheduler:
                     try:
                         fresh = {c.unique_code: c for c in await self._refresh()}
                         retry_todo = [fresh.get(c.unique_code, c) for c in self.retry_queue
-                                      if not fresh.get(c.unique_code, c).is_completed]
+                                      if not _challenge_completed(fresh.get(c.unique_code, c))]
                     except ApiError:
                         retry_todo = self.retry_queue
                     log.info("主队列完成，重试 %d 道未解出题（本轮已记录部分进展，续跑）", len(retry_todo))
@@ -532,7 +592,7 @@ class Scheduler:
                 # retry 也空：回查平台。还有未解出的（含 start/容器失败的终局题）就再来一轮。
                 if self.cfg.never_stop or time_left > 120:
                     try:
-                        remaining = [c for c in await self._refresh() if not c.is_completed]
+                        remaining = [c for c in await self._refresh() if not _challenge_completed(c)]
                     except ApiError as e:
                         # 拉取失败 ≠ 全部解开：不判空不退出，稍后重试
                         log.warning("回查题目失败: %s，60s 后重试", e)
@@ -546,7 +606,7 @@ class Scheduler:
                 break  # 有界模式时间到
 
             # 补充新任务（首轮尝试限长超时；retry 轮 allow_extended 给足时间）
-            # gate 用 effective_max：自适应模式下 409 收敛后不再超排。
+            # gate 固定 3 并发（平台上限写死）：槽位一空立即补位，不允许空闲。
             skipped = 0
             while (len(tasks) < self.effective_max and self.pending
                    and (self.cfg.never_stop or time_left > 120)):
@@ -566,7 +626,7 @@ class Scheduler:
                 # first_attempt=n==0 决定「首轮限长超时快速轮转」，retry 轮（n>0）给足长超时。
                 allow_extended = n > 0 or self.cfg.round_num >= 2
                 t = asyncio.create_task(self._run_one(ch, allow_extended=allow_extended,
-                                                      first_attempt=(n == 0)))
+                                                      first_attempt=(n == 0), attempt=n))
                 self._live += 1
                 tasks.add(t)
                 t.add_done_callback(tasks.discard)

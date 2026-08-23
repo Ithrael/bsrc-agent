@@ -81,6 +81,11 @@ async def _amain() -> int:
             log.error("LLM 连通失败（托管模式是否已走 .tsecbench.gw 网关？）: %s", e)
             return 4
         if cfg.claude_worker:
+            # 多模型分工未配置时提示（run 10282 复盘：pro 全程只被调用 1 次——
+            # hard 题全靠 flash 单模型，与榜首 2-4 模型分工差距的直接原因）
+            if not cfg.llm_model_hard:
+                log.warning("LLM_MODEL_HARD 未设置：hard 题/retry 轮将全程使用 %s 单模型。"
+                            "建议配置（如 deepseek-v4-pro），否则攻坚能力受限。", cfg.llm_model)
             # claude 直接解题模式下 claude 完全依赖 Anthropic 通道：启动即探测，
             # 不通立刻退出（否则整轮 0 分空转，任务 9030 教训）。
             code, detail = await _probe_anthropic_channel(cfg)
@@ -89,6 +94,28 @@ async def _amain() -> int:
                 log.error("该通道不通时 claude_worker 整轮 0 分。请修复后重传，或设 CLAUDE_WORKER=0 走裸 LLM 循环。")
                 return 4
             log.info("claude Anthropic 通道自检 OK: HTTP %s", code)
+            if cfg.claude_hard_effort:
+                # effort 探测：--effort max 在 ClawGod+网关链路未实测过（第 1 次任务未用
+                # effort）。失败自动降级为无 effort（hard 题退回普通思考），不整轮赌命。
+                from .harness import _claude_env
+                probe_model = cfg.llm_model_hard or cfg.llm_model
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "claude", "-p", "回复 OK", "--effort", cfg.claude_hard_effort,
+                        "--model", probe_model,
+                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                        env=_claude_env(cfg, probe_model))
+                    rc = await asyncio.wait_for(proc.wait(), timeout=90)
+                except Exception as e:
+                    rc = -1
+                    log.warning("effort 探测异常: %s", e)
+                if rc == 0:
+                    log.info("claude --effort %s 探测 OK（模型 %s）", cfg.claude_hard_effort,
+                             cfg.llm_model_hard or cfg.llm_model)
+                else:
+                    log.warning("claude --effort %s 探测失败 rc=%s：降级为无 effort 模式",
+                                cfg.claude_hard_effort, rc)
+                    cfg.claude_hard_effort = ""
         if cfg.dry_run or "--dry-run" in sys.argv:
             log.info("dry-run 完成，退出。")
             return 0

@@ -70,11 +70,12 @@ class LLMClient:
         await self._client.aclose()
 
     async def chat(self, messages: list[dict], tools: list[dict] | None = None,
-                   max_tokens: int | None = None) -> dict:
+                   max_tokens: int | None = None, model: str = "") -> dict:
         """返回 message dict：{role, content, tool_calls?}。失败重试后仍抛异常由上层兜底。
-        max_tokens 覆盖全局默认（reason 决策等纯 JSON 输出场景收紧输出上限）。"""
+        max_tokens 覆盖全局默认（reason 决策等纯 JSON 输出场景收紧输出上限）。
+        model 覆盖本次调用的模型（advisor brief 用强模型单次调用，不动全局默认）。"""
         payload: dict = {
-            "model": self.model,
+            "model": model or self.model,
             "messages": messages,
             "max_tokens": max_tokens or self.max_tokens,
             "temperature": self.temperature,

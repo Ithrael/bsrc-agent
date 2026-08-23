@@ -26,7 +26,7 @@ def fresh_challenges() -> dict:
             "is_completed": False,
             "container_status": "stopped",
             "container_addr": [],
-            "_flags": ["flag{mock-1}"],
+            "_flags": ["flag{mock_flag_01}"],
         },
         "mock_bin_01": {
             "unique_code": "mock_bin_01",
@@ -39,7 +39,7 @@ def fresh_challenges() -> dict:
             "is_completed": False,
             "container_status": "stopped",
             "container_addr": [],
-            "_flags": ["flag{mock-a}", "flag{mock-b}"],
+            "_flags": ["flag{mock_flag_2a}", "flag{mock_flag_2b}"],
         },
     }
 

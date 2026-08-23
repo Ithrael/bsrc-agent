@@ -41,3 +41,5 @@ fetch_image.sh
 fullscan.txt
 http_cb.log
 agent-*.txt
+hosted-env.txt
+manifest.json

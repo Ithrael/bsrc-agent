@@ -83,12 +83,17 @@ def _claude_env(cfg, model_override: str = "") -> dict:
     return env
 
 
-def _claude_cmd(cfg) -> list[str]:
+def _claude_cmd(cfg, effort: str = "", model_override: str = "") -> list[str]:
     # 注意：root 用户禁用 --dangerously-skip-permissions；
     # 容器内用预置的 /root/.claude/settings.json 权限白名单放行 Bash/Read/Write 等。
     # --verbose 必须：CC 2.1.232 起 --output-format=stream-json 要求 --verbose（容器实测）。
-    return ["claude", "-p", "-", "--output-format", "stream-json",
-            "--verbose", "--model", cfg.llm_model]
+    # --model 必须用覆盖值：命令行参数优先于 ANTHROPIC_MODEL env（run 10282 复盘：
+    # 多模型分工 env 被 --model cfg.llm_model 盖掉，hard 题全程 flash、pro 从未上场）。
+    cmd = ["claude", "-p", "-", "--output-format", "stream-json",
+           "--verbose", "--model", model_override or cfg.llm_model]
+    if effort:
+        cmd += ["--effort", effort]
+    return cmd
 
 
 def _parse_jsonl(line: str, res: HarnessResult, on_text=None):
@@ -107,9 +112,12 @@ def _parse_jsonl(line: str, res: HarnessResult, on_text=None):
     # 误杀正常题（run 9228 复盘：a-07 正常题 1.9 分钟被 300 万熔断误杀，cache_read 占 97%）。
     if ev.get("type") == "assistant":
         u = (ev.get("message") or {}).get("usage") or ev.get("usage") or {}
+        # reasoning/thinking tokens 计入 output 类（effort max 下思考暴涨，防熔断统计失真）
+        reasoning = int(u.get("reasoning", 0) or 0) or int(u.get("reasoning_tokens", 0) or 0)
         res.total_tokens += (int(u.get("input_tokens", 0) or 0)
                              + int(u.get("cache_creation_input_tokens", 0) or 0)
                              + int(u.get("output_tokens", 0) or 0)
+                             + reasoning
                              + int(u.get("cache_read_input_tokens", 0) or 0) // 10)
     t = ev.get("type")
     item = ev.get("item") or {}
@@ -127,15 +135,17 @@ def _parse_jsonl(line: str, res: HarnessResult, on_text=None):
 
 
 async def run_harness(cfg, prompt: str, cwd: str, timeout_s: int,
-                      on_text=None, token_budget: int = 0, model: str = "") -> HarnessResult:
+                      on_text=None, token_budget: int = 0, model: str = "",
+                      effort: str = "") -> HarnessResult:
     """spawn 外部 agent CLI 跑一次攻坚。backend 支持：
     - "claude"：内置后端（ClawGod 版 claude code）
     - 其他值：当作可执行脚本路径（测试/自定义后端用），参数只有 cwd。
     流式逐行读 stdout（原 communicate 一次性读完）：支持 token 熔断——
     assistant 步级 usage 累计超 token_budget 就 kill（run 9054 复盘 b-02 单会话 920 万 token）。
-    model：非空时覆盖该会话的 ANTHROPIC_MODEL（多模型分工：hard 题用更强模型）。"""
+    model：非空时覆盖该会话的 ANTHROPIC_MODEL（多模型分工：hard 题用更强模型）。
+    effort：非空时加 --effort（hard 题 max 思考预算，Claude Code 2.1.231+ 支持）。"""
     if cfg.harness_backend == "claude":
-        env, cmd = _claude_env(cfg, model), _claude_cmd(cfg)
+        env, cmd = _claude_env(cfg, model), _claude_cmd(cfg, effort, model)
     else:
         env, cmd = dict(os.environ), [cfg.harness_backend]
     res = HarnessResult()
@@ -146,24 +156,41 @@ async def run_harness(cfg, prompt: str, cwd: str, timeout_s: int,
         cwd=cwd, env=env, start_new_session=True)
     try:
         assert proc.stdin and proc.stdout
-        proc.stdin.write(prompt.encode())
-        await proc.stdin.drain()
-        proc.stdin.close()
+        try:
+            proc.stdin.write(prompt.encode())
+            await proc.stdin.drain()
+            proc.stdin.close()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            # claude 秒退（启动失败/网关抖动/资源紧张）：管道写不进去。
+            # 不冒泡成 worker 崩溃（run 10048 bctf-38/03 断点重跑 ConnectionResetError），
+            # 返回空结果交由调度轮转，已拿的 flag 不受影响。
+            log.warning("[harness] %s 进程提前退出，prompt 写入失败（rc=%s）", cmd[0], proc.returncode)
+            await _wait_proc(proc)
+            return res
         killed = False
 
         async def _read_loop():
             nonlocal killed
+            # 不用 StreamReader.readline：单行超 64KB（claude 巨长文本事件）会抛
+            # ValueError: Separator is found, but chunk is longer than limit
+            # （run 10048 bctf-20/bctf-01 崩溃根因）。手动行缓冲无行长限制。
+            buf = b""
             while True:
-                line = await proc.stdout.readline()
-                if not line:
+                chunk = await proc.stdout.read(65536)
+                if not chunk:
                     break
-                _parse_jsonl(line.decode(errors="replace"), res, on_text)
-                if token_budget and res.total_tokens > token_budget:
-                    _kill_proc(proc)
-                    killed = True
-                    res.collected += "\n[HARNESS TOKEN BUDGET EXCEEDED]\n"
-                    log.warning("[harness] %s token 熔断（%d > %d）", cmd[0], res.total_tokens, token_budget)
-                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    _parse_jsonl(line.decode(errors="replace"), res, on_text)
+                    if token_budget and res.total_tokens > token_budget:
+                        _kill_proc(proc)
+                        killed = True
+                        res.collected += "\n[HARNESS TOKEN BUDGET EXCEEDED]\n"
+                        log.warning("[harness] %s token 熔断（%d > %d）", cmd[0], res.total_tokens, token_budget)
+                        return
+            if buf:  # EOF 残留的未换行尾行
+                _parse_jsonl(buf.decode(errors="replace"), res, on_text)
 
         try:
             await asyncio.wait_for(_read_loop(), timeout=timeout_s)

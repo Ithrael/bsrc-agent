@@ -32,12 +32,12 @@ def _mk(code, score, diff, flags=1):
     return Challenge(code, None, diff, 1, score, flags, 0, False, "stopped", [])
 
 
-def test_priority_easy_high_score_first(monkeypatch):
+def test_priority_single_flag_before_multi_flag(monkeypatch):
     import agent.scheduler as sched
     monkeypatch.setattr(sched, "_LIB", {})  # 现场解模式：无解法库（solutions.json 可能被跑分回写）
     easy = _mk("d-01", 200, "easy")
     hard = _mk("a-01", 500, "hard")
     multi = _mk("b-01", 1200, "hard", flags=4)
     ordered = sorted([hard, easy, multi], key=_priority)
-    assert ordered[0].unique_code in ("d-01", "b-01")  # 高分多flag or 快题优先
-    assert _priority(hard) < _priority(multi)  # 负值越小越优先：单 flag 题优先于多 flag（现场解 est×flag）
+    assert ordered[0].unique_code == "d-01"  # 目标是单位墙钟解出更多完整题
+    assert _priority(easy) < _priority(hard) < _priority(multi)

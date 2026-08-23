@@ -8,7 +8,7 @@
 
 - 调度优先级改为“预计完整解题概率 / 墙钟耗时”，优先已知解法、只剩一个 flag 的 partial 题、easy/medium 单 flag 题，再处理 hard 和多 flag 题。
 - 保持 3 个 challenge 槽位；增加全局 Agent semaphore，默认允许 9 个 Agent（3 题各 3 线），检测到网关限流时可通过环境变量降到 6。
-- 未完成且无完整解法的题按角色启动最多三条线：入口、内网/非 Web、提权/收尾。使用不同模型或角色提示；完成条件触发后取消同题剩余子进程。
+- 未完成且无完整解法的题按角色启动最多三条线：入口、内网/非 Web、提权/收尾；两面 flag 或 hard 单面题至少启动两条线。使用不同模型或角色提示；完成条件触发后取消同题剩余子进程。
 - 完整解法只要有 `completed` 且有 `steps`、`note` 或专家笔记即可进入短复现，不要求必须有 shell steps。
 - `FlagSubmitter` 继承平台已有的 `correct_flag_count`，提交响应中的平台计数作为完成判据，避免多 flag 重试时本地集合从零开始。
 - 会话重建只有在 `correct_flag_count == flag_count` 时标记 completed；单次 `answer_correct` 不足以证明整题完成。
