@@ -93,10 +93,11 @@ class Config:
     # MAX_CONCURRENT 写死为平台上限 3（run 10048 复盘：409 自适应收敛只降不升致
     # 后半程单线程——并发不降级，题轮转队尾等槽位，槽位空出立即补位）。
     max_concurrent: int = field(default_factory=lambda: _int("MAX_CONCURRENT", 3))
-    # Agent 级并发与平台题目槽位分离：3 道题各跑 8 条思考线时最多 24 个 Claude，
-    # semaphore 上限 24（对标榜首 Cairn 24 路：小会话高并行是差距所在）。
-    # 网关若限流可下调（429 重试会自动退避）；调度器只在 semaphore 层排队，不影响题目槽位占满。
-    max_agent_concurrent: int = field(default_factory=lambda: _int("MAX_AGENT_CONCURRENT", 24))
+    # Agent 级并发：主进程 + Task 子 agent 架构下，每题只有 1 个主 claude 进程
+    # （3 题槽位 = 3 主进程），子 agent 在主进程内并行不占 semaphore。
+    # 6 = 3 主进程 + 断点重跑/蒸馏等辅助调用的余量。run 12231 复盘：24 个独立进程
+    # 吃爆 8核16G 沙箱，claude 秒退空转——子 agent 架构下无此问题。
+    max_agent_concurrent: int = field(default_factory=lambda: _int("MAX_AGENT_CONCURRENT", 6))
     # 双 worker 并行：总分≥1000 且 flag≥3 且无完整解法的大题，1 容器 2 条思考线
     # （共享 NOTES.md 与 flag 进度，worker-A 主攻入口面 / worker-B 主攻内网横向）
     pair_workers: bool = field(default_factory=lambda: os.environ.get("PAIR_WORKERS", "1") != "0")

@@ -2,6 +2,7 @@
 验证 prompt 打包、submit_flag.sh 生成、flag 双通道提交、解法落库、无输出超时判定。"""
 import json
 import time
+from pathlib import Path
 
 import pytest
 
@@ -67,8 +68,8 @@ async def test_claude_worker_solves_and_submits(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_claude_worker_pair_split(tmp_path, monkeypatch):
-    """P0 分治：flag 3-4 的题 spawn 6 个 claude（入口/横向/提权收尾/独立侦察/CVE/云逃逸），
-    各线独立子目录（防踩），flag 合并提交。"""
+    """P0 分治（主进程 + Task 子 agent 架构）：flag 3-4 的题 spawn 1 个主 claude 进程，
+    主 prompt 含子 agent 方向表（入口/横向/提权收尾/独立侦察/CVE/云逃逸），flag 由主进程提交。"""
     srv = make_server()
     srv.state.update({
         "mock_pair_01": {
@@ -97,28 +98,15 @@ async def test_claude_worker_pair_split(tmp_path, monkeypatch):
     monkeypatch.setattr(worker_mod, "solution_lib_path", lambda: str(sol_path))
     monkeypatch.setattr(worker_mod, "notes_lib_path", lambda: str(notes_path))
 
-    # fake claude：读 stdin 按分工提示区分各线，各自输出对应 flag；调用次数落盘
+    # fake claude：单主进程，输出三个 flag + 断言 prompt 含主控指令
     calls_log = tmp_path / "calls.log"
     p = tmp_path / "fake-claude.sh"
     p.write_text("#!/bin/bash\n"
                  f"echo call >> {calls_log}\n"
                  "prompt=$(cat)\n"
-                 "if echo \"$prompt\" | grep -q '提权与收尾'; then\n"
-                 "  echo '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"提权 flag{p_line_03}\"}]}}'\n"
-                 "  echo '{\"type\":\"result\",\"result\":\"C done\"}'\n"
-                 "elif echo \"$prompt\" | grep -q '内网横向'; then\n"
-                 "  echo '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"横向 flag{p_line_02}\"}]}}'\n"
-                 "  echo '{\"type\":\"result\",\"result\":\"B done\"}'\n"
-                 "elif echo \"$prompt\" | grep -q '独立侦察'; then\n"
-                 "  echo '{\"type\":\"result\",\"result\":\"D done\"}'\n"
-                 "elif echo \"$prompt\" | grep -q 'CVE 专攻'; then\n"
-                 "  echo '{\"type\":\"result\",\"result\":\"E done\"}'\n"
-                 "elif echo \"$prompt\" | grep -q '云与逃逸'; then\n"
-                 "  echo '{\"type\":\"result\",\"result\":\"F done\"}'\n"
-                 "else\n"
-                 "  echo '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"入口 flag{p_line_01}\"}]}}'\n"
-                 "  echo '{\"type\":\"result\",\"result\":\"A done\"}'\n"
-                 "fi\n")
+                 "echo \"$prompt\" > /tmp/master_prompt.txt\n"
+                 "echo '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"flag{p_line_01} flag{p_line_02} flag{p_line_03}\"}]}}'\n"
+                 "echo '{\"type\":\"result\",\"result\":\"master done\"}'\n")
     p.chmod(0o755)
 
     cfg = Config()
@@ -135,13 +123,15 @@ async def test_claude_worker_pair_split(tmp_path, monkeypatch):
     assert res.score == 1200
     assert sorted(res.flags) == ["flag{p_line_01}", "flag{p_line_02}", "flag{p_line_03}"]
     lines = calls_log.read_text().strip().splitlines()
-    assert len(lines) == 6, f"六线都应跑过: {lines}"
-    # 防踩：各线独立子目录 + 共享文件软链
+    assert len(lines) == 1, f"单主进程只跑一次: {lines}"
+    # 主 prompt 含主控指令与子 agent 方向表
+    master = Path("/tmp/master_prompt.txt").read_text()
+    assert "主控 agent" in master and "Task" in master
+    for kw in ("入口面", "内网横向", "提权与收尾", "独立侦察", "CVE 专攻", "云与逃逸"):
+        assert kw in master, f"子 agent 方向缺失: {kw}"
+    # 防踩：子 agent 约定目录已创建
     ws = tmp_path / "ws"
-    assert (ws / "line_A" / "submit_flag.sh").is_symlink()
-    assert (ws / "line_A" / "NOTES.md").is_symlink()
-    assert (ws / "line_A" / "STATE.md").is_symlink()
-    assert (ws / "line_A" / "RELAY.md").is_symlink()
+    assert (ws / "line_A").is_dir() and (ws / "line_F").is_dir()
     await api.close()
 
 
@@ -219,14 +209,14 @@ async def test_claude_worker_no_output(tmp_path):
 
 @pytest.mark.asyncio
 async def test_medium_round2_timeout_25min():
-    """题数最大化：medium 首轮 12min（快速轮转），重试轮 15min（step 碎片化 v0）。"""
+    """题数最大化：medium 首轮 12min（快速轮转），重试轮 25min（run 12231 复盘回滚）。"""
     w = Worker.__new__(Worker)
     w.cfg = Config()
     w.first_attempt = False
     w.attempt = 1
     w.ch = Challenge.from_dict({"unique_code": "bctf-02", "flag_count": 1,
                                 "total_score": 400, "difficulty": "medium"})
-    assert w._scaled_timeout_s() == 15 * 60
+    assert w._scaled_timeout_s() == 25 * 60
     # 首轮快速轮转 12min
     w.attempt = 0
     w.first_attempt = True

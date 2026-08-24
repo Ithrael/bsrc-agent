@@ -46,21 +46,21 @@ def test_sanitize_keeps_relative_commands():
 # ---- 超时分级 ----
 
 def test_timeout_first_attempt_hard_fast_fail():
-    """hard 首轮 20min（step 碎片化 v0：短会话+蒸馏接力，轮转快上下文短）。"""
+    """hard 首轮 25min（run 12231 复盘回滚：主进程协调子 agent 需完整预算）。"""
     w = _mk_worker(unique_code="b-02", flag_count=4, difficulty="hard", attempt=0)
-    assert w._scaled_timeout_s() == 20 * 60
+    assert w._scaled_timeout_s() == 25 * 60
 
 
 def test_timeout_retry_hard_40min():
-    """hard retry 轮（attempt≥1）统一 25min（碎片化后不再逐次加长）。"""
+    """hard 第 2 次尝试 35min。"""
     w = _mk_worker(unique_code="b-02", flag_count=4, difficulty="hard", attempt=1)
-    assert w._scaled_timeout_s() == 25 * 60
+    assert w._scaled_timeout_s() == 35 * 60
 
 
 def test_timeout_hard_third_round_90min():
-    """hard 第 3 次及以后尝试同样 25min。"""
+    """hard 第 3 次及以后尝试 40min。"""
     w = _mk_worker(unique_code="b-02", flag_count=4, difficulty="hard", attempt=2)
-    assert w._scaled_timeout_s() == 25 * 60
+    assert w._scaled_timeout_s() == 40 * 60
 
 
 def test_timeout_easy_below_cap():
@@ -144,7 +144,7 @@ def test_timeout_round1_short_cap():
     """ROUND=1 仍沿用快速轮转预算；完整解法题走更短复现预算。"""
     hard = _mk_worker(unique_code="b-02", flag_count=4, difficulty="hard")
     hard.cfg.round_num = 1
-    assert hard._scaled_timeout_s(has_completed_sol=False) == 20 * 60
+    assert hard._scaled_timeout_s(has_completed_sol=False) == 25 * 60
     easy = _mk_worker(unique_code="a-01", flag_count=1, difficulty="easy")
     easy.cfg.round_num = 1
     assert easy._scaled_timeout_s(has_completed_sol=False) == 8 * 60

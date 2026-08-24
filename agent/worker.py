@@ -651,13 +651,13 @@ class Worker:
         if has_completed_sol:
             minutes = 5 if self.ch.flag_count <= 1 else 10
         elif self.ch.difficulty == "hard":
-            # step 碎片化 v0（2026-08-23 竞品复盘：Cairn 短会话+蒸馏接力——会话短轮转快、
-            # 上下文短不易退化；断点由 RELAY 蒸馏保留，retry 轮续跑不从头）
-            minutes = 20 if self.attempt <= 0 else 25
+            # 主进程要协调 N 个子 agent 多轮派发，需要完整预算（run 12231 复盘：
+            # 碎片化 20/25min 太短 + medium retry 15min 丢 c-02/a-14/c-08 共 -860 分——回滚）
+            minutes = 25 if self.attempt <= 0 else (35 if self.attempt == 1 else 40)
         elif self.ch.difficulty == "medium":
             # 首轮 12min（原 20min，AePis 复盘：easy/medium 全扫 <2h，3.3min/flag；
-            # 首轮快速轮转把时间留给 hard 攻坚）；retry 轮 15min（原 25min，碎片化）
-            minutes = 12 if self.attempt <= 0 else 15
+            # 首轮快速轮转把时间留给 hard 攻坚），retry 轮 25min 给足断点续跑
+            minutes = 12 if self.attempt <= 0 else 25
         else:
             minutes = 8 if self.attempt <= 0 else 15
         if self.cfg.round_num == 1 and not has_completed_sol:
@@ -1347,11 +1347,11 @@ class Worker:
         self._rotation_text = self._rotation_notice()
 
         self._harness_flags = []
-        # P0: 分治——每题多线并行（run 12082 竞品复盘：榜首 Cairn 24 路/虫洞 32 路，
-        # 高并行是差距核心；3 题槽位 × 8 线 = 理论峰值 24 路）。
-        # 线数按题分级：flag≥5 八线 / flag 3-4 六线 / flag 2 或 hard 四线 / 其余单线。
-        # 防踩机制：每线独立 cwd 子目录（lineX/），共享文件（NOTES/STATE/RELAY/
-        # submit_flag.sh）软链进子目录；追加纪律带线名前缀；攻击面分工明确，串线线索只交接。
+        # P0: 分治——每题 1 个主 claude 进程 + Task 工具并行派发子 agent（2026-08-24 架构改造：
+        # run 12231 复盘——24 个独立 claude 进程吃爆 8核16G 沙箱（每进程 ~0.5-1GB），
+        # 后半程 claude 秒退空转。子 agent 共享主进程运行时，资源占用降一个量级）。
+        # 方向数按题分级：flag≥5 八个 / flag 3-4 六个 / flag 2 或 hard 四个。
+        # 防踩：子 agent 各自独立工作目录 lineX/（约定），共享文件追加带线名前缀，串线线索只交接。
         _ROLES: dict[str, tuple[str, str]] = {
             "A": ("入口面", "目标 Web 服务的初始突破（默认凭证/已知 CVE/文件上传等）。"),
             "B": ("内网横向", "按 NOTES.md 主机清单逐台探测/利用；新主机地址/端口/指纹登记进 NOTES.md。"),
@@ -1367,29 +1367,36 @@ class Worker:
         }
         if not has_completed_sol and (ch.flag_count >= 2 or ch.difficulty == "hard"):
             if ch.flag_count >= 5:
-                line_keys = "ABCDEFGH"   # 八线（b-02 级 6 flags 大题）
+                line_keys = "ABCDEFGH"   # 八个子 agent 方向（b-02 级 6 flags 大题）
             elif ch.flag_count >= 3:
-                line_keys = "ABCDEF"     # 六线（b-01/b-03 级 4 flags）
+                line_keys = "ABCDEF"     # 六个（b-01/b-03 级 4 flags）
             else:
-                line_keys = "ADEF"       # 四线（2 flags / hard 单 flag）
-            common = (f"本题共 {ch.flag_count} 面 flag（{len(line_keys)} 线并行攻坚）。"
-                      "开动前先读 NOTES.md、STATE.md 与 RELAY.md：已拿到的 flag 与已排除方向不要重复攻；"
-                      "拿到一个 flag 立即 ./submit_flag.sh 提交，然后继续攻下一面；"
-                      "全部 flag 拿齐前不要停止。\n"
-                      "## 多线协作纪律（防互相踩，必须遵守）\n"
-                      "1. 你的工作目录是专属子目录（line 目录），与其它线完全隔离："
-                      "所有脚本/输出/临时文件只写在工作目录内；NOTES.md/STATE.md/RELAY.md/"
-                      "submit_flag.sh 是软链（指向共享文件），可正常读写。\n"
-                      "2. 共享文件只做**追加**，禁止重排/覆盖他人内容；追加行必须带你的线名前缀："
-                      "`echo '- [X线] <发现>' >> NOTES.md`（RELAY.md 与 STATE.md 的 INTENTS/ELIMINATED 同理）。\n"
-                      "3. 发现属于其它线攻击面的线索：追加进 NOTES.md 交接（注明给哪条线），不要自己深入。\n"
-                      "4. 目录里若有其它线遗留的文件：先读一眼再动，不要清空或重排与本线无关的内容。")
+                line_keys = "ADEF"       # 四个（2 flags / hard 单 flag）
+            subtask_table = "\n".join(
+                f"- [{key}线] {_ROLES[key][0]}：{_ROLES[key][1]}" for key in line_keys)
+            master_role = (
+                f"## 你的角色（主控 agent，用 Task 工具并行派发子 agent 攻坚）\n"
+                f"本题共 {ch.flag_count} 面 flag，你负责统筹全局，不亲自做侦察细节：\n"
+                f"1. 先读 NOTES.md、STATE.md、RELAY.md：已拿到的 flag 与已排除方向不要重复攻。\n"
+                f"2. 用 Task 工具**一次性并行派发 {len(line_keys)} 个子 agent**，各自独立上下文分头攻坚，"
+                f"方向互不重叠：\n{subtask_table}\n"
+                "3. 每个子 agent 的指令里必须包含（防互相踩）：\n"
+                "   - 独立工作目录 line_{线号}/：所有脚本/输出/临时文件只写在这里，"
+                "禁止写工作目录之外的任何文件（共享文件除外）\n"
+                "   - 共享文件只追加且带线名前缀：`echo '- [X线] <发现>' >> NOTES.md`"
+                "（RELAY.md、STATE.md 的 INTENTS/ELIMINATED 同理），禁止重排/覆盖他人内容\n"
+                "   - 拿到 flag 立即用 bash 执行 `./submit_flag.sh <flag>` 提交\n"
+                "   - 发现其它方向攻击面的线索：写进 NOTES.md 交接（注明给哪条线），不要自己深入\n"
+                "   - 结束前返回三行总结：已达成原语 / 已证死路 / 下一步\n"
+                "4. 子 agent 全部返回后：读它们的总结与 NOTES.md 新增，判断还缺哪几面 flag，"
+                "针对缺口再派新一轮子 agent（换攻击面/换主机/换凭证），直到全部拿齐或时间不足。\n"
+                "5. 拿到 flag 的判定以 STATE.md 的 FACTS 为准（系统自动更新），不要凭子 agent 口头汇报。")
             if ch.flag_count >= 3:
                 # 多 flag 题专项清单（run 12019 复盘：b-01 1/4、b-02 2/6、b-03 1/4——
                 # 首面能拿后续纵深乏力；9489 曾靠 flagN 直读+容器逃逸+横向拿全 b-01 4/4，
-                # 把实测有效的优先级固化进各线公共指令）
-                common += (
-                    "\n\n## 多 flag 题专项清单（每线开动前先过一遍，按序执行）\n"
+                # 把实测有效的优先级固化进公共指令）
+                master_role += (
+                    "\n\n## 多 flag 题专项清单（派发子 agent 时按需注入对应方向）\n"
                     "1. **本机直读最优先**：`ls /challenge/ /flag* 2>/dev/null; "
                     "find / -maxdepth 3 -name 'flag*' 2>/dev/null`——多面 flag 常挂 /challenge/flagN.txt，"
                     "拿到任意文件读取/RCE 后先逐个直读提交，比打内网快得多。\n"
@@ -1402,48 +1409,17 @@ class Worker:
                     "5. **容器/宿主逃逸**：检查 /var/run/docker.sock 挂载、overlay 挂载、"
                     "/proc/self/status 里的宿主机特征——多面题高分段常靠逃逸到宿主或其他容器。\n"
                     "6. 每台新主机重复 1-5；每面 flag 一到手立即 ./submit_flag.sh，然后继续下一面。")
-            # 构建各线 prompt + 独立子目录（软链共享文件）
-            prompts: dict[str, str] = {}
+            # 主进程 cwd = 工作区根；子 agent 约定目录先建好
             for key in line_keys:
-                role = _ROLES[key]
-                rd = (f"## 你的分工（{len(line_keys)} 线并行攻坚，你负责 [{key}线] {role[0]}）\n"
-                      + common + f"\n你主攻**{role[0]}**：{role[1]}")
-                p = self._build_claude_prompt(ch, sol, notes, has_completed_sol, desc_hints,
-                                              recon_report, rd)
-                p += hint_text + advisor_text
-                prompts[key] = p
-                line_dir = os.path.join(self.ws, f"line_{key}")
-                os.makedirs(line_dir, exist_ok=True)
-                for name in ("NOTES.md", "STATE.md", "RELAY.md", "submit_flag.sh"):
-                    src, dst = os.path.join(self.ws, name), os.path.join(line_dir, name)
-                    if os.path.exists(src) and not os.path.exists(dst):
-                        os.symlink(src, dst)
-            log.info("[%s] claude code 直接解题（分治 %d 线×%ds 预算，token 熔断 %d）",
+                os.makedirs(os.path.join(self.ws, f"line_{key}"), exist_ok=True)
+            prompt = self._build_claude_prompt(ch, sol, notes, has_completed_sol, desc_hints,
+                                               recon_report, master_role)
+            prompt += hint_text + advisor_text
+            log.info("[%s] 主进程 + Task 子 agent（%d 方向，%ds 预算，token 熔断 %d）",
                      ch.unique_code, len(line_keys), timeout_s, token_budget)
-            jobs = []
-            for i, key in enumerate(line_keys):
-                # A 线（入口）用快速模型抢入口；其余线用 hard 模型深挖，降低同质化。
-                jobs.append({
-                    "prompt": prompts[key], "timeout_s": timeout_s,
-                    "on_text": self._harness_on_text, "token_budget": token_budget,
-                    "model": "" if i == 0 else hard_model,
-                    "effort": "" if i == 0 else hard_effort,
-                    "cwd": os.path.join(self.ws, f"line_{key}"),
-                })
-            results = await self._run_harness_group(jobs)
-            # 合并各线（A 为主，其余摘要并入）
-            from .harness import HarnessResult
-            valid = [r for r in results if r is not None]
-            res = results[0] or (valid[0] if valid else HarnessResult())
-            for i, r in enumerate(results[1:], start=1):
-                if r is None:
-                    continue
-                lbl = f"{line_keys[i]} 线"
-                res.output_text = (res.output_text or "") \
-                    + f"\n===== {lbl} =====\n" + (r.output_text or "")
-                res.collected += f"\n===== {lbl} =====\n" + r.digest()
-                res.events += r.events
-                res.total_tokens += r.total_tokens
+            res = await self._run_harness_with_drain(prompt, timeout_s,
+                                    on_text=self._harness_on_text, token_budget=token_budget,
+                                    model=hard_model, effort=hard_effort)
         else:
             prompt = self._build_claude_prompt(ch, sol, notes, has_completed_sol, desc_hints, recon_report, "")
             prompt += hint_text + advisor_text
