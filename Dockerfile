@@ -65,9 +65,11 @@ COPY clawgod-install.sh /tmp/clawgod-install.sh
 RUN (cd /tmp && bash clawgod-install.sh && rm -f /tmp/clawgod-install.sh) \
     || echo "WARNING: ClawGod 安装失败，harness 攻坚将不可用"
 ENV PATH=/root/.local/bin:$PATH
-# claude 权限白名单：root 用户禁用 --dangerously-skip-permissions，用官方 settings.json 放行
+# claude 权限白名单：root 用户禁用 --dangerously-skip-permissions，用官方 settings.json 放行。
+# Task(*) 必须显式放行：主进程 + 子 agent 架构依赖 Task 工具派发并行子 agent，
+# headless（-p）模式下 allow 列表之外的工具会被直接拒绝（无法交互授权）。
 RUN mkdir -p /root/.claude && \
-    echo '{"permissions": {"allow": ["Bash(*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)"], "deny": []}}' \
+    echo '{"permissions": {"allow": ["Bash(*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "Task(*)"], "deny": []}}' \
     > /root/.claude/settings.json
 # harness 可用性验证：claude 二进制存在性检查（构建日志可见，失败不阻断）
 RUN if command -v claude >/dev/null 2>&1; then claude --version 2>/dev/null || true; else echo "WARNING: claude not found, harness disabled"; fi

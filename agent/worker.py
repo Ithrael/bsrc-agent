@@ -1365,6 +1365,7 @@ class Worker:
             "H": ("收尾直读", "专攻本机与已拿主机的 flag 文件直读（/challenge/flagN.txt、"
                              "find / -maxdepth 3 -name 'flag*'），补其他线漏掉的面。"),
         }
+        master_role = ""  # 主控角色指令（多 flag/hard 题启用；断点重跑复用同一角色）
         if not has_completed_sol and (ch.flag_count >= 2 or ch.difficulty == "hard"):
             if ch.flag_count >= 5:
                 line_keys = "ABCDEFGH"   # 八个子 agent 方向（b-02 级 6 flags 大题）
@@ -1440,7 +1441,7 @@ class Worker:
                 and "[HARNESS TOKEN BUDGET" not in res.collected):
             retry_s = max(300, timeout_s // 2)
             log.info("[%s] claude 提前退出未拿全 flag，断点重跑一次（%ds）", ch.unique_code, retry_s)
-            retry_prompt = self._build_claude_prompt(ch, sol, notes, has_completed_sol, desc_hints, recon_report, "")
+            retry_prompt = self._build_claude_prompt(ch, sol, notes, has_completed_sol, desc_hints, recon_report, master_role)
             retry_prompt += ("\n\n## 断点续跑（第二次尝试）\n"
                              "上次运行已结束但 flag 未拿全。先读 RELAY.md（接力块：原语/死路/下一步）、"
                              "NOTES.md 与 STATE.md 了解已有进展与已排除方向，从断点继续，"
