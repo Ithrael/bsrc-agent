@@ -95,9 +95,9 @@ class Config:
     max_concurrent: int = field(default_factory=lambda: _int("MAX_CONCURRENT", 3))
     # Agent 级并发：主进程 + Task 子 agent 架构下，每题只有 1 个主 claude 进程
     # （3 题槽位 = 3 主进程），子 agent 在主进程内并行不占 semaphore。
-    # 6 = 3 主进程 + 断点重跑/蒸馏等辅助调用的余量。run 12231 复盘：24 个独立进程
-    # 吃爆 8核16G 沙箱，claude 秒退空转——子 agent 架构下无此问题。
-    max_agent_concurrent: int = field(default_factory=lambda: _int("MAX_AGENT_CONCURRENT", 6))
+    # 8 = 3 主进程 + 断点重跑/蒸馏等辅助调用的余量（run 12396 实测峰值 9 并发
+    # 沙箱稳定，6 升 8 让辅助通道不再挤占主进程额度）。
+    max_agent_concurrent: int = field(default_factory=lambda: _int("MAX_AGENT_CONCURRENT", 8))
     # 双 worker 并行：总分≥1000 且 flag≥3 且无完整解法的大题，1 容器 2 条思考线
     # （共享 NOTES.md 与 flag 进度，worker-A 主攻入口面 / worker-B 主攻内网横向）
     pair_workers: bool = field(default_factory=lambda: os.environ.get("PAIR_WORKERS", "1") != "0")
@@ -147,6 +147,11 @@ class Config:
     explore_segment_min: int = field(default_factory=lambda: _int("EXPLORE_SEGMENT_MIN", 5))
     stagnate_segments_hint: int = field(default_factory=lambda: _int("STAGNATE_SEGMENTS_HINT", 2))
     stagnate_segments_quit: int = field(default_factory=lambda: _int("STAGNATE_SEGMENTS_QUIT", 3))
+    # 全局掉速检测（run 12396 复盘：19:56 b-01/b-03 拿一面后 36 分钟仅 +90 分，
+    # 资源全在难啃单 flag 题上，b-02 等 6 面大题无一条线在打）：连续 N 分钟无
+    # 新 flag 入账 → 把最高价值的多 flag 未解题强制插队（启动即自动 Task 分治）。
+    # 0 = 关闭。
+    stagnate_boost_min: int = field(default_factory=lambda: _int("STAGNATE_BOOST_MIN", 30))
 
     # 上下文预算：按估算 token 计（CJK 1 字符≈1 token，其余 4 字符≈1 token）。
     # 150k 字符的全中文上下文会逼近 128k token 上限触发 LLM 400（历史 b-02 踩过），

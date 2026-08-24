@@ -207,3 +207,73 @@ async def test_no_pair_when_solution_exists(tmp_path):
             srv.shutdown()
     finally:
         sched_mod._LIB.pop("mock_pair_01", None)
+
+
+class _FakeApi:
+    """只实现 list_challenges 的假平台：correct_flag_count 由测试直接控制。"""
+
+    def __init__(self, challenges: list[dict]):
+        self.challenges = challenges
+
+    async def list_challenges(self):
+        from agent.tsec_api import Challenge
+        return [Challenge.from_dict(c) for c in self.challenges]
+
+
+def _ch(code: str, flag_count: int, score: int, correct: int = 0) -> dict:
+    return {
+        "unique_code": code, "description": "mock", "difficulty": "hard",
+        "level": 1, "total_score": score, "flag_count": flag_count,
+        "correct_flag_count": correct, "is_completed": False,
+        "container_status": "stopped", "container_addr": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_stagnate_check_boost_and_cooldown(tmp_path):
+    """掉速检测：有增长不触发；无进展超阈值插队多 flag 题；20min 冷却防重复。"""
+    cfg = Config()
+    cfg.stagnate_boost_min = 30
+    api = _FakeApi([_ch("b_02", 6, 1800), _ch("a_05", 1, 300)])
+    sched = Scheduler(cfg, FakeLLM(), api, str(tmp_path))
+    challenges = await api.list_challenges()
+    sched.pending = [c for c in challenges if c.unique_code == "a_05"]
+    sched.retry_queue = [c for c in challenges if c.unique_code == "b_02"]
+
+    # 场景 1：平台有新 flag 增长 → 刷新进度时间戳，不插队
+    api.challenges[1]["correct_flag_count"] = 1  # a_05 涨一面
+    sched._last_progress_ts = time.monotonic() - 31 * 60
+    await sched._stagnate_check()
+    assert sched.pending[0].unique_code == "a_05", "有增长不应插队"
+    assert time.monotonic() - sched._last_progress_ts < 5, "增长应刷新进度时间戳"
+
+    # 场景 2：31 分钟无进展 → b_02（6 面 1800 分）插到队头，retry 清空
+    sched._last_progress_ts = time.monotonic() - 31 * 60
+    await sched._stagnate_check()
+    assert sched.pending[0].unique_code == "b_02"
+    assert sched.pending[0].flag_count == 6
+    assert sched.retry_queue == []
+
+    # 场景 3：冷却期内再查不重复插队（b_02 已在队头，冷却 return 不动队列）
+    sched._last_progress_ts = time.monotonic() - 31 * 60
+    sched.retry_queue = [c for c in challenges if c.unique_code == "b_02"]
+    await sched._stagnate_check()
+    assert sched.pending[0].unique_code == "b_02"
+    assert len(sched.pending) == 2  # b_02 队头 + a_05 原题
+    assert len(sched.retry_queue) == 1  # 冷却 return，重新塞的 b_02 未被处理
+
+
+@pytest.mark.asyncio
+async def test_stagnate_check_disabled(tmp_path):
+    """STAGNATE_BOOST_MIN=0 时掉速检测关闭：不插队。"""
+    cfg = Config()
+    cfg.stagnate_boost_min = 0
+    api = _FakeApi([_ch("b_02", 6, 1800)])
+    sched = Scheduler(cfg, FakeLLM(), api, str(tmp_path))
+    challenges = await api.list_challenges()
+    sched.pending = []
+    sched.retry_queue = list(challenges)
+    sched._last_progress_ts = time.monotonic() - 31 * 60
+    await sched._stagnate_check()
+    assert sched.pending == []
+    assert len(sched.retry_queue) == 1

@@ -71,7 +71,10 @@ def _priority(ch: Challenge, round_num: int = 2) -> float:
     elif info.get("partial"):
         rank = 5 + difficulty_rank      # 有断点但仍多面
     else:
-        rank = 8 + difficulty_rank      # 全新多 flag 题最后处理
+        # 全新多 flag 题最后处理；但高分大题（≥1000 分，b 系列 1200-1800）提前
+        # 到与 partial 多面同级（run 12396 复盘：b-02 1800 分从头到尾没启动，
+        # 槽位被单 flag 题反复占满，子 agent 无题可派，整段无分治低效期）。
+        rank = (5 if ch.total_score >= 1000 else 8) + difficulty_rank
 
     if round_num == 1 and not info:
         rank -= 10                       # 保留 ROUND=1 的全题覆盖语义
@@ -112,6 +115,12 @@ class Scheduler:
         # claude 运行时健康度：连续崩溃/无输出计数（启动三道闸只防"带病上场"，
         # 这里防运行中恶化——网关策略变化/运行时错误。达标全局降级裸 LLM）
         self._claude_fail_streak = 0
+        # 全局掉速检测：harness 的 flag 走 submit_flag.sh 直连，本地感知不到，
+        # 以平台 correct_flag_count 总数为准（60s 回查一次）。
+        self._last_total_flags = -1          # 上次回查的全局 correct flag 数（-1=未校准）
+        self._last_progress_ts = time.monotonic()  # 最近一次 flag 增长的墙钟时间
+        self._last_boost_ts = 0.0            # 上次掉速插队时间（20min 冷却防反复插同一题）
+        self._last_stagnate_check = 0.0      # 上次掉速检查墙钟时间
 
     async def _watchdog(self):
         """容器看门狗：worker 在跑但容器被平台回收时自动重启并更新地址。"""
@@ -163,6 +172,46 @@ class Scheduler:
 
     async def _refresh(self) -> list[Challenge]:
         return await self.api.list_challenges()
+
+    async def _stagnate_check(self):
+        """全局掉速检测（run 12396 复盘）：连续 N 分钟无新 flag 入账时，把最高
+        价值的多 flag 未解题强制插队到 pending 队头——worker 对多 flag 题启动即
+        派 Task 子 agent 分治（4-8 线），插队即转分治。flag 计数以平台回查为准
+        （harness 的 flag 走 submit_flag.sh 直连，本地 submitter 感知不到）。
+        20 分钟冷却防反复插同一题；仅插队不杀在跑任务（不干扰正在解的题）。"""
+        if self.cfg.stagnate_boost_min <= 0:
+            return
+        try:
+            challenges = await self._refresh()
+        except ApiError:
+            return
+        total = sum(c.correct_flag_count for c in challenges)
+        now = time.monotonic()
+        if total > self._last_total_flags:
+            self._last_total_flags = total
+            self._last_progress_ts = now
+            return
+        if now - self._last_progress_ts < self.cfg.stagnate_boost_min * 60:
+            return
+        if now - self._last_boost_ts < 1200:
+            return
+        # 目标：剩余面最多的多 flag 未解题（b 系列 4-6 面大题），且不在跑/不在冷却
+        fresh = {c.unique_code: c for c in challenges}
+        candidates = [fresh.get(c.unique_code, c)
+                      for c in self.pending + self.retry_queue
+                      if fresh.get(c.unique_code, c).remaining_flags >= 2
+                      and c.unique_code not in self.active_workers
+                      and not _challenge_completed(fresh.get(c.unique_code, c))]
+        if not candidates:
+            return
+        target = max(candidates, key=lambda c: (c.remaining_flags, c.total_score))
+        self.pending = [c for c in self.pending if c.unique_code != target.unique_code]
+        self.retry_queue = [c for c in self.retry_queue if c.unique_code != target.unique_code]
+        self.pending.insert(0, target)
+        self._last_boost_ts = now
+        log.warning("[stagnate] 连续 %d 分钟无新 flag，强制插队 %s（%d 面剩 %d 分）"
+                    "转分治攻坚", self.cfg.stagnate_boost_min, target.unique_code,
+                    target.remaining_flags, target.total_score)
 
     async def _start_throttled(self, code: str) -> list[str]:
         """start 接口限速（相邻调用 ≥0.6s）：平台文档上限 3 题并发，
@@ -593,6 +642,10 @@ class Scheduler:
                 # 不再空转轮转（run 8629 复盘：16:37 后 10+ 分钟无效 409 轮转）。
                 log.info("平台任务已结束，停止调度")
                 break
+            # 掉速检测：60s 节流回查（主循环 15s 一轮，4 轮查一次）
+            if time.monotonic() - self._last_stagnate_check >= 60:
+                self._last_stagnate_check = time.monotonic()
+                await self._stagnate_check()
             time_left = self.deadline - time.monotonic()
             # 队列耗尽时：先吃 retry（本轮超时未解出、有断点续跑），
             # 再回查平台把仍未被解出的题重新入队。永不停止模式下只有
