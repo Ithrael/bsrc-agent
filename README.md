@@ -93,10 +93,10 @@ docker save bsrc-agent:latest | gzip > bsrc-agent.tar.gz   # ≤1GB
 | `LLM_MODEL_HARD` | 多模型分工：hard 题全程、easy/medium 一轮未解（attempt≥1）用该模型（如 `deepseek-v4-pro`），其余 flash |
 | `CLAUDE_HARD_EFFORT` | hard 会话 effort（思考预算），默认 `max`；置空关闭 |
 | `MAX_CONCURRENT` | **平台题目槽位上限 3**。start 接口内置 0.6s 限速；409 invalid_state 不降级，题轮转队尾 30s 后重试 |
-| `MAX_AGENT_CONCURRENT` | Agent 思考线全局上限，默认 9（3 题 × 3 线）；网关限流时可设为 6 |
-| `CLAUDE_TOKEN_BUDGET` | `<0` 禁用 Claude 会话 token 熔断（默认 -1）；6 小时冲刺不因 token 额度提前停题 |
-| `CHALLENGE_TIMEOUT_MIN` | 单题快速轮转预算由难度/尝试次数决定：hard 25/35/40min、medium 20/25min、easy 10/15min；复现题单 flag 5min、多 flag 10min |
-| `GLOBAL_BUDGET_MIN` | 全局预算分钟数，默认 345（时限 360） |
+| `MAX_AGENT_CONCURRENT` | 主 claude 进程全局上限，默认 6（3 题 = 3 主进程 + 断点重跑等辅助调用余量）；Task 子 agent 在主进程内并行，不占此额度 |
+| `CLAUDE_TOKEN_BUDGET` | `<0` 禁用 Claude 会话 token 熔断（默认 -1）；6 小时冲刺不因 token 额度提前停题。注意熔断只统计主进程流 usage，子 agent 消耗不计入 |
+| 单题预算（非配置项） | 代码按难度/尝试次数决定：hard 25/35/40min、medium 12/25min、easy 8/15min；复现题单 flag 5min、多 flag 10min |
+| `GLOBAL_BUDGET_MIN` | 全局预算分钟数，默认 345（时限 360），仅 NEVER_STOP=0 时生效 |
 
 `BENCHMARK_BASE_URL` / `BENCHMARK_TOKEN` 由平台自动注入，无需配置。
 
@@ -104,7 +104,7 @@ docker save bsrc-agent:latest | gzip > bsrc-agent.tar.gz   # ≤1GB
 
 ```bash
 .venv/bin/pip install pytest pytest-asyncio
-.venv/bin/python -m pytest tests/ -q     # 56 个测试，含 mock 平台端到端
+.venv/bin/python -m pytest tests/ -q     # 72 个测试，含 mock 平台端到端
 python -m tests.mock_server 8899          # 单独起 mock 平台手动联调
 ```
 

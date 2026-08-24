@@ -268,6 +268,8 @@ class WorkerResult:
 class Worker:
     # 动态升级门槛：跑满 4 分钟且 12 步无新 flag 才升级 harness（测试可调小）
     harness_upgrade_after_s = 240
+    # flag 兜底提交周期（秒）：drain 通道轮询事件流捕获的 flag；测试可调小
+    _drain_interval_s = 20
 
     def __init__(self, cfg: Config, llm: LLMClient, api: TsecClient,
                  challenge: Challenge, addrs: list[str], workspace: str,
@@ -958,21 +960,53 @@ class Worker:
                 if self.submitter.completed:
                     break
 
+    def _state_submitted_flags(self) -> list[str]:
+        """STATE.md 里 submit_flag.sh 登记的已正确 flag（`- flag 已正确提交: <flag>` 行）。
+
+        Task 子 agent 的 bash 输出不进主进程事件流：它经 submit_flag.sh 直连提交成功时，
+        Python 侧 FlagSubmitter 完全不知情，完成判定此前只能靠主控复读 STATE.md（不确定）。
+        代码直接扫登记行兜底记账——重复提交走 duplicate 通道校准 correct 集合，
+        主控提前退出没读 STATE.md 也不会把已解出的题记成未解出。"""
+        flags: list[str] = []
+        try:
+            with open(self.state_path) as f:
+                for line in f:
+                    if "flag 已正确提交" not in line:
+                        continue
+                    for fl in extract_flags(line):
+                        if fl not in flags:
+                            flags.append(fl)
+        except OSError:
+            pass
+        return flags
+
+    async def _settle_claude_flags(self):
+        """claude 会话收尾统一记账：事件流捕获 + STATE.md 登记行都过提交闸门。"""
+        await self._submit_harness_flags()
+        for flag in self._state_submitted_flags():
+            if self.submitter.should_try(flag):
+                r = await self._submit_cb(flag)
+                log.info("[%s] STATE.md 登记flag 补记账 %s -> %s",
+                         self.ch.unique_code, flag[:60], r[:40])
+                if self.submitter.completed:
+                    break
+
     async def _drain_harness_flags(self):
         """harness 运行期间周期提交已捕获 flag。
 
         on_text 是同步回调只能收集不能 await；harness 长跑（hard 双线 30min）时若等到
         结束才提交，flag 早已在事件流里出现过却白等——10585 复盘 e3-04 超时后挖出的
-        flag 是 duplicate。drain 每 20s 提交一轮，flag 一到手立刻入账。
+        flag 是 duplicate。drain 每 _drain_interval_s 提交一轮，flag 一到手立刻入账。
         """
         while True:
-            await asyncio.sleep(20)
+            await asyncio.sleep(self._drain_interval_s)
             await self._submit_harness_flags()
 
-    async def _run_harness_with_drain(self, prompt: str, timeout_s: int, cwd: str = "", **kw):
-        """带实时 flag 提交的 harness 包装：drain 任务与 harness 并发，结束后统一再提交一轮。
+    async def _run_harness_with_drain(self, prompt: str, timeout_s: int, **kw):
+        """带实时 flag 提交与完成早停的 harness 包装。
 
-        cwd：分治线的独立子目录（lineX/，软链共享文件）——多线互不踩工作文件。"""
+        drain 任务与 harness 并发（周期提交捕获的 flag）；本题全部 flag 入账时
+        _completion_event 置位 → run_harness 杀进程组提前收工，不占槽位等超时。"""
         from .harness import run_harness
         sem = self._agent_semaphore
         acquired = False
@@ -981,44 +1015,14 @@ class Worker:
             acquired = True
         drain = asyncio.create_task(self._drain_harness_flags())
         try:
-            return await run_harness(self.cfg, prompt, cwd or self.ws, timeout_s, **kw)
+            return await run_harness(self.cfg, prompt, self.ws, timeout_s,
+                                     stop_event=self._completion_event, **kw)
         finally:
             drain.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await drain
             if acquired:
                 sem.release()
-
-    async def _run_harness_group(self, jobs: list[dict]):
-        """并行启动一组 Agent；任一线提交完本题后立即取消其余线。
-
-        返回值中被取消的线为 ``None``。取消会穿透到 harness 的 finally，
-        由进程组清理逻辑回收 Claude 及其 bash 子进程。
-        """
-        tasks = [asyncio.create_task(self._run_harness_with_drain(**job)) for job in jobs]
-
-        async def _cancel_losers():
-            await self._completion_event.wait()
-            if not self.submitter.completed:
-                return
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-
-        stopper = asyncio.create_task(_cancel_losers())
-        try:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-        finally:
-            stopper.cancel()
-        normalized = []
-        for result in results:
-            if isinstance(result, asyncio.CancelledError):
-                normalized.append(None)
-            elif isinstance(result, BaseException):
-                raise result
-            else:
-                normalized.append(result)
-        return normalized
 
     async def _run_harness_retry(self, messages: list[dict], timeout_s: int) -> str:
         """打包当前进展 → spawn 外部 agent CLI 重探索 → 提交捕获的 flag → 返回摘要。
@@ -1124,7 +1128,11 @@ class Worker:
 
     def _claude_token_budget(self) -> int:
         """单题 claude token 熔断阈值：0 走难度分层（run 9054 复盘 b-02 单会话 920 万 token 仍 0 解），
-        >0 用配置值，<0 禁用。"""
+        >0 用配置值，<0 禁用。
+
+        已知限制：熔断只统计主进程事件流里的 assistant usage；Task 子 agent 的
+        消耗不进主进程流，启用熔断时会低估实际花费（默认 CLAUDE_TOKEN_BUDGET=-1
+        即关闭，不受影响）。启用前需先实测 stream-json 是否含子 agent usage。"""
         v = self.cfg.claude_token_budget
         if v < 0:
             return 0
@@ -1383,7 +1391,9 @@ class Worker:
                 f"方向互不重叠：\n{subtask_table}\n"
                 "3. 每个子 agent 的指令里必须包含（防互相踩）：\n"
                 "   - 独立工作目录 line_{线号}/：所有脚本/输出/临时文件只写在这里，"
-                "禁止写工作目录之外的任何文件（共享文件除外）\n"
+                "禁止写工作目录之外的任何文件（共享文件除外）；"
+                "line 目录内的 NOTES.md/STATE.md/RELAY.md/submit_flag.sh 是软链"
+                "（指向共享文件），cd 进去后照样用相对路径追加/提交\n"
                 "   - 共享文件只追加且带线名前缀：`echo '- [X线] <发现>' >> NOTES.md`"
                 "（RELAY.md、STATE.md 的 INTENTS/ELIMINATED 同理），禁止重排/覆盖他人内容\n"
                 "   - 拿到 flag 立即用 bash 执行 `./submit_flag.sh <flag>` 提交\n"
@@ -1410,9 +1420,18 @@ class Worker:
                     "5. **容器/宿主逃逸**：检查 /var/run/docker.sock 挂载、overlay 挂载、"
                     "/proc/self/status 里的宿主机特征——多面题高分段常靠逃逸到宿主或其他容器。\n"
                     "6. 每台新主机重复 1-5；每面 flag 一到手立即 ./submit_flag.sh，然后继续下一面。")
-            # 主进程 cwd = 工作区根；子 agent 约定目录先建好
+            # 主进程 cwd = 工作区根；子 agent 约定目录先建好。
+            # 共享文件软链进各 line 目录（f54063c 重构曾误删，2026-08-24 review 恢复）：
+            # 子 agent 按指令 cd line_X 后，相对路径的 NOTES.md 追加与 ./submit_flag.sh
+            # 仍落在共享文件上——纯 prompt 约定防不住 cwd 漂移（cd 后 >> NOTES.md 会
+            # 建隔离副本、./submit_flag.sh 直接 file not found，flag 显式提交通道断掉）
             for key in line_keys:
-                os.makedirs(os.path.join(self.ws, f"line_{key}"), exist_ok=True)
+                line_dir = os.path.join(self.ws, f"line_{key}")
+                os.makedirs(line_dir, exist_ok=True)
+                for name in ("NOTES.md", "STATE.md", "RELAY.md", "submit_flag.sh"):
+                    src, dst = os.path.join(self.ws, name), os.path.join(line_dir, name)
+                    if os.path.exists(src) and not os.path.lexists(dst):
+                        os.symlink(src, dst)
             prompt = self._build_claude_prompt(ch, sol, notes, has_completed_sol, desc_hints,
                                                recon_report, master_role)
             prompt += hint_text + advisor_text
@@ -1429,8 +1448,9 @@ class Worker:
             res = await self._run_harness_with_drain(prompt, timeout_s,
                                     on_text=self._harness_on_text, token_budget=token_budget,
                                     model=hard_model, effort=hard_effort)
-        # 输出捕获通道提交（submit_flag.sh 走平台直连，此通道兜底漏网的 flag）
-        await self._submit_harness_flags()
+        # 收尾统一记账（输出捕获 + STATE.md 登记行兜底：submit_flag.sh 显式通道
+        # 走平台直连，Python 侧 submitter 只能靠这两条路径感知完成）
+        await self._settle_claude_flags()
 
         # 快速重跑（run 9234 复盘）：claude 提前退出（非超时/熔断）且 flag 没拿全——
         # e1-03 2.8min 就退、a-05 12.7min 退，9054 里都能解出。当场断点重跑一次，
@@ -1455,7 +1475,7 @@ class Worker:
             res.collected += "\n===== 断点重跑 =====\n" + res2.digest()
             res.events += res2.events
             res.total_tokens += res2.total_tokens
-            await self._submit_harness_flags()
+            await self._settle_claude_flags()
 
         # 会话结束蒸馏（hxbai 模式）：未拿全时蒸馏接力块，短会话轮转不丢断点
         if not self.submitter.completed and (res.output_text or res.events):
@@ -1483,7 +1503,18 @@ class Worker:
     def _record_claude_solution(self, res):
         """claude 模式解法落库：note=claude 输出摘要（output_text + 事件流尾部），
         completed 按 flag 全拿判定。steps 留空（claude 会话不产出逐条 shell 步骤，
-        复现轮靠 note 摘要 + NOTES.md 工作区文件引导）。"""
+        复现轮靠 note 摘要 + NOTES.md 工作区文件引导）。
+
+        落库纪律与裸 LLM 版 _record_solution 一致（2026-08-24 review 修复：
+        此前无条件覆盖，复现题超时/秒退会把已验证 completed 解法降级）：
+        - 解出 → 覆盖写 completed=True
+        - 未解出且 ≥8min → partial：已有 completed 记录不降级覆盖
+        - 未解出且 <8min → 快速失败不落库（note 价值低，覆盖只会污染已有记录）
+        """
+        is_solved = bool(self.result.completed)
+        is_partial = (not is_solved) and self.result.elapsed_min >= 8
+        if not (is_solved or is_partial):
+            return
         if not self.cfg.record_solutions:
             return
         try:
@@ -1493,9 +1524,15 @@ class Worker:
                         lib = json.load(f)
                 except (OSError, json.JSONDecodeError):
                     lib = {}
-                entry = dict(lib.get(self.ch.unique_code, {}))
+                cur = lib.get(self.ch.unique_code) or {}
+                if is_partial and cur.get("completed"):
+                    return  # 已有完整解法，不降级覆盖（复现超时≠解法失效）
+                entry = dict(cur)
                 entry["note"] = ((res.output_text or "") + "\n" + res.digest())[-6000:]
-                entry["completed"] = bool(self.result.completed)
+                entry["completed"] = is_solved
+                # partial 标记：scheduler 的断点优先通道（_priority/_should_use_harness）
+                # 靠它识别「上轮有断点」，claude 记录器此前漏写导致通道永不触发
+                entry["partial"] = is_partial
                 entry["elapsed_min"] = round(self.result.elapsed_min, 1)
                 lib[self.ch.unique_code] = entry
                 tmp = solution_lib_path() + ".tmp"

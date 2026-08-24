@@ -12,6 +12,8 @@ import os
 import sys
 import time
 
+log = logging.getLogger("main")
+
 
 async def _probe_anthropic_channel(cfg) -> tuple[int, str]:
     """启动自检：探测 claude 后端依赖的 Anthropic 通道（托管网关 /anthropic 路径此前未实测）。
@@ -32,6 +34,34 @@ async def _probe_anthropic_channel(cfg) -> tuple[int, str]:
             return r.status_code, (r.text or "")[:120].replace("\n", " ")
     except Exception as e:
         return 0, f"{type(e).__name__}: {e}"
+
+
+async def _smoke_claude(cfg) -> bool:
+    """claude 全链路冒烟：spawn 真实 claude -p（一次最小对话，真走一次网关），
+    校验 rc==0 且有 stream-json 输出。
+
+    比二进制存在性检查更严：ClawGod patch 断裂（版本漂移）/ bun 丢失 /
+    launcher 指向的 cli.cjs 缺失时，`claude --version` 可能仍正常，但 -p 秒退
+    127/1——只有实跑能暴露。失败由调用方降级裸 LLM 模式，绝不带着坏 claude 空转。"""
+    from .harness import _claude_env
+    probe_model = cfg.llm_model_hard or cfg.llm_model
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "claude", "-p", "回复 OK", "--model", probe_model,
+            "--output-format", "stream-json", "--verbose",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env=_claude_env(cfg, probe_model))
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+    except Exception as e:
+        log.warning("claude 冒烟异常: %s", e)
+        return False
+    text = (out or b"").decode(errors="replace")
+    if proc.returncode == 0 and '"type"' in text:
+        log.info("claude 冒烟 OK（rc=0, %d 字节输出）", len(text))
+        return True
+    log.warning("claude 冒烟失败 rc=%s，输出前 200 字符: %s",
+                proc.returncode, text[:200].replace("\n", " "))
+    return False
 
 
 def _setup_logging(run_dir: str):
@@ -86,15 +116,33 @@ async def _amain() -> int:
             if not cfg.llm_model_hard:
                 log.warning("LLM_MODEL_HARD 未设置：hard 题/retry 轮将全程使用 %s 单模型。"
                             "建议配置（如 deepseek-v4-pro），否则攻坚能力受限。", cfg.llm_model)
-            # claude 直接解题模式下 claude 完全依赖 Anthropic 通道：启动即探测，
-            # 不通立刻退出（否则整轮 0 分空转，任务 9030 教训）。
-            code, detail = await _probe_anthropic_channel(cfg)
-            if not (200 <= code < 300):
-                log.error("claude Anthropic 通道自检失败: HTTP %s %s", code, detail)
-                log.error("该通道不通时 claude_worker 整轮 0 分。请修复后重传，或设 CLAUDE_WORKER=0 走裸 LLM 循环。")
-                return 4
-            log.info("claude Anthropic 通道自检 OK: HTTP %s", code)
-            if cfg.claude_hard_effort:
+            # claude 可用性三道闸（2026-08-24 加固）：任一失败降级裸 LLM 循环继续解题，
+            # 不再退出空转（裸循环走 OpenAI 兼容端点，与 claude 依赖的 Anthropic 通道无关）。
+            # 历史教训：ClawGod 安装失败/patch 断裂时镜像仍能构建（"失败不阻断"），
+            # 带着 claude_worker=1 上场 = 整轮 6 小时 crash 循环 0 分（run 9030 同类）。
+            if cfg.harness_backend == "claude":
+                import shutil
+                if not shutil.which("claude"):
+                    log.error("claude 二进制不存在（ClawGod 安装失败？Dockerfile 构建期 WARNING 被吞）。"
+                              "降级裸 LLM 循环（CLAUDE_WORKER=0 等效），继续解题不空转。")
+                    cfg.claude_worker = False
+                    cfg.harness_enabled = False
+            if cfg.claude_worker:
+                code, detail = await _probe_anthropic_channel(cfg)
+                if not (200 <= code < 300):
+                    log.error("claude Anthropic 通道自检失败: HTTP %s %s", code, detail)
+                    log.error("claude 模式不可用。降级裸 LLM 循环继续解题（OpenAI 兼容端点已验证连通）。")
+                    cfg.claude_worker = False
+                    cfg.harness_enabled = False
+                else:
+                    log.info("claude Anthropic 通道自检 OK: HTTP %s", code)
+            if (cfg.claude_worker and cfg.harness_backend == "claude"
+                    and not await _smoke_claude(cfg)):
+                log.error("claude 冒烟失败（launcher/bun/patched CLI 链路断裂）。"
+                          "降级裸 LLM 循环继续解题。")
+                cfg.claude_worker = False
+                cfg.harness_enabled = False
+            if cfg.claude_worker and cfg.claude_hard_effort:
                 # effort 探测：--effort max 在 ClawGod+网关链路未实测过（第 1 次任务未用
                 # effort）。失败自动降级为无 effort（hard 题退回普通思考），不整轮赌命。
                 from .harness import _claude_env

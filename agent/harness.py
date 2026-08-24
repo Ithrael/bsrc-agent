@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -74,6 +75,11 @@ def _claude_env(cfg, model_override: str = "") -> dict:
     # Anthropic 端点从域名根派生（LLM_BASE_URL 自带 /v1，直接拼 /anthropic → 404）
     env["ANTHROPIC_BASE_URL"] = anthropic_gateway_url(cfg.llm_base_url)
     env["ANTHROPIC_AUTH_TOKEN"] = cfg.llm_api_key
+    # 缓存保险（ClawGod 补丁的等价 env）：x-anthropic-billing-header 会让第三方
+    # 网关（DeepSeek 等）的 prompt-cache 命中率归零（实测成本差 5-8 倍）。该变量
+    # 是 claude code 原生读取的——显式设置后，即使 ClawGod 某次构建 patch 静默
+    # 失效（版本漂移致正则失配），97% 缓存命中也保得住。
+    env["CLAUDE_CODE_ATTRIBUTION_HEADER"] = "0"
     model = model_override or cfg.llm_model
     env["ANTHROPIC_MODEL"] = model
     env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = model
@@ -136,14 +142,17 @@ def _parse_jsonl(line: str, res: HarnessResult, on_text=None):
 
 async def run_harness(cfg, prompt: str, cwd: str, timeout_s: int,
                       on_text=None, token_budget: int = 0, model: str = "",
-                      effort: str = "") -> HarnessResult:
+                      effort: str = "", stop_event: asyncio.Event | None = None) -> HarnessResult:
     """spawn 外部 agent CLI 跑一次攻坚。backend 支持：
     - "claude"：内置后端（ClawGod 版 claude code）
     - 其他值：当作可执行脚本路径（测试/自定义后端用），参数只有 cwd。
     流式逐行读 stdout（原 communicate 一次性读完）：支持 token 熔断——
     assistant 步级 usage 累计超 token_budget 就 kill（run 9054 复盘 b-02 单会话 920 万 token）。
     model：非空时覆盖该会话的 ANTHROPIC_MODEL（多模型分工：hard 题用更强模型）。
-    effort：非空时加 --effort（hard 题 max 思考预算，Claude Code 2.1.231+ 支持）。"""
+    effort：非空时加 --effort（hard 题 max 思考预算，Claude Code 2.1.231+ 支持）。
+    stop_event：外部完成信号（本题 flag 已全部入账）——置位即杀进程组提前收工。
+    单主进程 + Task 子 agent 架构下槽位时间是稀缺资源，flag 拿齐后不等模型
+    自己收尾/超时（旧多线架构靠 _cancel_loser_workers 做同等事，重构后一度丢失）。"""
     if cfg.harness_backend == "claude":
         env, cmd = _claude_env(cfg, model), _claude_cmd(cfg, effort, model)
     else:
@@ -192,6 +201,15 @@ async def run_harness(cfg, prompt: str, cwd: str, timeout_s: int,
             if buf:  # EOF 残留的未换行尾行
                 _parse_jsonl(buf.decode(errors="replace"), res, on_text)
 
+        stopper = None
+        if stop_event is not None:
+            async def _stop_on_complete():
+                await stop_event.wait()
+                _kill_proc(proc)  # 杀进程组 → stdout EOF → _read_loop 自然退出
+                res.collected += "\n[HARNESS STOPPED EARLY]\n"
+                log.info("[harness] %s 完成事件触发提前终止（flag 已全部入账）", cmd[0])
+            stopper = asyncio.create_task(_stop_on_complete())
+
         try:
             await asyncio.wait_for(_read_loop(), timeout=timeout_s)
         except asyncio.TimeoutError:
@@ -199,6 +217,11 @@ async def run_harness(cfg, prompt: str, cwd: str, timeout_s: int,
             killed = True
             res.collected += "\n[HARNESS TIMEOUT]\n"
             log.warning("[harness] %s 超时被杀（%ds）", cmd[0], timeout_s)
+        finally:
+            if stopper is not None:
+                stopper.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await stopper
         if killed:
             await _wait_proc(proc)
         else:

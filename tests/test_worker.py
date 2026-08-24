@@ -38,7 +38,6 @@ async def test_worker_auto_capture_and_finish(tmp_path):
     addrs = await api.start_challenge(ch.unique_code)
 
     cfg = Config()
-    cfg.challenge_timeout_min = 5
     cfg.recon_boot = False  # mock 目标在 127.0.0.1 随机端口，预侦察无意义且拖慢测试
     cfg.record_solutions = False  # 不把 mock 题写进真实 solutions.json
     w = Worker(cfg, FakeLLM(), api, ch, addrs, str(tmp_path / "mock_web_01"),
@@ -60,7 +59,6 @@ async def test_state_md_tracks_flag_progress(tmp_path):
     addrs = await api.start_challenge(ch.unique_code)
 
     cfg = Config()
-    cfg.challenge_timeout_min = 5
     cfg.recon_boot = False
     cfg.record_solutions = False
     w = Worker(cfg, FakeLLM(), api, ch, addrs, str(tmp_path / "mock_web_01"),

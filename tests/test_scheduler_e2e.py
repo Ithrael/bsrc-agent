@@ -57,7 +57,6 @@ async def test_scheduler_end_to_end(tmp_path):
     host, port = srv.server_address
     api = TsecClient(f"http://{host}:{port}", TOKEN)
     cfg = Config()
-    cfg.challenge_timeout_min = 5
     cfg.max_concurrent = 3
     cfg.recon_boot = False  # mock 目标在 127.0.0.1 随机端口，预侦察无意义且拖慢测试
     cfg.record_solutions = False  # 不把 mock 题写进真实 solutions.json
@@ -102,7 +101,6 @@ async def test_fixed_concurrency_no_convergence(tmp_path):
     host, port = srv.server_address
     api = TsecClient(f"http://{host}:{port}", TOKEN)
     cfg = Config()
-    cfg.challenge_timeout_min = 5
     cfg.max_concurrent = 3
     cfg.recon_boot = False
     cfg.record_solutions = False
@@ -142,7 +140,6 @@ async def test_paired_workers(tmp_path):
     host, port = srv.server_address
     api = TsecClient(f"http://{host}:{port}", TOKEN)
     cfg = Config()
-    cfg.challenge_timeout_min = 5
     cfg.max_concurrent = 3
     cfg.pair_workers = True
     cfg.recon_boot = False
@@ -190,7 +187,6 @@ async def test_no_pair_when_solution_exists(tmp_path):
     host, port = srv.server_address
     api = TsecClient(f"http://{host}:{port}", TOKEN)
     cfg = Config()
-    cfg.challenge_timeout_min = 5
     cfg.max_concurrent = 3
     cfg.pair_workers = True
     cfg.recon_boot = False

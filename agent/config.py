@@ -121,14 +121,14 @@ class Config:
     harness_timeout_min: int = field(default_factory=lambda: _int("HARNESS_TIMEOUT_MIN", 15))
     # claude 单题 token 熔断（P1，run 9054 复盘 b-02 单会话烧 920 万 token 仍 0 解）：
     # 0 = 按难度分层自动；>0 = 固定值；<0 = 禁用。6 小时最大解题数量模式默认不熔断。
+    # 注意：熔断只统计主进程事件流 usage，Task 子 agent 消耗不计入（低估）；
+    # 启用前先实测（详见 Worker._claude_token_budget）。
     claude_token_budget: int = field(default_factory=lambda: _int("CLAUDE_TOKEN_BUDGET", -1))
     # 永不停止：只要平台还有未解出的题就一直跑，全部解开才退出。
     # 单题超时/失败一律临时放弃（状态落库）+ 轮转续跑，不再受全局时限提前掐断。
     # NEVER_STOP=0 时才退回「受 GLOBAL_BUDGET_MIN 约束」的有界模式（调试用）。
     never_stop: bool = field(default_factory=lambda: os.environ.get("NEVER_STOP", "1") != "0")
     global_budget_min: int = field(default_factory=lambda: _int("GLOBAL_BUDGET_MIN", 345))  # 仅 NEVER_STOP=0 时生效
-    challenge_timeout_min: int = field(default_factory=lambda: _int("CHALLENGE_TIMEOUT_MIN", 30))
-    challenge_max_steps: int = field(default_factory=lambda: _int("CHALLENGE_MAX_STEPS", 150))
     # 第一轮（ROUND=1）熔断：覆盖优先快速过手，token/步数超限即放弃轮转，把难题留给第二轮攻坚。
     # 第二轮（ROUND=2）不设熔断，以解开题目为终极目标。
     round1_max_steps: int = field(default_factory=lambda: _int("ROUND1_MAX_STEPS", 40))

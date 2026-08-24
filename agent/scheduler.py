@@ -109,6 +109,9 @@ class Scheduler:
         self._live = 0                              # 运行中的 _run_one 任务数（含 start 中的）
         self._start_backoff: dict[str, float] = {}  # 409 轮转的题 -> 可重试时间戳
         self._task_finished = False  # 平台任务已结束（start/close 报 already finished）时置位停止空转
+        # claude 运行时健康度：连续崩溃/无输出计数（启动三道闸只防"带病上场"，
+        # 这里防运行中恶化——网关策略变化/运行时错误。达标全局降级裸 LLM）
+        self._claude_fail_streak = 0
 
     async def _watchdog(self):
         """容器看门狗：worker 在跑但容器被平台回收时自动重启并更新地址。"""
@@ -195,6 +198,23 @@ class Scheduler:
 
     def _on_task_done(self, t: asyncio.Task):
         self._live -= 1
+
+    def _track_claude_health(self, res: WorkerResult):
+        """claude 运行时健康度：连续崩溃/无输出达阈值（默认 6 次 ≈ 全槽位两轮
+        快速失败）就全局降级裸 LLM 模式。崩溃是秒级的，坏 claude 几分钟内触发；
+        单题偶发（容器抖动）有 3 槽位余量不会误杀。任何一次正常输出即清零。"""
+        if not self.cfg.claude_worker:
+            return
+        r = res.reason or ""
+        if r.startswith(("crash:", "claude no output", "harness crash")):
+            self._claude_fail_streak += 1
+            if self._claude_fail_streak >= 6:
+                log.error("claude 连续 %d 次崩溃/无输出（运行中恶化），"
+                          "全局降级裸 LLM 模式继续解题", self._claude_fail_streak)
+                self.cfg.claude_worker = False
+                self.cfg.harness_enabled = False
+        else:
+            self._claude_fail_streak = 0
 
     async def _close_safely(self, code: str) -> None:
         """close + 失败重试一次：实例泄漏会占平台槽位（3 上限写死，泄漏=槽位永久少一个）。"""
@@ -297,6 +317,7 @@ class Scheduler:
                 res.reason = f"crash: {type(e).__name__}: {e}"
             finally:
                 self.active_workers.pop(code, None)
+            self._track_claude_health(res)
             await self._finish(ch, res)
 
     def _should_use_harness(self, ch: Challenge) -> bool:

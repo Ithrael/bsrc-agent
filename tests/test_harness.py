@@ -131,7 +131,6 @@ async def test_worker_harness_upgrade_submits_flag(tmp_path):
     ch = next(c for c in await api.list_challenges() if c.unique_code == "mock_web_01")
     addrs = await api.start_challenge(ch.unique_code)
     cfg = Config()
-    cfg.challenge_timeout_min = 5
     cfg.recon_boot = False
     cfg.record_solutions = False
     cfg.harness_enabled = True

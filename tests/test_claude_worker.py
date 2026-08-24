@@ -132,6 +132,12 @@ async def test_claude_worker_pair_split(tmp_path, monkeypatch):
     # 防踩：子 agent 约定目录已创建
     ws = tmp_path / "ws"
     assert (ws / "line_A").is_dir() and (ws / "line_F").is_dir()
+    # 防踩：共享文件软链进各 line 目录（cd line_X 后相对路径追加/提交仍落共享文件，
+    # f54063c 重构误删、2026-08-24 review 恢复）
+    for name in ("NOTES.md", "STATE.md", "RELAY.md", "submit_flag.sh"):
+        ln = ws / "line_A" / name
+        assert ln.is_symlink(), f"line_A/{name} 应为软链"
+        assert ln.resolve() == (ws / name).resolve()
     await api.close()
 
 
@@ -243,7 +249,7 @@ async def test_medium_round2_uses_hard_model(tmp_path, monkeypatch):
     calls: list[dict] = []
 
     async def fake_run_harness(cfg, prompt, cwd, timeout_s, on_text=None,
-                               token_budget=0, model="", effort=""):
+                               token_budget=0, model="", effort="", stop_event=None):
         calls.append({"model": model, "effort": effort, "timeout_s": timeout_s})
         from agent.harness import HarnessResult
         r = HarnessResult()
@@ -352,7 +358,7 @@ async def test_repro_challenge_skips_hard_model(tmp_path, monkeypatch):
     calls: list[dict] = []
 
     async def fake_run_harness(cfg, prompt, cwd, timeout_s, on_text=None,
-                               token_budget=0, model="", effort=""):
+                               token_budget=0, model="", effort="", stop_event=None):
         calls.append({"model": model, "effort": effort, "timeout_s": timeout_s,
                       "token_budget": token_budget})
         from agent.harness import HarnessResult
@@ -410,7 +416,7 @@ async def test_repro_multi_flag_timeout_10min(tmp_path, monkeypatch):
     calls: list[dict] = []
 
     async def fake_run_harness(cfg, prompt, cwd, timeout_s, on_text=None,
-                               token_budget=0, model="", effort=""):
+                               token_budget=0, model="", effort="", stop_event=None):
         calls.append({"timeout_s": timeout_s, "token_budget": token_budget})
         from agent.harness import HarnessResult
         r = HarnessResult()
@@ -568,3 +574,217 @@ def test_rotation_notice_injected_into_claude_prompt(tmp_path):
     prompt = w._build_claude_prompt(ch, {}, {}, False, [], "", "")
     assert "容器已轮换" in prompt
     assert "10.0.0.9:80" in prompt
+
+
+# ---- 2026-08-24 review 修复：子 agent 架构闭环加固 ----
+
+
+@pytest.mark.asyncio
+async def test_early_stop_on_completion(tmp_path, monkeypatch):
+    """完成早停：drain 通道提交最后一面 flag → 完成事件杀主进程组，
+    不等它 sleep 60 自己结束/超时（槽位时间是稀缺资源）。"""
+    srv = make_server()
+    host, port = srv.server_address
+    api = TsecClient(f"http://{host}:{port}", TOKEN)
+    ch = next(c for c in await api.list_challenges() if c.unique_code == "mock_web_01")
+    addrs = await api.start_challenge(ch.unique_code)
+
+    sol_path = tmp_path / "solutions.json"
+    sol_path.write_text("{}")
+    notes_path = tmp_path / "notes.json"
+    notes_path.write_text("{}")
+    monkeypatch.setattr(worker_mod, "solution_lib_path", lambda: str(sol_path))
+    monkeypatch.setattr(worker_mod, "notes_lib_path", lambda: str(notes_path))
+
+    # fake claude：先吐 flag 再 sleep 60（不触发完成早停就会跑满 60s）
+    p = tmp_path / "fake-claude.sh"
+    p.write_text("#!/bin/bash\n"
+                 "echo '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\","
+                 "\"text\":\"found flag{mock_flag_01}\"}]}}'\n"
+                 "sleep 60\n"
+                 "echo '{\"type\":\"result\",\"result\":\"never reached\"}'\n")
+    p.chmod(0o755)
+
+    cfg = Config()
+    cfg.claude_worker = True
+    cfg.harness_backend = str(p)
+    cfg.recon_boot = False
+    cfg.record_solutions = False
+    monkeypatch.setattr(Worker, "_drain_interval_s", 0.2)
+
+    t0 = time.monotonic()
+    w = Worker(cfg, object(), api, ch, addrs, str(tmp_path / "ws"),
+               deadline=time.monotonic() + 600)
+    res = await w.run()
+    elapsed = time.monotonic() - t0
+
+    assert res.completed
+    assert res.flags == ["flag{mock_flag_01}"]
+    assert elapsed < 30, f"完成事件应提前杀掉主进程，实际跑了 {elapsed:.1f}s"
+    await api.close()
+
+
+@pytest.mark.asyncio
+async def test_state_md_submitted_flag_settled(tmp_path, monkeypatch):
+    """子 agent 内部提交兜底：flag 只登记在 STATE.md（submit_flag.sh 成功后写入的行），
+    主进程事件流从未出现该值（Task 子 agent 输出不进主流）→ 收尾扫描登记行补记账。"""
+    srv = make_server()
+    host, port = srv.server_address
+    api = TsecClient(f"http://{host}:{port}", TOKEN)
+    ch = next(c for c in await api.list_challenges() if c.unique_code == "mock_web_01")
+    addrs = await api.start_challenge(ch.unique_code)
+
+    sol_path = tmp_path / "solutions.json"
+    sol_path.write_text("{}")
+    notes_path = tmp_path / "notes.json"
+    notes_path.write_text("{}")
+    monkeypatch.setattr(worker_mod, "solution_lib_path", lambda: str(sol_path))
+    monkeypatch.setattr(worker_mod, "notes_lib_path", lambda: str(notes_path))
+
+    # fake claude：模拟子 agent 已在内部经 submit_flag.sh 提交成功（STATE.md 有登记行），
+    # 主进程流只输出不含 flag 的总结
+    p = tmp_path / "fake-claude.sh"
+    p.write_text("#!/bin/bash\n"
+                 "echo '- flag 已正确提交: flag{mock_flag_01}' >> STATE.md\n"
+                 "echo '{\"type\":\"result\",\"result\":\"sub-agent submitted internally\"}'\n")
+    p.chmod(0o755)
+
+    cfg = Config()
+    cfg.claude_worker = True
+    cfg.harness_backend = str(p)
+    cfg.recon_boot = False
+    cfg.record_solutions = False
+
+    w = Worker(cfg, object(), api, ch, addrs, str(tmp_path / "ws"),
+               deadline=time.monotonic() + 600)
+    res = await w.run()
+
+    assert res.completed, "STATE.md 登记行应兜底记账完成判定"
+    assert res.flags == ["flag{mock_flag_01}"]
+    assert res.score == 100
+    await api.close()
+
+
+def test_record_claude_solution_guards(tmp_path, monkeypatch):
+    """解法库落库纪律（对齐裸 LLM 版）：快速失败不落库；partial 不降级已有
+    completed；partial 标记补写（scheduler 断点优先通道依赖）。"""
+    from agent.harness import HarnessResult
+
+    sol_path = tmp_path / "solutions.json"
+    monkeypatch.setattr(worker_mod, "solution_lib_path", lambda: str(sol_path))
+
+    def _worker():
+        w = Worker.__new__(Worker)
+        w.cfg = Config()
+        w.cfg.record_solutions = True
+        w.ch = Challenge.from_dict({"unique_code": "mock_web_01", "flag_count": 1,
+                                    "total_score": 100, "difficulty": "easy"})
+        w.result = worker_mod.WorkerResult()
+        return w
+
+    res = HarnessResult()
+    res.output_text = "gave up"
+    w = _worker()
+
+    # 场景 1：已有 completed 记录 + 本轮快速失败（<8min）→ 完全不落库
+    sol_path.write_text(json.dumps(
+        {"mock_web_01": {"completed": True, "note": "已验证解法"}}))
+    w.result.completed = False
+    w.result.elapsed_min = 2.0
+    w._record_claude_solution(res)
+    lib = json.loads(sol_path.read_text())
+    assert lib["mock_web_01"] == {"completed": True, "note": "已验证解法"}
+
+    # 场景 2：本轮超时失败（≥8min partial）→ 已有 completed 不降级覆盖
+    w.result.elapsed_min = 12.0
+    w._record_claude_solution(res)
+    lib = json.loads(sol_path.read_text())
+    assert lib["mock_web_01"]["completed"] is True
+
+    # 场景 3：无已有记录 + 超时失败 → 落 partial=True（断点通道可识别）
+    sol_path.write_text("{}")
+    w._record_claude_solution(res)
+    lib = json.loads(sol_path.read_text())
+    assert lib["mock_web_01"]["completed"] is False
+    assert lib["mock_web_01"]["partial"] is True
+
+    # 场景 4：解出 → completed=True 且清 partial
+    w.result.completed = True
+    w._record_claude_solution(res)
+    lib = json.loads(sol_path.read_text())
+    assert lib["mock_web_01"]["completed"] is True
+    assert lib["mock_web_01"]["partial"] is False
+
+
+# ---- ClawGod 保险（2026-08-24：缓存 env + 启动冒烟降级 + 运行时健康守卫）----
+
+
+def test_claude_env_sets_attribution_header():
+    """缓存保险：_claude_env 显式设 CLAUDE_CODE_ATTRIBUTION_HEADER=0——
+    ClawGod 补丁的原生 env 等价物，patch 静默失效时缓存命中仍保得住。"""
+    from agent.harness import _claude_env
+    cfg = Config()
+    env = _claude_env(cfg)
+    assert env["CLAUDE_CODE_ATTRIBUTION_HEADER"] == "0"
+    assert env["ANTHROPIC_BASE_URL"]
+    assert "ANTHROPIC_API_KEY" not in env  # 避免与 AUTH_TOKEN 冲突
+
+
+@pytest.mark.asyncio
+async def test_smoke_claude_detects_broken_and_healthy(monkeypatch):
+    """启动冒烟：rc!=0 或无 stream 输出判死（--version 正常但 -p 秒退的
+    patch 断裂场景）；rc=0 且有 JSON 输出判活。"""
+    from agent import main as main_mod
+
+    class _Proc:
+        def __init__(self, rc, out):
+            self.returncode = rc
+            self._out = out
+
+        async def communicate(self):
+            return self._out, b""
+
+    cfg = Config()
+
+    async def fake_exec_fail(*a, **kw):
+        return _Proc(1, b"clawgod: bun runtime not found")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec_fail)
+    assert await main_mod._smoke_claude(cfg) is False
+
+    async def fake_exec_ok(*a, **kw):
+        return _Proc(0, b'{"type":"system","subtype":"init"}\n{"type":"result","result":"OK"}\n')
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec_ok)
+    assert await main_mod._smoke_claude(cfg) is True
+
+
+def test_scheduler_claude_health_guard():
+    """运行时守卫：连续 6 次崩溃/无输出全局降级裸 LLM；任何正常输出清零计数。"""
+    from agent.scheduler import Scheduler
+
+    sched = Scheduler.__new__(Scheduler)
+    sched.cfg = Config()
+    sched.cfg.claude_worker = True
+    sched.cfg.harness_enabled = True
+    sched._claude_fail_streak = 0
+
+    def _res(reason):
+        r = worker_mod.WorkerResult()
+        r.reason = reason
+        return r
+
+    for i in range(5):
+        sched._track_claude_health(_res("crash: FileNotFoundError: claude"))
+        assert sched.cfg.claude_worker, f"5 次内不误杀（第 {i + 1} 次）"
+    sched._track_claude_health(_res("claude no output (timeout?)"))
+    assert not sched.cfg.claude_worker
+    assert not sched.cfg.harness_enabled
+
+    # 恢复场景：计数接近阈值时一次正常输出清零
+    sched.cfg.claude_worker = True
+    sched.cfg.harness_enabled = True
+    sched._claude_fail_streak = 5
+    sched._track_claude_health(_res("claude done"))
+    assert sched._claude_fail_streak == 0
+    assert sched.cfg.claude_worker

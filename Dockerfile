@@ -66,10 +66,12 @@ RUN (cd /tmp && bash clawgod-install.sh && rm -f /tmp/clawgod-install.sh) \
     || echo "WARNING: ClawGod 安装失败，harness 攻坚将不可用"
 ENV PATH=/root/.local/bin:$PATH
 # claude 权限白名单：root 用户禁用 --dangerously-skip-permissions，用官方 settings.json 放行。
-# Task(*) 必须显式放行：主进程 + 子 agent 架构依赖 Task 工具派发并行子 agent，
+# Task 必须显式放行：主进程 + 子 agent 架构依赖 Task 工具派发并行子 agent，
 # headless（-p）模式下 allow 列表之外的工具会被直接拒绝（无法交互授权）。
+# "Task" 与 "Task(*)" 双写：不同 CC 版本对通配符语法的匹配有差异，裸工具名
+# 是全版本最稳的放行形式（2026-08-24 review 加固）。
 RUN mkdir -p /root/.claude && \
-    echo '{"permissions": {"allow": ["Bash(*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "Task(*)"], "deny": []}}' \
+    echo '{"permissions": {"allow": ["Bash(*)", "Read(*)", "Write(*)", "Edit(*)", "Glob(*)", "Grep(*)", "Task", "Task(*)"], "deny": []}}' \
     > /root/.claude/settings.json
 # harness 可用性验证：claude 二进制存在性检查（构建日志可见，失败不阻断）
 RUN if command -v claude >/dev/null 2>&1; then claude --version 2>/dev/null || true; else echo "WARNING: claude not found, harness disabled"; fi
@@ -93,12 +95,15 @@ RUN git clone --depth 1 --filter=blob:none --sparse https://github.com/projectdi
     && rm -rf .git \
     || true
 
-# 精简词表
+# 精简词表（多级回退：SecLists 已把 top-100.txt 改名删除，2026-08-24 构建实测 404
+# 致 hydra 词表缺失；最终兜底内置列表，保证 prompt 引用的路径永不落空）
 RUN mkdir -p /opt/wordlists && \
     for f in raft-small-directories.txt raft-small-words.txt; do \
       curl -fsSL "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/$f" -o "/opt/wordlists/$f" || true; \
     done && \
-    curl -fsSL "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/top-100.txt" -o /opt/wordlists/top-100-passwords.txt || true
+    { curl -fsSL "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/xato-net-10-million-passwords-100.txt" -o /opt/wordlists/top-100-passwords.txt \
+      || curl -fsSL "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/darkweb2017_top-100.txt" -o /opt/wordlists/top-100-passwords.txt \
+      || printf '%s\n' 123456 password 123456789 12345678 12345 qwerty abc123 111111 123123 1234567890 1234567 iloveyou 000000 admin welcome monkey dragon letmein login princess qwertyuiop solo passw0rd starwars master hello freedom whatever qazwsx trustno1 superman batman football baseball dragon1 michael shadow jordan harley ranger buster hunter thomas robert charlie daniel hannah magic 1q2w3e4r 1qaz2wsx zaq12wsx password1 password123 p@ssw0rd root toor test guest user info changeme > /opt/wordlists/top-100-passwords.txt; }
 
 COPY agent /app/agent
 COPY api-doc.txt /app/api-doc.txt
