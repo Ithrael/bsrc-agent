@@ -219,7 +219,6 @@ async def test_medium_round2_timeout_25min():
     """题数最大化：medium 首轮 12min（快速轮转），重试轮 25min（run 12231 复盘回滚）。"""
     w = Worker.__new__(Worker)
     w.cfg = Config()
-    w.first_attempt = False
     w.attempt = 1
     w.ch = Challenge.from_dict({"unique_code": "bctf-02", "flag_count": 1,
                                 "total_score": 400, "difficulty": "medium"})
@@ -233,7 +232,6 @@ async def test_medium_round2_timeout_25min():
     assert w._scaled_timeout_s() == 25 * 60
     # 首轮快速轮转 12min
     w.attempt = 0
-    w.first_attempt = True
     assert w._scaled_timeout_s() == 12 * 60
 
 
@@ -936,3 +934,72 @@ def test_subagent_shared_files_include_hosts_ledger():
     dk = open("Dockerfile").read()
     assert "chisel" in dk
     assert "COPY tools/flag_sweep.sh tools/creds_replay.sh /opt/tools/" in dk
+
+
+# ---- 闭环修复回归（2026-08-26）：hint 去重 / HOSTS 速览 / harness 解法落库 ----
+
+@pytest.mark.asyncio
+async def test_hint_cb_reuses_cached_hint(tmp_path, monkeypatch):
+    """notes.json 已有官方 hint 时 get_hint 工具直接复用缓存，不再打 hint API
+    （重复查看重复扣 10%）。"""
+    from agent.config import Config
+    notes_p = tmp_path / "notes.json"
+    notes_p.write_text(json.dumps({"a-01": "[官方 hint] 从 SQL 注入入手，users 表有 flag"}))
+    monkeypatch.setattr(worker_mod, "notes_lib_path", lambda: str(notes_p))
+
+    class BoomApi:
+        async def get_hint(self, code):
+            raise AssertionError("已缓存 hint 不应再打 API")
+
+    w = Worker.__new__(Worker)
+    w.cfg = Config()          # hint_policy 默认 free
+    w.api = BoomApi()
+    w.ch = Challenge.from_dict({"unique_code": "a-01", "flag_count": 1,
+                                "total_score": 500, "difficulty": "easy"})
+    w.started = time.monotonic()
+    w._hint_used = False
+    out = await w._hint_cb()
+    assert "从 SQL 注入入手" in out
+    assert "免费复用" in out
+    assert w._hint_used
+
+
+@pytest.mark.asyncio
+async def test_workspace_digest_includes_hosts_ledger(tmp_path):
+    """续跑轮工作区速览必须带 HOSTS.md 资产台账（多 flag 续跑最关键交接）。"""
+    ws = tmp_path
+    (ws / "NOTES.md").write_text("# 笔记\n- 入口在 8080")
+    (ws / "STATE.md").write_text("## FACTS\n- flag 进度: 1/3")
+    (ws / "RELAY.md").write_text("# 接力块\n已达成原语: RCE")
+    (ws / "HOSTS.md").write_text("# 资产台账\n- web-1 | 8080/nginx | admin:123 | flag1 已拿")
+    w = Worker.__new__(Worker)
+    w.ws = str(ws)
+    w.notes_path = str(ws / "NOTES.md")
+    w.state_path = str(ws / "STATE.md")
+    digest = await w._workspace_digest()
+    assert "HOSTS.md" in digest
+    assert "web-1 | 8080/nginx" in digest
+    assert "RELAY.md" in digest and "STATE.md" in digest
+
+
+def test_record_harness_solution(tmp_path, monkeypatch):
+    """静态 harness 路径解法落库：completed/partial 写 solutions.json；
+    partial 不降级覆盖 completed；<8min 失败不落库。"""
+    from agent.worker import record_harness_solution
+    sol_p = tmp_path / "solutions.json"
+    sol_p.write_text("{}")
+    monkeypatch.setattr(worker_mod, "solution_lib_path", lambda: str(sol_p))
+
+    record_harness_solution("x-01", "RCE via CVE", completed=True, elapsed_min=20.0)
+    lib = json.loads(sol_p.read_text())
+    assert lib["x-01"]["completed"] is True
+    assert "RCE via CVE" in lib["x-01"]["note"]
+
+    record_harness_solution("x-01", "failed retry", completed=False, elapsed_min=15.0)
+    lib = json.loads(sol_p.read_text())
+    assert lib["x-01"]["completed"] is True          # 不降级覆盖
+    assert "RCE via CVE" in lib["x-01"]["note"]
+
+    record_harness_solution("x-02", "quick fail", completed=False, elapsed_min=3.0)
+    lib = json.loads(sol_p.read_text())
+    assert "x-02" not in lib                         # 短命失败不落库

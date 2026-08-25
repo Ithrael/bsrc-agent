@@ -102,6 +102,12 @@ class FlagSubmitter:
         # api.submit_flag 直连）都先问 should_try，垃圾候选在这里统一拦截。
         return bool(flag) and flag not in self.tried and plausible_flag(flag)
 
+    def record_reject(self, flag: str):
+        """格式闸门拒绝（从未打到平台）：只记 tried 防重复尝试。
+        不计连错/错提额度——占位符垃圾没烧平台请求，也不该烧「连续猜错」
+        告警和 auto 通道熔断额度（此前与真实错提混计，模型收到误导性警告）。"""
+        self.tried.add(flag)
+
     def record(self, flag: str, correct: bool, awarded: int,
                correct_count: int | None = None):
         self.tried.add(flag)

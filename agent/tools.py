@@ -52,15 +52,11 @@ class ShellSession:
             limit=4 * 1024 * 1024,
         )
         # 初始化：关闭 echo 的提示符干扰。cwd 已由 subprocess 参数设定，
-        # 这里用绝对路径 cd 兜底（旧版用相对路径会在非项目根目录启动时报错噪音）
-        await self._write("export PS1=; stty -echo 2>/dev/null; cd " + os.path.abspath(self.cwd))
-
-    async def _write(self, cmd: str):
-        assert self.proc and self.proc.stdin
+        # 这里用绝对路径 cd 兜底（旧版用相对路径会在非项目根目录启动时报错噪音）。
+        # 只写不读：残留的初始化结束标记由 run() 的「过期标记丢弃」逻辑兜住
         mark = f"{_END_MARK}{uuid.uuid4().hex[:8]}"
-        self._mark = mark
-        payload = f"{cmd}\necho {mark}$?\n"
-        self.proc.stdin.write(payload.encode())
+        self.proc.stdin.write(
+            f"export PS1=; stty -echo 2>/dev/null; cd {os.path.abspath(self.cwd)}\necho {mark}$?\n".encode())
         await self.proc.stdin.drain()
 
     async def run(self, cmd: str, timeout: int = 60) -> str:

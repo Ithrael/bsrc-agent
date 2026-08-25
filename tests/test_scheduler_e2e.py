@@ -321,8 +321,109 @@ def test_endgame_ok_quick_wins_only():
 def test_fscan_wired_in_image_and_playbook():
     """fscan 进镜像 + playbook 阶段门/多 flag 清单接入（通用工具，无题目先验）。"""
     dk = open("Dockerfile").read()
-    assert "shadow1ng/fscan" in dk
+    assert "COPY tools/bin/fscan /usr/local/bin/fscan" in dk
     pb = open("agent/prompts.py").read()
     assert "fscan -h" in pb
     wk = open("agent/worker.py").read()
     assert wk.count("fscan") >= 2
+
+
+# ---- 闭环修复回归（2026-08-26）：钉子题判死 / 回查兜底 / endgame retry 晋升 ----
+
+@pytest.mark.asyncio
+async def test_nail_dead_and_false_kill(tmp_path, monkeypatch):
+    """钉子题判死入 _dead 且不进 retry；平台已有部分 flag 的题不误杀（进 retry）。"""
+    from agent.worker import WorkerResult
+    import agent.scheduler as sched_mod
+
+    srv = make_server()
+    host, port = srv.server_address
+    api = TsecClient(f"http://{host}:{port}", TOKEN)
+    notes_p = tmp_path / "notes.json"
+    notes_p.write_text(json.dumps({"mock_web_01": "[官方 hint] 试 SQL 注入",
+                                   "mock_bin_01": "[官方 hint] 看协议"}))
+    monkeypatch.setattr(sched_mod, "notes_lib_path", lambda: str(notes_p))
+    cfg = Config()
+    cfg.record_solutions = False
+    sched = Scheduler(cfg, FakeLLM(), api, str(tmp_path))
+    challenges = {c.unique_code: c for c in await api.list_challenges()}
+
+    def _zero_result():
+        r = WorkerResult()
+        r.completed = False
+        r.score = 0
+        r.flags = []
+        r.reason = "claude done"
+        r.elapsed_min = 5.0
+        return r
+
+    # 场景 1：hint 已看 + 第 3 次调度 + 平台 0 flag → 判死，不进 retry
+    sched._attempts["mock_web_01"] = 2
+    await sched._finish(challenges["mock_web_01"], _zero_result())
+    assert "mock_web_01" in sched._dead
+    assert sched.retry_queue == []
+
+    # 场景 2：平台已有 1/2 flag（本轮没新增）→ 不误杀，进 retry 续跑
+    srv.state["mock_bin_01"]["correct_flag_count"] = 1
+    fresh = {c.unique_code: c for c in await api.list_challenges()}
+    sched._attempts["mock_bin_01"] = 2
+    await sched._finish(fresh["mock_bin_01"], _zero_result())
+    assert "mock_bin_01" not in sched._dead
+    assert [c.unique_code for c in sched.retry_queue] == ["mock_bin_01"]
+    await api.close()
+    srv.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_platform_recheck_dead_last_resort(tmp_path):
+    """回查过滤钉子题；只剩钉子题时兜底回挖（其他题全解了就试试死题）。"""
+    cfg = Config()
+    api = _FakeApi([_ch("dead-1", 1, 500), _ch("alive-1", 1, 300)])
+    sched = Scheduler(cfg, FakeLLM(), api, str(tmp_path))
+    sched._dead.add("dead-1")
+    assert await sched._platform_recheck()
+    assert [c.unique_code for c in sched.pending] == ["alive-1"]      # 钉子题被滤掉
+    # alive-1 也解完 → 只剩钉子题，兜底回挖
+    api.challenges[1]["is_completed"] = True
+    assert await sched._platform_recheck()
+    assert [c.unique_code for c in sched.pending] == ["dead-1"]
+    # 全部解开 → 退出信号
+    api.challenges[0]["is_completed"] = True
+    assert not await sched._platform_recheck()
+
+
+def test_endgame_promotes_retry_over_blocked_pending(tmp_path):
+    """收尾段 retry 快赢不被 pending 里的拦截题饿死（尾段全系统空转修复）。"""
+    from agent.tsec_api import Challenge
+    blocked = Challenge.from_dict({"unique_code": "big-1", "flag_count": 6,
+                                   "correct_flag_count": 0, "difficulty": "hard"})
+    quick = Challenge.from_dict({"unique_code": "one-1", "flag_count": 4,
+                                 "correct_flag_count": 3, "difficulty": "hard"})
+    sch = _sched_for_endgame(elapsed_min=300)   # 进入 endgame
+    sch.pending = [blocked]
+    sch.retry_queue = [quick]
+    sch._promote_retry_in_endgame()
+    assert sch.pending[0].unique_code == "one-1"      # 快赢排到拦截题前面
+    assert sch.retry_queue == []
+    # 非 endgame 不动（retry 等 pending 清空的既有语义保留）
+    sch2 = _sched_for_endgame(elapsed_min=100)
+    sch2.pending = [blocked]
+    sch2.retry_queue = [quick]
+    sch2._promote_retry_in_endgame()
+    assert sch2.pending == [blocked] and sch2.retry_queue == [quick]
+
+
+def test_claude_health_tracks_harness_path():
+    """静态 harness 路径崩溃同样计入健康度 streak，达阈值降级。"""
+    from agent.worker import WorkerResult
+    sch = Scheduler.__new__(Scheduler)
+    sch.cfg = Config()
+    sch.cfg.claude_worker = False
+    sch.cfg.harness_enabled = True
+    sch._claude_fail_streak = 0
+    r = WorkerResult()
+    r.reason = "harness crash"
+    for _ in range(6):
+        sch._track_claude_health(r)
+    assert not sch.cfg.harness_enabled          # 连续崩溃触发全局降级
+    assert not sch.cfg.claude_worker

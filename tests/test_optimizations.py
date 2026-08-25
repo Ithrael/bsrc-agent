@@ -13,8 +13,6 @@ def _mk_worker(**ch_fields):
     cfg = Config()
     w = Worker.__new__(Worker)
     w.cfg = cfg
-    w.allow_extended = ch_fields.pop("allow_extended", False)
-    w.first_attempt = ch_fields.pop("first_attempt", True)
     w.attempt = ch_fields.pop("attempt", 0)
     fields = {"unique_code": "a-01", "flag_count": 1,
               "total_score": 500, "difficulty": "easy"}
@@ -47,9 +45,12 @@ def test_sanitize_keeps_relative_commands():
 # ---- 超时分级 ----
 
 def test_timeout_first_attempt_hard_fast_fail():
-    """hard 首轮 25min（run 12231 复盘回滚：主进程协调子 agent 需完整预算）。"""
+    """hard 首轮 25min；多 flag 大题 45min（12641 复盘：25min 浅拿即轮转，
+    b 系列剩面插队攻坚 1.5h 零产出；12464 一次性窗口 +2550）。"""
     w = _mk_worker(unique_code="b-02", flag_count=4, difficulty="hard", attempt=0)
-    assert w._scaled_timeout_s() == 25 * 60
+    assert w._scaled_timeout_s() == 45 * 60
+    single = _mk_worker(unique_code="c-02", flag_count=1, difficulty="hard", attempt=0)
+    assert single._scaled_timeout_s() == 25 * 60
 
 
 def _give_progress(w):
@@ -153,10 +154,11 @@ def test_priority_round1_unknown_boosted(monkeypatch):
 
 
 def test_timeout_round1_short_cap():
-    """ROUND=1 仍沿用快速轮转预算；完整解法题走更短复现预算。"""
+    """ROUND=1 仍沿用快速轮转预算（45min 多 flag 预算被 cap 到 30）；
+    完整解法题走更短复现预算。"""
     hard = _mk_worker(unique_code="b-02", flag_count=4, difficulty="hard")
     hard.cfg.round_num = 1
-    assert hard._scaled_timeout_s(has_completed_sol=False) == 25 * 60
+    assert hard._scaled_timeout_s(has_completed_sol=False) == 30 * 60
     easy = _mk_worker(unique_code="a-01", flag_count=1, difficulty="easy")
     easy.cfg.round_num = 1
     assert easy._scaled_timeout_s(has_completed_sol=False) == 8 * 60
@@ -176,3 +178,75 @@ def test_state_append_dedup(tmp_path):
     assert content.count("- flag 进度: 1/3") == 1
     assert "- flag 进度: 2/3" in content
     assert "## FACTS" in content
+
+
+# ---- 蒸馏块 vs 断点判定闭环（12464 止损保护被 12641 蒸馏架空的修复） ----
+
+def test_relay_block_empty_variants():
+    """空块判定：三行/六行全「无」= 空；空 lines 恒不触发；有实质行 = 非空。"""
+    assert Worker._relay_block_empty(["已达成原语: 无", "已证死路: 无", "下一步: 无"], 3)
+    assert Worker._relay_block_empty(["已达成原语: 无"] * 6, 6)
+    assert not Worker._relay_block_empty([], 3)                    # all([]) 老坑
+    assert not Worker._relay_block_empty(["已达成原语: RCE on web-1"], 3)
+    # 六行版：只看前 3 行会漏掉后 3 行的实质内容
+    assert not Worker._relay_block_empty(
+        ["已达成原语: 无", "已证死路: 无", "下一步: 无",
+         "内网拓扑: 10.0.0.5:8080, 10.0.0.6:22", "已拿主机与凭据: 无", "可复用文件: 无"], 6)
+
+
+def test_has_progress_ignores_empty_distill_block():
+    """全「无」蒸馏块不算断点：retry 不拿满预算（12min 快验），no_progress 熔断可触发。"""
+    import tempfile
+    w = _mk_worker(unique_code="b-02", flag_count=4, difficulty="hard", attempt=2)
+    d = tempfile.mkdtemp()
+    w.ws = d
+    w.notes_path = os.path.join(d, "NOTES.md")
+    with open(os.path.join(d, "RELAY.md"), "w") as f:
+        f.write("# 接力块（跨线共享）\n"
+                "## 会话蒸馏（11:00:00）\n"
+                "已达成原语: 无\n内网拓扑: 无\n已证死路: 无\n下一步: 无\n")
+    assert not w._has_progress()
+    assert w._scaled_timeout_s() == 12 * 60          # 快验轮，不是 40min 满预算
+
+
+def test_has_progress_counts_distill_with_real_content():
+    """蒸馏块里有实质内容（拓扑/凭据）算真断点：拿满预算续跑。"""
+    import tempfile
+    w = _mk_worker(unique_code="b-02", flag_count=4, difficulty="hard", attempt=2)
+    d = tempfile.mkdtemp()
+    w.ws = d
+    w.notes_path = os.path.join(d, "NOTES.md")
+    with open(os.path.join(d, "RELAY.md"), "w") as f:
+        f.write("# 接力块（跨线共享）\n"
+                "## 会话蒸馏（11:00:00）\n"
+                "已达成原语: SSRF→内网可达\n内网拓扑: 10.0.0.5:8080\n"
+                "已拿主机与凭据: 无\n已证死路: 泛微路径 — 不存在\n下一步: 打 10.0.0.5\n")
+    assert w._has_progress()
+    assert w._scaled_timeout_s() == 40 * 60
+
+
+# ---- 格式拒绝不烧错提额度 ----
+
+def test_record_reject_keeps_wrong_budget():
+    """格式闸门拒绝（从未打平台）只记 tried：不进连错/累计错提，auto 通道熔断额度不烧。"""
+    from agent.flagger import FlagSubmitter
+    s = FlagSubmitter("x-01", 1, wrong_cap=2)
+    s.record_reject("flag{placeholder}")
+    assert s.wrong_streak == 0
+    assert s.wrong_total == 0
+    assert "flag{placeholder}" in s.tried       # 防重复尝试
+    # 真实错提 2 次后才熔断 auto 通道
+    s.record("flag{aaaaaaaaaaaa1}", False, 0)
+    s.record("flag{bbbbbbbbbbbb2}", False, 0)
+    assert s.wrong_total == 2
+    assert not s.should_try("flag{cccccccccccc3}", auto=True)
+
+
+# ---- 预侦察地址解析（scheme 剥离） ----
+
+def test_addr_host_port_tolerates_scheme():
+    from agent.recon import _addr_host_port
+    assert _addr_host_port("http://10.0.0.3:8080/x") == ("10.0.0.3", 8080)
+    assert _addr_host_port("10.0.0.1:80") == ("10.0.0.1", 80)
+    assert _addr_host_port("10.0.0.2") is None
+    assert _addr_host_port("https://h:8443") == ("h", 8443)

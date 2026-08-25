@@ -265,6 +265,48 @@ class WorkerResult:
         self.elapsed_min = 0.0
 
 
+def record_harness_solution(code: str, note: str, completed: bool, elapsed_min: float):
+    """静态 harness 路径（scheduler 直跑 harness，不经过 Worker 实例）的解法落库。
+
+    此前该路径只写 RESULT.json：_LIB 感知不到 completed/partial，优先级断点通道、
+    endgame 放行门、下轮复现注入全部失效——这是 harness 静态模式的闭环断点。
+    落库纪律与 Worker._record_claude_solution 一致：partial 不降级覆盖已有
+    completed；<8min 的失败不落库（note 价值低）。
+    """
+    if not completed and elapsed_min < 8:
+        return
+    try:
+        with _SOL_LOCK:
+            try:
+                with open(solution_lib_path()) as f:
+                    lib = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                lib = {}
+            cur = lib.get(code) or {}
+            if not completed and cur.get("completed"):
+                return  # 已有完整解法，不降级覆盖
+            entry = dict(cur)
+            entry["note"] = (note or "")[-6000:]
+            entry["completed"] = completed
+            entry["partial"] = not completed
+            entry["elapsed_min"] = round(elapsed_min, 1)
+            lib[code] = entry
+            tmp = solution_lib_path() + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(lib, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, solution_lib_path())
+            log.info("[%s] harness 解法已记录（completed=%s, %s min）",
+                     code, completed, entry["elapsed_min"])
+            # stdout 回传（托管容器跑完即销毁，赛后 grep SOLNOTE 重建解法库）
+            tag = "SOLVED" if completed else "PARTIAL"
+            n = entry["note"]
+            for i in range(0, len(n), 1000):
+                log.info("[SOLNOTE] %s|%s|%d|%s", code, tag, i // 1000,
+                         n[i:i + 1000].replace("\n", " "))
+    except OSError:
+        pass
+
+
 class Worker:
     # 动态升级门槛：跑满 4 分钟且 12 步无新 flag 才升级 harness（测试可调小）
     harness_upgrade_after_s = 240
@@ -273,8 +315,7 @@ class Worker:
 
     def __init__(self, cfg: Config, llm: LLMClient, api: TsecClient,
                  challenge: Challenge, addrs: list[str], workspace: str,
-                 deadline: float, allow_extended: bool = False,
-                 first_attempt: bool = True, attempt: int = 0,
+                 deadline: float, attempt: int = 0,
                  submitter: FlagSubmitter | None = None,
                  notes_path: str | None = None,
                  state_path: str | None = None,
@@ -295,10 +336,6 @@ class Worker:
             self._known_hosts.update(re.findall(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", str(_a)))
         self.ws = workspace
         self.deadline = deadline  # 全局截止时间（monotonic）
-        self.allow_extended = allow_extended  # retry 轮允许适度延长（首轮快速轮转防堵槽位）
-        # first_attempt 与 allow_extended 解耦（run 9222 复盘）：ROUND=2 下 allow_extended 恒 True，
-        # 首轮快速失败必须单独按尝试次数判断（scheduler 传 n==0）
-        self.first_attempt = first_attempt
         # attempt：本题第几次被调度尝试（0=首轮，1=二轮，2+=三轮及以后）——
         # hard 预算按 attempt 递增（25/35/40min，优先腾出题目槽位）
         self.attempt = attempt
@@ -357,7 +394,7 @@ class Worker:
         # 其余（占位符 flag{...}、纯英文短语 flag{this_is_flag}、KEY{...} 等）是
         # 模型解不出时的瞎编，提交必错还烧请求，直接拒绝（记入 tried 防重复尝试）。
         if not plausible_flag(flag):
-            self.submitter.record(flag, False, 0)
+            self.submitter.record_reject(flag)
             return f"[格式拒绝] 非 flag{{...}} 合法形态（平台不接受，疑似猜测），跳过提交: {flag[:60]}"
         if not self.submitter.should_try(flag):
             return f"[跳过] 该 flag 已提交过: {flag[:60]}"
@@ -407,6 +444,18 @@ class Worker:
         if policy == "stuck" and elapsed_min < self.cfg.hint_after_min and not self._hint_used:
             return (f"[hint 暂未开放] 开始解题 {elapsed_min:.0f} 分钟，"
                     f"未满 {self.cfg.hint_after_min} 分钟。请先换攻击面继续尝试。")
+        # 去重（与 _auto_hint 对齐）：notes.json 已有官方 hint（本会话或历史轮拉过）
+        # 直接复用缓存，不再打 hint API——重复查看会重复扣该题 10%。
+        try:
+            with open(notes_lib_path()) as f:
+                _nlib = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            _nlib = {}
+        _cached = _nlib.get(self.ch.unique_code) or ""
+        if _cached.startswith("[官方 hint]"):
+            self._hint_used = True
+            return ("官方提示（此前已获取，免费复用，不要重复请求 hint）：\n"
+                    + _cached[len("[官方 hint]"):].strip())
         try:
             hint = await self.api.get_hint(self.ch.unique_code)
         except ApiError as e:
@@ -489,6 +538,28 @@ class Worker:
         easy/medium 单 flag flash 能解，留给断点重跑再拉。"""
         return (self.cfg.hint_policy == "free" and self.ch.flag_count >= 2)
 
+    async def _workspace_digest(self) -> str:
+        """轮内重 launch 工作区速览（ATX 吸收：续跑轮把上轮工作区尾部全量内联进
+        prompt，不依赖 agent 自觉读文件——12641 复盘：RELAY 蒸馏三行信息损失 90%，
+        b 系列剩面分治 24 会话 1.5h 零产出，断点断层）。只在 attempt>=1 调用。"""
+        parts = []
+        # HOSTS.md 资产台账必须进速览：多 flag 续跑最关键的交接（横向线开打前必读）
+        for name, path, cap in (("NOTES.md", self.notes_path, 1500),
+                                ("STATE.md", self.state_path, 800),
+                                ("RELAY.md", os.path.join(self.ws, "RELAY.md"), 1000),
+                                ("HOSTS.md", os.path.join(self.ws, "HOSTS.md"), 600)):
+            try:
+                with open(path) as f:
+                    content = f.read()[-cap:]
+            except OSError:
+                continue
+            if content.strip():
+                parts.append(f"### {name}（尾部）\n{content}")
+        if not parts:
+            return ""
+        return ("\n\n## 上轮工作区速览（轮内续跑：已确认事实/脚本/断点都在这里，"
+                "直接从这里继续，勿重复侦察）\n" + "\n\n".join(parts))
+
     async def _advisor_brief(self, hint_text: str = "") -> str:
         """retry 轮指挥官 brief（对标榜 2 Heimdall_lucky 的 observer→advisor 模式）：
         强模型读该题全部进度（NOTES/STATE/上轮会话摘要），产出定向作战指令注入
@@ -556,19 +627,39 @@ class Worker:
         log.info("[%s] advisor brief 生成（%d 字符）", self.ch.unique_code, len(brief))
         return "\n## 指挥官 brief（外部观察员基于全部进度生成，优先执行）\n" + brief[:2500]
 
+    @staticmethod
+    def _relay_block_empty(lines: list[str], head_n: int) -> bool:
+        """蒸馏块是否为空块：前 head_n 行（三行版/六行版）全是「无」占位。
+        空 lines 恒不触发重蒸馏（all([]) 的老坑），有任一实质行即非空。"""
+        head = lines[:head_n]
+        return bool(head) and all("无" in l and "<" not in l for l in head)
+
     async def _distill_relay(self, res) -> str:
         """会话结束蒸馏（对标 hxbai 的接力块蒸馏）：本题未拿全 flag 时，把会话摘要
         蒸馏成三行接力块追加 RELAY.md——不依赖解题 agent 自觉写（超时被杀时自觉写的
-        往往没落盘）。一次 flash 调用（≤400 token），失败静默跳过不阻塞收尾。"""
+        往往没落盘）。一次 flash 调用（≤400 token），失败静默跳过不阻塞收尾。
+        多 flag 题强制带内网拓扑/主机清单（12641 复盘：剩面分治 24 会话 1.5h 零产出
+        = 断点没传到位，分治线重复打浅层）。"""
         digest = res.digest() if hasattr(res, "digest") else str(res)[-6000:]
         if not digest.strip():
             return ""
-        prompt = (
-            "把这次未解出的渗透会话蒸馏成接力块，只输出三行，每行一句、可直接执行：\n"
-            "已达成原语: <本次真拿到的胜利态：任意读/RCE/已破口令/已建隧道，没有就写'无'>\n"
-            "已证死路: <试过走不通的，附一句为什么>\n"
-            "下一步: <紧接原语的具体命令/payload>\n\n"
-            f"会话摘要（事件流尾部）：\n{digest[-6000:]}")
+        if self.ch.flag_count >= 2:
+            prompt = (
+                "把这次未解出的渗透会话蒸馏成接力块，只输出六行，每行一句、可直接执行：\n"
+                "已达成原语: <本次真拿到的胜利态：任意读/RCE/已破口令/已建隧道，没有就写'无'>\n"
+                "内网拓扑: <已确认的主机/IP/端口/网段清单，没有就写'无'>\n"
+                "已拿主机与凭据: <已攻破主机 + 可用凭据，没有就写'无'>\n"
+                "已证死路: <试过走不通的，附一句为什么>\n"
+                "可复用文件: <工作区里可直接复用的脚本/输出文件路径（如 scripts/x.py、.tmp/fscan.out），没有就写'无'>\n"
+                "下一步: <紧接原语的下一个目标主机/具体命令/payload>\n\n"
+                f"会话摘要（事件流尾部）：\n{digest[-6000:]}")
+        else:
+            prompt = (
+                "把这次未解出的渗透会话蒸馏成接力块，只输出三行，每行一句、可直接执行：\n"
+                "已达成原语: <本次真拿到的胜利态：任意读/RCE/已破口令/已建隧道，没有就写'无'>\n"
+                "已证死路: <试过走不通的，附一句为什么>\n"
+                "下一步: <紧接原语的具体命令/payload>\n\n"
+                f"会话摘要（事件流尾部）：\n{digest[-6000:]}")
         try:
             msg = await self.llm.chat([{"role": "user", "content": prompt}], None,
                                       max_tokens=400)
@@ -578,6 +669,20 @@ class Worker:
         text = (msg.get("content") or "").strip()
         if not text:
             return ""
+        # 空块重蒸馏（12641 复盘：尾段 24 会话零产出，接力块信息量不足是嫌疑）：
+        # 关键行全是「无」= 没有可接力内容，换更高温度再蒸馏一次，还空就放弃
+        lines = [l for l in text.splitlines() if l.strip()]
+        if self._relay_block_empty(lines, 6 if self.ch.flag_count >= 2 else 3):
+            try:
+                msg2 = await self.llm.chat(
+                    [{"role": "user", "content": "上面的接力块三行全是「无」，没有可用信息。"
+                      "请重新审视会话摘要，找出哪怕一个具体细节（一个端口、一个报错、"
+                      "一个疑似端点、一个失败原因）写进三行里。"}], None, max_tokens=400)
+                text2 = (msg2.get("content") or "").strip()
+                if text2:
+                    text = text2
+            except Exception:
+                pass
         try:
             with self._state_lock:
                 with open(os.path.join(self.ws, "RELAY.md"), "a") as f:
@@ -654,6 +759,28 @@ class Worker:
 
     # ---- 上下文管理 ----
 
+    @staticmethod
+    def _relay_has_progress(content: str) -> bool:
+        """RELAY.md 是否有真断点。agent 即时落盘的裸行直接算；「## 会话蒸馏」段
+        只算有实质内容的行——蒸馏每次会话结束都追加（含全「无」空块），不剥离会把
+        零进展题误判成有断点，架空「无断点 retry 降 12min 快验」与 no_progress 熔断
+        （12464 止损保护被 12641 蒸馏机制静默抵消的闭环冲突，2026-08-26 修复）。"""
+        in_distill = False
+        for ln in content.splitlines():
+            if ln.startswith("## 会话蒸馏"):
+                in_distill = True
+                continue
+            if ln.startswith("## "):
+                in_distill = False
+                continue
+            s = ln.strip()
+            if not s or s.startswith("#"):
+                continue
+            if in_distill and "无" in s and "<" not in s:
+                continue  # 蒸馏块的「无」占位行不算进展
+            return True
+        return False
+
     def _has_progress(self) -> bool:
         """跨 attempt 的工作区是否有真进展（retry 预算分级的依据）。
 
@@ -667,10 +794,8 @@ class Worker:
         notes_path = getattr(self, "notes_path", "")
         try:
             with open(os.path.join(ws, "RELAY.md")) as f:
-                relay = [l for l in f.read().splitlines()
-                         if l.strip() and not l.strip().startswith("#")]
-            if relay:
-                return True
+                if self._relay_has_progress(f.read()):
+                    return True
         except OSError:
             pass
         try:
@@ -698,7 +823,12 @@ class Worker:
         elif self.ch.difficulty == "hard":
             # 主进程要协调 N 个子 agent 多轮派发，需要完整预算（run 12231 复盘）；
             # 无断点 retry 降为 12min 快验轮
-            minutes = 25 if self.attempt <= 0 else ((35 if self.attempt == 1 else 40) if prog else 12)
+            if self.attempt <= 0 and self.ch.flag_count >= 2:
+                # 多 flag 渗透链一次窗口打穿（12641 复盘：25min 浅拿即轮转，
+                # b 系列剩面插队攻坚 1.5h 零产出；12464 一次性窗口 +2550）
+                minutes = 45
+            else:
+                minutes = 25 if self.attempt <= 0 else ((35 if self.attempt == 1 else 40) if prog else 12)
         elif self.ch.difficulty == "medium":
             # 首轮 12min（AePis 复盘：easy/medium 全扫 <2h，3.3min/flag），
             # retry 有断点 25min 给足续跑；无断点 10min 快验
@@ -1173,9 +1303,10 @@ class Worker:
         """单题 claude token 熔断阈值：0 走难度分层（run 9054 复盘 b-02 单会话 920 万 token 仍 0 解），
         >0 用配置值，<0 禁用。
 
-        已知限制：熔断只统计主进程事件流里的 assistant usage；Task 子 agent 的
-        消耗不进主进程流，启用熔断时会低估实际花费（默认 CLAUDE_TOKEN_BUDGET=-1
-        即关闭，不受影响）。启用前需先实测 stream-json 是否含子 agent usage。"""
+        统计口径：stream-json --verbose 会输出 sidechain（Task 子 agent）的 assistant
+        事件，harness 解析器按事件累计不区分主/子——子 agent 消耗已计入熔断统计
+        （有回归测试锁定）。默认仍 -1 关闭：分层阈值与真实会话消耗的配准需要
+        一轮线上 run 校准后再开（CLAUDE_TOKEN_BUDGET 一个环境变量即可启用）。"""
         v = self.cfg.claude_token_budget
         if v < 0:
             return 0
@@ -1475,6 +1606,8 @@ class Worker:
                 f"1. 先读 NOTES.md、STATE.md、RELAY.md、HOSTS.md（资产台账）：已拿到的 flag 与已排除方向不要重复攻。\n"
                 f"2. 用 Task 工具**一次性并行派发 {len(line_keys)} 个子 agent**，各自独立上下文分头攻坚，"
                 f"方向互不重叠：\n{subtask_table}\n"
+                "   每个 Task 的 model 参数指定为 deepseek-v4-flash（子 agent 打宽用 flash，"
+                "主控统筹思考用 pro——12641 复盘：尾段 24 个 pro 会话空烧 1.5h 零产出，成本错配）\n"
                 "3. 每个子 agent 的指令里必须包含（防互相踩）：\n"
                 "   - 独立工作目录 line_{线号}/：所有脚本/输出/临时文件只写在这里，"
                 "禁止写工作目录之外的任何文件（共享文件除外）；"
@@ -1487,7 +1620,9 @@ class Worker:
                 "   - 结束前返回三行总结：已达成原语 / 已证死路 / 下一步\n"
                 "4. 子 agent 全部返回后：读它们的总结与 NOTES.md 新增，判断还缺哪几面 flag，"
                 "针对缺口再派新一轮子 agent（换攻击面/换主机/换凭证），直到全部拿齐或时间不足。\n"
-                "5. 拿到 flag 的判定以 STATE.md 的 FACTS 为准（系统自动更新），不要凭子 agent 口头汇报。")
+                "5. 意图节流（ATX 吸收）：若所有方向都已试过且无新线索可派，"
+                "不要为派而派——直接结束会话，调度器会按工作区断点续跑，空转派发纯烧 token。\n"
+                "6. 拿到 flag 的判定以 STATE.md 的 FACTS 为准（系统自动更新），不要凭子 agent 口头汇报。")
             if ch.flag_count >= 3:
                 # 多 flag 题专项清单（run 12019 复盘：b-01 1/4、b-02 2/6、b-03 1/4——
                 # 首面能拿后续纵深乏力；9489 曾靠 flagN 直读+容器逃逸+横向拿全 b-01 4/4，
@@ -1525,6 +1660,8 @@ class Worker:
                         os.symlink(src, dst)
             prompt = self._build_claude_prompt(ch, sol, notes, has_completed_sol, desc_hints,
                                                recon_report, master_role)
+            if self.attempt >= 1:
+                prompt += await self._workspace_digest()
             prompt += hint_text + advisor_text
             log.info("[%s] 主进程 + Task 子 agent（%d 方向，%ds 预算，token 熔断 %d）",
                      ch.unique_code, len(line_keys), timeout_s, token_budget)
@@ -1533,6 +1670,8 @@ class Worker:
                                     model=hard_model, effort=hard_effort)
         else:
             prompt = self._build_claude_prompt(ch, sol, notes, has_completed_sol, desc_hints, recon_report, "")
+            if self.attempt >= 1:
+                prompt += await self._workspace_digest()
             prompt += hint_text + advisor_text
             log.info("[%s] claude code 直接解题（%ds 预算，token 熔断 %d）",
                      ch.unique_code, timeout_s, token_budget)

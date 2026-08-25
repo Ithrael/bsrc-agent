@@ -115,12 +115,11 @@ RUN (curl -fsSL https://github.com/jpillora/chisel/releases/download/v1.10.1/chi
      && gunzip -f /tmp/chisel.gz && chmod +x /tmp/chisel && mv /tmp/chisel /usr/local/bin/chisel) \
     || echo "WARNING: chisel 下载失败，穿透回退 ssh -D + proxychains4"
 # 3) fscan 静态二进制：内网横向一把梭（存活/端口/服务/弱口令/常见漏洞检测），
-#    台账+凭据重放体系（#2 脚本）的主动扫描升级；经隧道时 proxychains4 fscan 使用
-RUN FSCAN_URL=$(curl -fsSL https://api.github.com/repos/shadow1ng/fscan/releases/latest | python3 -c "import sys,json; d=json.load(sys.stdin); print(next(a['browser_download_url'] for a in d['assets'] if 'amd64' in a['name'] and 'arm' not in a['name']))") \
-    && curl -fsSL "$FSCAN_URL" -o /tmp/fscan_dl \
-    && (cd /tmp && { file fscan_dl | grep -q zip && unzip -o fscan_dl && mv fscan* /usr/local/bin/fscan || mv fscan_dl /usr/local/bin/fscan; }) \
-    && chmod +x /usr/local/bin/fscan \
-    || echo "WARNING: fscan 下载失败，横向回退 creds_replay.sh + nmap 手工流"
+#    台账+凭据重放体系（#2 脚本）的主动扫描升级；经隧道时 proxychains4 fscan 使用。
+#    本地预下载（v2.2.0 linux_x64，gh-proxy 代理拉取）：构建环境直连 GitHub
+#    间歇性 TLS 失败（且 release 资产名是 x64 非 amd64，旧远程下载脚本双重失效）
+COPY tools/bin/fscan /usr/local/bin/fscan
+RUN chmod +x /usr/local/bin/fscan
 COPY tools/flag_sweep.sh tools/creds_replay.sh /opt/tools/
 RUN chmod +x /opt/tools/flag_sweep.sh /opt/tools/creds_replay.sh && touch /opt/tools/creds.txt
 

@@ -113,8 +113,10 @@ class Scheduler:
         self._watchdog_stop = False
         # 并发写死 3（平台同时最多 3 题）：409 不降级，题轮转队尾等槽位（run 10048
         # 复盘：409 收敛只降不升致后半程单线程，吞吐损失 2/3——宁可轮转不可塌缩）
-        self._live = 0                              # 运行中的 _run_one 任务数（含 start 中的）
         self._start_backoff: dict[str, float] = {}  # 409 轮转的题 -> 可重试时间戳
+        # 钉子题（hint 已看 + 多轮 0 flag）判死集合：不进常规 retry、不参与常规回查；
+        # 只剩钉子题未解时回查轮仍会回挖（其他题全解了，打死题零机会成本）
+        self._dead: set[str] = set()
         self._task_finished = False  # 平台任务已结束（start/close 报 already finished）时置位停止空转
         # claude 运行时健康度：连续崩溃/无输出计数（启动三道闸只防"带病上场"，
         # 这里防运行中恶化——网关策略变化/运行时错误。达标全局降级裸 LLM）
@@ -264,17 +266,16 @@ class Scheduler:
             await asyncio.sleep(5)
         return []
 
-    def _on_task_done(self, t: asyncio.Task):
-        self._live -= 1
-
     def _track_claude_health(self, res: WorkerResult):
         """claude 运行时健康度：连续崩溃/无输出达阈值（默认 6 次 ≈ 全槽位两轮
         快速失败）就全局降级裸 LLM 模式。崩溃是秒级的，坏 claude 几分钟内触发；
-        单题偶发（容器抖动）有 3 槽位余量不会误杀。任何一次正常输出即清零。"""
-        if not self.cfg.claude_worker:
+        单题偶发（容器抖动）有 3 槽位余量不会误杀。任何一次正常输出即清零。
+        覆盖 claude_worker 与静态 harness 两条路径（harness 崩溃同样是运行时恶化）。"""
+        if not (self.cfg.claude_worker or self.cfg.harness_enabled):
             return
         r = res.reason or ""
-        if r.startswith(("crash:", "claude no output", "harness crash")):
+        if r.startswith(("crash:", "claude no output", "harness crash",
+                         "harness done (0 events)")):
             self._claude_fail_streak += 1
             if self._claude_fail_streak >= 6:
                 log.error("claude 连续 %d 次崩溃/无输出（运行中恶化），"
@@ -341,8 +342,7 @@ class Scheduler:
             addrs = await self._wait_available(code)
         return addrs, False
 
-    async def _run_one(self, ch: Challenge, allow_extended: bool = False,
-                       first_attempt: bool = True, attempt: int = 0):
+    async def _run_one(self, ch: Challenge, attempt: int = 0):
         code = ch.unique_code
         async with self._sem:
             ws = os.path.join(self.run_dir, code)
@@ -368,13 +368,12 @@ class Scheduler:
                 return
             log.info("[%s] 目标: %s", code, ", ".join(addrs))
             if self._should_use_harness(ch):
-                await self._run_harness_worker(ch, addrs, ws, allow_extended)
+                await self._run_harness_worker(ch, addrs, ws)
                 return
             if self._should_pair(ch):
-                await self._run_paired(ch, addrs, ws, allow_extended)
+                await self._run_paired(ch, addrs, ws)
                 return
             worker = Worker(self.cfg, self.llm, self.api, ch, addrs, ws, self.deadline,
-                            allow_extended=allow_extended, first_attempt=first_attempt,
                             attempt=attempt, agent_semaphore=self._agent_sem)
             self.active_workers[code] = [worker]
             try:
@@ -400,12 +399,11 @@ class Scheduler:
             return False
         return bool(info.get("partial")) or ch.difficulty == "hard"
 
-    async def _run_harness_worker(self, ch: Challenge, addrs: list[str], ws: str,
-                                  allow_extended: bool):
+    async def _run_harness_worker(self, ch: Challenge, addrs: list[str], ws: str):
         """单题 harness worker：prompt 注入题目信息 + 解法库/专家复盘 + 工作区约定。"""
         from .flagger import extract_flags
         from .harness import run_harness
-        from .worker import _sanitize_step
+        from .worker import _sanitize_step, record_harness_solution
         code = ch.unique_code
         log.info("[%s] harness 直接攻坚（backend=%s）", code, self.cfg.harness_backend)
         notes_path = os.path.join(ws, "NOTES.md")
@@ -507,6 +505,12 @@ class Scheduler:
                 }, f, ensure_ascii=False, indent=2)
         except OSError:
             pass
+        # 健康度追踪 + 解法落库（闭环补全：harness 崩溃计入降级 streak；
+        # completed/partial 写 solutions.json，_LIB/优先级/复现/收尾门才感知得到）
+        self._track_claude_health(merged)
+        if self.cfg.record_solutions:
+            note = ((res.output_text or "") + "\n" + res.digest()) if res else ""
+            record_harness_solution(code, note, merged.completed, merged.elapsed_min)
         await self._finish(ch, merged)
 
     def _should_pair(self, ch: Challenge) -> bool:
@@ -527,8 +531,7 @@ class Scheduler:
             return False
         return True
 
-    async def _run_paired(self, ch: Challenge, addrs: list[str], ws: str,
-                          allow_extended: bool):
+    async def _run_paired(self, ch: Challenge, addrs: list[str], ws: str):
         """同一容器跑 2 个 worker：共享 FlagSubmitter（进度/completed 判定）与 NOTES.md，
         工作区隔离（worker-A / worker-B），A 主攻入口面、B 主攻内网/横向。"""
         code = ch.unique_code
@@ -556,14 +559,14 @@ class Scheduler:
                             os.path.join(ws, "worker-B", "transcript.jsonl")]
         w_a = Worker(self.cfg, self.llm, self.api, ch, addrs,
                      os.path.join(ws, "worker-A"), self.deadline,
-                     allow_extended=allow_extended, submitter=submitter,
+                     submitter=submitter,
                      notes_path=notes_path, state_path=state_path,
                      state_lock=state_lock, role_extra=role_a,
                      transcripts=both_transcripts, agent_semaphore=self._agent_sem,
                      completion_event=completion_event)
         w_b = Worker(self.cfg, self.llm, self.api, ch, addrs,
                      os.path.join(ws, "worker-B"), self.deadline,
-                     allow_extended=allow_extended, submitter=submitter,
+                     submitter=submitter,
                      notes_path=notes_path, state_path=state_path,
                      state_lock=state_lock, role_extra=role_b,
                      transcripts=both_transcripts,
@@ -628,9 +631,62 @@ class Scheduler:
         # no_progress（attempt≥2 无 flag 无断点）不进常规 retry：时间留给有希望的题；
         # 主循环队列耗尽后的平台回查（NEVER_STOP 回查全部未解题）仍会带回它们，
         # 满足「时间没用完就继续挖零进展题」。
-        if not res.completed and self.cfg.retry_unsolved and "deadline" not in res.reason \
+        # 钉子题熔断（12641 复盘：7 道钉子题 hint 已看仍 0 分，空转烧槽位——
+        # hint 是能力探针，看了还解不出 = 死题）：notes.json 有 [官方 hint] 记录
+        # 且 ≥2 次尝试且零 flag → 判死入 _dead（常规 retry 与回查都不再带回；
+        # 其他题全解后回查轮仍回挖）。零分判据必须同时看本轮（res.score/flags）
+        # 与平台快照（ch.correct_flag_count）：平台已有部分 flag 的题本轮没新增
+        # ≠ 死题，只看 res.score 会把 2/6 续跑题误杀。
+        nail = False
+        attempts = getattr(self, "_attempts", {})  # __new__ 构造的测试实例无此属性
+        if (attempts.get(code, 0) >= 2 and res.score == 0 and not res.flags
+                and getattr(ch, "correct_flag_count", 0) == 0):
+            try:
+                with open(notes_lib_path()) as f:
+                    nlib = json.load(f)
+                nail = (nlib.get(code) or "").startswith("[官方 hint]")
+            except (OSError, json.JSONDecodeError):
+                pass
+        if nail:
+            self._dead.add(code)
+            log.info("[%s] 钉子题判死（hint 已看 + %d 轮 0 flag），常规轮转不再重试",
+                     code, attempts.get(code, 0))
+        elif not res.completed and self.cfg.retry_unsolved and "deadline" not in res.reason \
                 and not res.reason.startswith("no_progress"):
             self.retry_queue.append(ch)
+
+    def _promote_retry_in_endgame(self):
+        """收尾段把 retry 队列并入 pending 队头。endgame 放行门拦下的题会永远
+        留在 pending（放行门只跳过不清除），retry→pending 的晋升又只在 pending
+        清空后触发——不插队的话最后 ENDGAME_MIN 分钟全系统空转到收卷，retry 里的
+        快赢题（剩一面断点续跑）恰恰是尾段最该打的。并入后统一走放行门过滤。"""
+        if not (self._in_endgame() and self.pending and self.retry_queue):
+            return
+        codes_in_pending = {c.unique_code for c in self.pending}
+        promo = [c for c in self.retry_queue if c.unique_code not in codes_in_pending]
+        self.retry_queue = []
+        if promo:
+            _reload_lib()
+            self.pending = (sorted(promo, key=lambda c: _priority(c, self.cfg.round_num))
+                            + self.pending)
+
+    async def _platform_recheck(self) -> bool:
+        """回查平台把仍未解出的题重新入队。返回 False = 全部解开（可退出）。
+        钉子题（_dead）不参与常规回挖；只剩钉子题未解时仍回挖——其他题全解了，
+        剩余时间打死题是零机会成本的兜底（时间不用白不用）。"""
+        try:
+            remaining = [c for c in await self._refresh() if not _challenge_completed(c)]
+        except ApiError as e:
+            # 拉取失败 ≠ 全部解开：不判空不退出，稍后重试
+            log.warning("回查题目失败: %s，60s 后重试", e)
+            await asyncio.sleep(60)
+            return True
+        if not remaining:
+            return False
+        alive = [c for c in remaining if c.unique_code not in self._dead]
+        _reload_lib()
+        self.pending = sorted(alive or remaining, key=lambda c: _priority(c, self.cfg.round_num))
+        return True
 
     async def run(self):
         # 首次拉题：失败不退出（换平台协议可能不适配），循环重试直至成功
@@ -695,21 +751,16 @@ class Scheduler:
                     continue
                 # retry 也空：回查平台。还有未解出的（含 start/容器失败的终局题）就再来一轮。
                 if self.cfg.never_stop or time_left > 120:
-                    try:
-                        remaining = [c for c in await self._refresh() if not _challenge_completed(c)]
-                    except ApiError as e:
-                        # 拉取失败 ≠ 全部解开：不判空不退出，稍后重试
-                        log.warning("回查题目失败: %s，60s 后重试", e)
-                        await asyncio.sleep(60)
-                        continue
-                    if not remaining:
+                    if not await self._platform_recheck():
                         break  # 全部解开
-                    _reload_lib()
-                    self.pending = sorted(remaining, key=lambda c: _priority(c, self.cfg.round_num))
                     continue
                 break  # 有界模式时间到
 
-            # 补充新任务（首轮尝试限长超时；retry 轮 allow_extended 给足时间）
+            # 收尾段 retry 快赢优先：endgame 放行门拦下的题占住 pending 时，
+            # retry 队列里的剩一面断点续跑题永无出头（见 _promote_retry_in_endgame）
+            self._promote_retry_in_endgame()
+
+            # 补充新任务（首轮尝试限长超时；retry 轮预算分级放长）
             # gate 固定 3 并发（平台上限写死）：槽位一空立即补位，不允许空闲。
             skipped = 0
             while (len(tasks) < self.effective_max and self.pending
@@ -734,16 +785,10 @@ class Scheduler:
                 skipped = 0
                 n = self._attempts.get(ch.unique_code, 0)
                 self._attempts[ch.unique_code] = n + 1
-                # first_attempt 与 allow_extended 解耦（run 9054/9222 复盘）：ROUND=2 下
-                # allow_extended 恒 True 导致「首轮快速失败」完全失效（b-01 首轮 120min 堵槽）。
-                # first_attempt=n==0 决定「首轮限长超时快速轮转」，retry 轮（n>0）给足长超时。
-                allow_extended = n > 0 or self.cfg.round_num >= 2
-                t = asyncio.create_task(self._run_one(ch, allow_extended=allow_extended,
-                                                      first_attempt=(n == 0), attempt=n))
-                self._live += 1
+                # attempt=n：0=首轮限长超时快速轮转，retry 轮（n>0）按断点分级放长
+                t = asyncio.create_task(self._run_one(ch, attempt=n))
                 tasks.add(t)
                 t.add_done_callback(tasks.discard)
-                t.add_done_callback(self._on_task_done)
                 time_left = self.deadline - time.monotonic()
             if not tasks:
                 # 无在跑任务但还有待选题：只可能是全在 409/失败冷却中。

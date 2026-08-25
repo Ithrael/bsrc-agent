@@ -54,6 +54,12 @@ PLAYBOOKS: dict[str, str] = {
 - 信息收集：目录枚举（/api、/admin、/swagger、/actuator、/.git、/backup）、JS 里挖接口与密钥、注释与报错。
 - 认证：默认口令 admin/admin、test/test；JWT 弱密钥/none 算法；注册接口可注册则进后台。
 - 高频漏洞：SQL 注入（报错/时间盲注）、SSTI（{{7*7}}、${7*7}）、SSRF（URL 类参数打 127.0.0.1/metadata）、文件上传绕过、任意文件读取（../、/proc/self/）、反序列化（Java/PHP/Python pickle）、XXE、原型链污染（__proto__，Python 类也有 class.__init__.__globals__ 变体）。
+- 业务逻辑专项（合同审批/报表/资产管理系统类题优先排查——a-14/a-18 级钉子题常藏在这里）：
+  (1) 状态机跳步：订单/审批/流程的状态参数（status/step/state）直接改值或跳号提交，绕过中间校验步骤；
+  (2) 越权矩阵：拿 A 角色身份访问 B 角色的接口（改 uid/org_id/role 参数、遍历资源 ID）；水平越权先于垂直越权排查；
+  (3) 竞态：金额/次数/库存类操作并发双发（两次请求同 token/同订单），看余额是否扣减两次或只扣一次可透支；
+  (4) 参数篡改：金额、数量、单价、折扣、角色、权限位——请求参数可改处全试负数/0/溢出；
+  (5) 报表/导出类功能：模板注入、路径穿越导出任意文件、报表 SQL 拼接注入。
 - flag 常在：数据库 flag 表、/flag 文件、环境变量、管理员后台、源码注释。
 """,
     "f": """## 二进制逆向/Pwn 速查
@@ -62,10 +68,15 @@ PLAYBOOKS: dict[str, str] = {
 - Pwn：栈溢出（无 canary 直接 ret2win/ret2libc）、堆 UAF/双击、格式化字符串 %n/%s 泄露；pwntools 写 exploit，先本地调通再打远程。
 - 固件类：binwalk 解包，找硬编码凭据/校验逻辑。
 """,
-    "c": """## 漏洞利用（CVE 复现）速查
-- 先指纹识别组件与精确版本（banner、/version、报错、静态资源路径），再回忆对应 CVE。
-- 常见面：GeoServer/Confluence/GitLab/Spark/Fastjson/Log4j 等历史 RCE；AI 基础设施（模型托管/编排平台）优先试未授权 API、模板注入、路径穿越。
-- 利用链：RCE 后 flag 通常在 /flag、环境变量、数据库、或需要提权（suid/内核/docker.sock）。
+    "c": """## 二进制服务逆向速查（C 系列是守护程序/检索引擎类二进制服务，不是 Web CVE 复现）
+- 先用 nc 连接交互看协议：输入什么、返回什么、报错格式——协议理解是第一生产力。
+- 静态分析优先：file/checksec 看 ELF 结构与保护；strings 找硬编码凭据/命令/路径；
+  反编译聚焦输入处理链（read/fgets 后的 strcmp/memcmp/自研校验循环、弱加密 XOR/TEA）。
+- 协议内注入：输入长度/类型边界、格式串（%s/%n 泄露）、溢出（无 canary 直接控制流）、
+  命令拼接（输入进 system/popen/exec 的路径）。
+- 服务端特性：守护程序常带鉴权握手、共享内存、socket 权限问题；检索引擎类可能有
+  SQL/命令拼接、反序列化、模板渲染。
+- 拿到执行权后 flag 在 /flag、/challenge/、环境变量、或相邻文件——先全盘 find。
 """,
     "b": """## 多阶段渗透速查（阶段门流程：每阶段产出物落盘后才进下一阶段）
 按序过阶段门，禁止跳门硬打——每阶段的产出物就是下一阶段的输入：

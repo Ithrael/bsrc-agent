@@ -151,7 +151,7 @@ class Config:
     # 资源全在难啃单 flag 题上，b-02 等 6 面大题无一条线在打）：连续 N 分钟无
     # 新 flag 入账 → 把最高价值的多 flag 未解题强制插队（启动即自动 Task 分治）。
     # 0 = 关闭。
-    stagnate_boost_min: int = field(default_factory=lambda: _int("STAGNATE_BOOST_MIN", 30))
+    stagnate_boost_min: int = field(default_factory=lambda: _int("STAGNATE_BOOST_MIN", 20))
     # 错提熔断（run 12464 复盘：145 次错提全走输出捕获通道绕过脚本闸门）：
     # auto 通道（正则捕获）累计错提 ≥ 此值后关闭；显式 submit_flag 不受限。
     wrong_submit_cap: int = field(default_factory=lambda: _int("WRONG_SUBMIT_CAP", 10))

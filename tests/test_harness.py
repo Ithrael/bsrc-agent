@@ -163,3 +163,23 @@ def test_claude_env_pins_small_fast_model_to_flash():
     # 主会话槽仍是 pro
     assert env["ANTHROPIC_MODEL"] == "deepseek-v4-pro"
     assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "deepseek-v4-pro"
+
+
+@pytest.mark.asyncio
+async def test_sidechain_subagent_tokens_counted(tmp_path):
+    """Task 子 agent（sidechain）的 assistant 事件同样计入 token 熔断统计：
+    stream-json --verbose 会输出 sidechain 事件流，解析器按事件累计不区分主/子
+    ——CLAUDE_TOKEN_BUDGET 的统计口径锁定（子 agent 消耗不漏计）。"""
+    from agent.flagger import extract_flags
+    cfg = Config()
+    cfg.harness_backend = _fake_backend(tmp_path, [
+        '{"type":"assistant","message":{"usage":{"input_tokens":100,"output_tokens":20}}}',
+        '{"type":"assistant","isSidechain":true,"message":{"usage":{"input_tokens":500,"cache_read_input_tokens":100,"output_tokens":80},"content":[{"type":"text","text":"subagent got flag{side_chain_1}"}]}}',
+        '{"type":"result","result":"done"}',
+    ])
+    flags: list[str] = []
+    res = await run_harness(cfg, "p", str(tmp_path), 60,
+                            on_text=lambda t: flags.extend(extract_flags(t)))
+    # 主进程 120 + 子 agent 500 + 100//10 + 80 = 710
+    assert res.total_tokens == 710
+    assert "flag{side_chain_1}" in flags          # sidechain 文本里的 flag 也会被捕获

@@ -43,6 +43,20 @@ def _parse_hosts(addrs: list[str]) -> list[str]:
     return hosts
 
 
+def _addr_host_port(addr: str) -> tuple[str, int] | None:
+    """从单个地址串提取 (host, port)：容忍 scheme 与路径（http://h:p/x、h:p）。
+    无端口返回 None。port_plan 此前不剥 scheme，addr 带 http:// 前缀时 key
+    对不上 host，题目显式端口探测静默丢失。"""
+    s = str(addr).strip()
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    s = s.split("/", 1)[0]
+    if ":" in s and s.rsplit(":", 1)[1].isdigit():
+        h, p = s.rsplit(":", 1)
+        return (h, int(p)) if h else None
+    return None
+
+
 async def _run_cmd(cmd: str, cwd: str, timeout: int) -> str:
     """独立 ShellSession 跑一条命令（recon 内并发安全：不共享 bash 进程）。"""
     from .tools import ShellSession
@@ -143,9 +157,9 @@ async def recon_targets(addrs: list[str], workspace: str, budget_s: int = 75) ->
         # HTTP 探测：先查 addr 自带端口，再补常见端口（去重，每 host 最多 4 个）
         port_plan: dict[str, list[int]] = {}
         for a in addrs or []:
-            s = str(a)
-            if ":" in s and s.rsplit(":", 1)[1].isdigit():
-                port_plan.setdefault(s.split(":", 1)[0], []).append(int(s.rsplit(":", 1)[1]))
+            hp = _addr_host_port(str(a))
+            if hp:
+                port_plan.setdefault(hp[0], []).append(hp[1])
         for h in hosts:
             ports = port_plan.get(h, [])
             for p in _HTTP_PORTS:
