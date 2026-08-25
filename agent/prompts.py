@@ -67,14 +67,38 @@ PLAYBOOKS: dict[str, str] = {
 - 常见面：GeoServer/Confluence/GitLab/Spark/Fastjson/Log4j 等历史 RCE；AI 基础设施（模型托管/编排平台）优先试未授权 API、模板注入、路径穿越。
 - 利用链：RCE 后 flag 通常在 /flag、环境变量、数据库、或需要提权（suid/内核/docker.sock）。
 """,
-    "b": """## 多阶段渗透速查
-- 多 flag 对应多阶段：入口立足点 → 内网信息收集（arp -a、/etc/hosts、ip route、发现其他网段主机）→ 横向（凭据复用、代理穿透）→ 逐台拿 flag。
-- 每阶段把凭据、主机清单、拓扑写进 NOTES.md。
-- 横向手段：ssh 私钥/密码复用、redis 未授权、弱 smb、容器逃逸（--privileged、docker.sock、kubelet）。
-- 用 chisel/frp 或 ssh -L/-D 建隧道打通内网段；socket 代理后用 proxychains。
-- **本机 flag 文件直读**：每面 flag 常挂在 /challenge/flagN.txt（N=1..flag_count），拿到任意文件读取/RCE 后先逐个直读提交，比打内网快得多。
-- **内网代理工具模式**：入口站常有隐藏的 SSRF/代理端点（如 /proxy.php?url=），特征：鉴权代码为空 if 块、file:// 协议可用、curl 转发 POST+COOKIEJAR、页面链接自动重写。发现后立即：(1) file:// 读 /challenge/flag*、源码、/etc/hosts、/proc/net/route、/proc/net/arp；(2) 用 http:// 扫 docker 网段（从 /etc/hosts 找本机 172.x 地址，扫 172.x.0.1-10 的 80/8080/21/22 找内网主机）；(3) 内网主机登录优先用产品名相关默认凭证（题目 hint 常见提示）。
-- **gopher 攻击注意**：libcurl 拒绝 URL 中 %00（空字节），gopher 打 FastCGI/MySQL 会因协议含 \\x00 失败——换 log poisoning（access.log 记 UA）+ file:// 组合，或直接走 HTTP 代理打内网。
+    "b": """## 多阶段渗透速查（阶段门流程：每阶段产出物落盘后才进下一阶段）
+按序过阶段门，禁止跳门硬打——每阶段的产出物就是下一阶段的输入：
+
+**门1 · 入口立足** → 产出：shell/任意文件读/RCE + 第一批凭据（RELAY.md 记原语）。
+- 高价值面：文件上传、反序列化、已知组件 RCE、后台弱口令；SSRF 打内网元数据。
+
+**门2 · 资产清点** → 产出：HOSTS.md 台账（追加行：`- 主机 | 端口/服务 | 凭据(已试/命中) | flag 状态`）。
+- 本机入手：ip route、/proc/net/arp、/etc/hosts 找网段 → nmap -sn 扫段 → 对存活主机 nmap 常见端口。
+- 台账是跨线/跨轮共享的拓扑记忆：分治线开打前必读，打下的每台主机立即登记。
+
+**门3 · 凭据收集与重放** → 产出：/opt/tools/creds.txt（每行 user:password）。
+- 收集源：台账已试凭据、配置文件、数据库用户表、ps auxww 命令行、源码硬编码。
+- 重放：`/opt/tools/creds_replay.sh <目标IP>`——对 SSH(22) 与常见管理端口批量重放，
+  命中即登记台账。凭据复用是横向的第一生产力，一个入口凭据常能开整张内网。
+- **主动横扫**：`fscan -h <目标或网段> -nopoc 2>/dev/null | tee .tmp/fscan.out`
+  （存活+端口+服务+弱口令一把梭；拿下跳板要打远端网段时
+  `proxychains4 fscan -h 172.x.0.0/24`）。新发现主机全部登记台账后再逐台利用；
+  fscan 自带爆破较吵，生产靶场优先按台账精准重放，fscan 补盲区。
+
+**门4 · 逐台收 flag** → 产出：每台主机的 flag 状态归零。
+- 每拿下/读到一台主机：跑 `bash /opt/tools/flag_sweep.sh`（文件系统/环境变量/DB/进程全清点）；
+  经跳板用 `sshpass -p <pass> ssh user@host 'bash -s' < /opt/tools/flag_sweep.sh`。
+- 本机 flag 文件直读：每面 flag 常挂在 /challenge/flagN.txt（N=1..flag_count），
+  拿到任意文件读取/RCE 后先逐个直读提交，比打内网快得多。
+
+**通用横向手段**：ssh 私钥/密码复用、redis 未授权、弱 smb、容器逃逸（--privileged、docker.sock、kubelet）。
+**穿透**：chisel（server 上传目标 `./chisel server -p 8000 --reverse`，本地
+`chisel client http://目标:8000 r:socks` → proxychains4 走 127.0.0.1:1080）；
+无落盘能力时 `ssh -D 1080 user@跳板` + proxychains4 等价。
+**横向线开工纪律**：台账（HOSTS.md）无立足点记录时，先独立找第二入口，不要空等主线。
+**内网代理工具模式**：入口站常有隐藏的 SSRF/代理端点（如 /proxy.php?url=），特征：鉴权代码为空 if 块、file:// 协议可用、curl 转发 POST+COOKIEJAR、页面链接自动重写。发现后立即：(1) file:// 读 /challenge/flag*、源码、/etc/hosts、/proc/net/route、/proc/net/arp；(2) 用 http:// 扫 docker 网段（从 /etc/hosts 找本机 172.x 地址，扫 172.x.0.1-10 的 80/8080/21/22 找内网主机）；(3) 内网主机登录优先用产品名相关默认凭证（题目 hint 常见提示）。
+**gopher 攻击注意**：libcurl 拒绝 URL 中 %00（空字节），gopher 打 FastCGI/MySQL 会因协议含 \\x00 失败——换 log poisoning（access.log 记 UA）+ file:// 组合，或直接走 HTTP 代理打内网。
 """,
     "d": """## 云攻击速查
 - 本质全是 misconfig：S3 桶匿名读写（aws s3 ls s3://bucket --no-sign-request，容器内无 aws cli 就直接 REST: curl https://bucket.s3.region.amazonaws.com/）、Lambda 环境变量泄露、EC2 metadata 169.254.169.254 拿临时凭证、SAS token 权限过大、AAD 弱认证流。

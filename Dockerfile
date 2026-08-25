@@ -105,6 +105,25 @@ RUN mkdir -p /opt/wordlists && \
       || curl -fsSL "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/darkweb2017_top-100.txt" -o /opt/wordlists/top-100-passwords.txt \
       || printf '%s\n' 123456 password 123456789 12345678 12345 qwerty abc123 111111 123123 1234567890 1234567 iloveyou 000000 admin welcome monkey dragon letmein login princess qwertyuiop solo passw0rd starwars master hello freedom whatever qazwsx trustno1 superman batman football baseball dragon1 michael shadow jordan harley ranger buster hunter thomas robert charlie daniel hannah magic 1q2w3e4r 1qaz2wsx zaq12wsx password1 password123 p@ssw0rd root toor test guest user info changeme > /opt/wordlists/top-100-passwords.txt; }
 
+# 多阶段渗透基建（run 12464 复盘：渗透维度 60.71——链断在"资产清点→凭据复用→逐台收 flag"
+# 后三段；以下全部为通用 tradecraft，不含任何题目先验）：
+# 1) chisel 静态二进制：Web 壳/SSRF 拿到的内网访问转全工具 SOCKS 穿透（失败不阻断，
+#    ssh -D + proxychains4 组合仍可用，playbook 同步教）
+# 2) 通用 post-exploitation 脚本：flag_sweep.sh（拿权主机的旗标清点）+
+#    creds_replay.sh（凭据清单对目标批量重放）
+RUN (curl -fsSL https://github.com/jpillora/chisel/releases/download/v1.10.1/chisel_1.10.1_linux_amd64.gz -o /tmp/chisel.gz \
+     && gunzip -f /tmp/chisel.gz && chmod +x /tmp/chisel && mv /tmp/chisel /usr/local/bin/chisel) \
+    || echo "WARNING: chisel 下载失败，穿透回退 ssh -D + proxychains4"
+# 3) fscan 静态二进制：内网横向一把梭（存活/端口/服务/弱口令/常见漏洞检测），
+#    台账+凭据重放体系（#2 脚本）的主动扫描升级；经隧道时 proxychains4 fscan 使用
+RUN FSCAN_URL=$(curl -fsSL https://api.github.com/repos/shadow1ng/fscan/releases/latest | python3 -c "import sys,json; d=json.load(sys.stdin); print(next(a['browser_download_url'] for a in d['assets'] if 'amd64' in a['name'] and 'arm' not in a['name']))") \
+    && curl -fsSL "$FSCAN_URL" -o /tmp/fscan_dl \
+    && (cd /tmp && { file fscan_dl | grep -q zip && unzip -o fscan_dl && mv fscan* /usr/local/bin/fscan || mv fscan_dl /usr/local/bin/fscan; }) \
+    && chmod +x /usr/local/bin/fscan \
+    || echo "WARNING: fscan 下载失败，横向回退 creds_replay.sh + nmap 手工流"
+COPY tools/flag_sweep.sh tools/creds_replay.sh /opt/tools/
+RUN chmod +x /opt/tools/flag_sweep.sh /opt/tools/creds_replay.sh && touch /opt/tools/creds.txt
+
 COPY agent /app/agent
 COPY api-doc.txt /app/api-doc.txt
 # claude code 直接解题模式：镜像内默认开启（本地 run-local 不设此变量，走裸 LLM 循环调试）

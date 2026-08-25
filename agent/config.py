@@ -152,6 +152,12 @@ class Config:
     # 新 flag 入账 → 把最高价值的多 flag 未解题强制插队（启动即自动 Task 分治）。
     # 0 = 关闭。
     stagnate_boost_min: int = field(default_factory=lambda: _int("STAGNATE_BOOST_MIN", 30))
+    # 错提熔断（run 12464 复盘：145 次错提全走输出捕获通道绕过脚本闸门）：
+    # auto 通道（正则捕获）累计错提 ≥ 此值后关闭；显式 submit_flag 不受限。
+    wrong_submit_cap: int = field(default_factory=lambda: _int("WRONG_SUBMIT_CAP", 10))
+    # 收尾段时长（分钟）：开跑满 GLOBAL_BUDGET_MIN-ENDGAME_MIN 后调度器只放行快赢题
+    # （12464 复盘：收卷前 25min 还在第三轮攻 f2-05，尾段槽位全烧在零转化题上）
+    endgame_min: int = field(default_factory=lambda: _int("ENDGAME_MIN", 45))
 
     # 上下文预算：按估算 token 计（CJK 1 字符≈1 token，其余 4 字符≈1 token）。
     # 150k 字符的全中文上下文会逼近 128k token 上限触发 LLM 400（历史 b-02 踩过），

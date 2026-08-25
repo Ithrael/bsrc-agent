@@ -41,3 +41,16 @@ def test_priority_single_flag_before_multi_flag(monkeypatch):
     ordered = sorted([hard, easy, multi], key=_priority)
     assert ordered[0].unique_code == "d-01"  # 目标是单位墙钟解出更多完整题
     assert _priority(easy) < _priority(hard) < _priority(multi)
+
+
+def test_killchain_playbook_stage_gates():
+    """b 系列 playbook：阶段门流程 + 台账/工具/穿透全部就位（通用 tradecraft，无题目先验）。"""
+    from agent.prompts import PLAYBOOKS
+    pb = PLAYBOOKS["b"]
+    assert "阶段门" in pb
+    for gate in ("门1", "门2", "门3", "门4"):
+        assert gate in pb, gate
+    assert "HOSTS.md" in pb and "台账" in pb
+    assert "flag_sweep.sh" in pb and "creds_replay.sh" in pb
+    assert "chisel" in pb and "ssh -D" in pb
+    assert "空等" in pb  # 横向线开工纪律

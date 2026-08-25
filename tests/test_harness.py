@@ -148,3 +148,18 @@ async def test_worker_harness_upgrade_submits_flag(tmp_path):
     assert (tmp_path / "mock_web_01" / "harness-transcript.jsonl").exists()
     await api.close()
     srv.shutdown()
+
+
+def test_claude_env_pins_small_fast_model_to_flash():
+    """haiku/内部杂务槽固定 flash（12464 复盘：未设 SMALL_FAST 时内部调用被网关
+    兜底到 deepseek-chat，1617 次 8241 万 token）；会话主模型是 pro 也不变。"""
+    from agent.config import Config
+    from agent.harness import _claude_env
+    cfg = Config()
+    cfg.llm_model = "deepseek-v4-flash"
+    env = _claude_env(cfg, model_override="deepseek-v4-pro")
+    assert env["ANTHROPIC_SMALL_FAST_MODEL"] == "deepseek-v4-flash"
+    assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "deepseek-v4-flash"
+    # 主会话槽仍是 pro
+    assert env["ANTHROPIC_MODEL"] == "deepseek-v4-pro"
+    assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "deepseek-v4-pro"

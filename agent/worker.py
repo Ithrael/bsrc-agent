@@ -306,7 +306,8 @@ class Worker:
         self.result = WorkerResult()
         # 双 worker 模式：submitter/notes_path/state_path 共享，role_extra 分工提示
         self.submitter = submitter or FlagSubmitter(
-            challenge.unique_code, challenge.flag_count, challenge.correct_flag_count)
+            challenge.unique_code, challenge.flag_count, challenge.correct_flag_count,
+            wrong_cap=cfg.wrong_submit_cap)
         self.notes_path = notes_path or os.path.join(workspace, "NOTES.md")
         # STATE.md：结构化状态（FACTS 代码自动维护 / INTENTS·ELIMINATED 由 LLM 按约定登记）
         self.state_path = state_path or os.path.join(workspace, "STATE.md")
@@ -479,6 +480,16 @@ class Worker:
                 f"解出后约扣 {max(1, self.ch.total_score // 10)} 分；若最终未解出则不扣分）。"
                 f"围绕提示方向调整思路，不要重复已排除方向：\n{hint or '(无提示内容)'}")
 
+    def _should_hint_upfront(self) -> bool:
+        """首轮（attempt=0）是否直接带官方 hint 开工。
+
+        Cairn_X 复盘（官方榜 94.61）：148 次 hint 换 71 flag，卡住就买方向比硬扛便宜
+        （每条扣该题 10%，换整题方向指引远划算）。free 策略 + hard/多 flag 题——
+        首线空转重灾区（run 12464：hard 首线 25min 无 hint，渗透维度 60.71 最大短板）；
+        easy/medium 单 flag flash 能解，留给断点重跑再拉。"""
+        return (self.cfg.hint_policy == "free"
+                and (self.ch.difficulty == "hard" or self.ch.flag_count >= 2))
+
     async def _advisor_brief(self, hint_text: str = "") -> str:
         """retry 轮指挥官 brief（对标榜 2 Heimdall_lucky 的 observer→advisor 模式）：
         强模型读该题全部进度（NOTES/STATE/上轮会话摘要），产出定向作战指令注入
@@ -644,24 +655,57 @@ class Worker:
 
     # ---- 上下文管理 ----
 
+    def _has_progress(self) -> bool:
+        """跨 attempt 的工作区是否有真进展（retry 预算分级的依据）。
+
+        信号取 RELAY.md（行动纪律强制即时落盘，最可靠）与 NOTES.md 的
+        solver 发现 bullet；NOTES 头部的「目标:」行和 STATE 的 flag 进度行
+        不算进展（每次创建都有）。run 12464 复盘：f2-05/a-18 三轮满预算
+        重攻零产出（213min 打水漂）——无断点的轮转不该再拿满预算。
+        """
+        # getattr 防御：__new__ 构造的测试实例/paired worker 无 ws 属性
+        ws = getattr(self, "ws", "")
+        notes_path = getattr(self, "notes_path", "")
+        try:
+            with open(os.path.join(ws, "RELAY.md")) as f:
+                relay = [l for l in f.read().splitlines()
+                         if l.strip() and not l.strip().startswith("#")]
+            if relay:
+                return True
+        except OSError:
+            pass
+        try:
+            with open(notes_path) as f:
+                bullets = [l for l in f.read().splitlines()
+                           if l.strip().startswith("- ") and "flag 进度" not in l]
+            if len(bullets) >= 2:
+                return True
+        except OSError:
+            pass
+        return False
+
     def _scaled_timeout_s(self, has_completed_sol: bool = False) -> int:
         """题数最大化模式的墙钟预算：快速轮转，避免单题长期堵住 3 个槽位。
 
         多 Agent 已经把同题探索宽度换成并行度；这里限制单次尝试长度，
         只给有断点/有新进展的 retry 轮适度延长时间。
+        预算分级（run 12464 复盘）：retry 轮有断点给满（run 12231 曾因碎片化
+        短预算丢 c-02/a-14/c-08 共 -860 分，不能一刀切）；无断点降为快验轮
+        （hint+advisor 双注入的定向验证，不配满预算原样重试）。
         """
+        prog = self._has_progress() if self.attempt >= 1 else True
         if has_completed_sol:
             minutes = 5 if self.ch.flag_count <= 1 else 10
         elif self.ch.difficulty == "hard":
-            # 主进程要协调 N 个子 agent 多轮派发，需要完整预算（run 12231 复盘：
-            # 碎片化 20/25min 太短 + medium retry 15min 丢 c-02/a-14/c-08 共 -860 分——回滚）
-            minutes = 25 if self.attempt <= 0 else (35 if self.attempt == 1 else 40)
+            # 主进程要协调 N 个子 agent 多轮派发，需要完整预算（run 12231 复盘）；
+            # 无断点 retry 降为 12min 快验轮
+            minutes = 25 if self.attempt <= 0 else ((35 if self.attempt == 1 else 40) if prog else 12)
         elif self.ch.difficulty == "medium":
-            # 首轮 12min（原 20min，AePis 复盘：easy/medium 全扫 <2h，3.3min/flag；
-            # 首轮快速轮转把时间留给 hard 攻坚），retry 轮 25min 给足断点续跑
-            minutes = 12 if self.attempt <= 0 else 25
+            # 首轮 12min（AePis 复盘：easy/medium 全扫 <2h，3.3min/flag），
+            # retry 有断点 25min 给足续跑；无断点 10min 快验
+            minutes = 12 if self.attempt <= 0 else (25 if prog else 10)
         else:
-            minutes = 8 if self.attempt <= 0 else 15
+            minutes = 8 if self.attempt <= 0 else (15 if prog else 8)
         if self.cfg.round_num == 1 and not has_completed_sol:
             minutes = min(minutes, 30 if self.ch.difficulty == "hard" else 20)
         return minutes * 60
@@ -954,7 +998,7 @@ class Worker:
     async def _submit_harness_flags(self):
         """输出捕获通道提交：submit_flag.sh 走平台直连，此通道兜底漏网的 flag。"""
         for flag in self._harness_flags:
-            if self.submitter.should_try(flag):
+            if self.submitter.should_try(flag, auto=True):
                 r = await self._submit_cb(flag)
                 log.info("[%s] claude flag 提交 %s -> %s", self.ch.unique_code, flag[:60], r[:40])
                 if self.submitter.completed:
@@ -984,7 +1028,7 @@ class Worker:
         """claude 会话收尾统一记账：事件流捕获 + STATE.md 登记行都过提交闸门。"""
         await self._submit_harness_flags()
         for flag in self._state_submitted_flags():
-            if self.submitter.should_try(flag):
+            if self.submitter.should_try(flag, auto=True):
                 r = await self._submit_cb(flag)
                 log.info("[%s] STATE.md 登记flag 补记账 %s -> %s",
                          self.ch.unique_code, flag[:60], r[:40])
@@ -1092,7 +1136,7 @@ class Worker:
         res = await self._run_harness_with_drain(prompt, h_timeout,
                                 on_text=self._harness_on_text)
         for flag in self._harness_flags:
-            if self.submitter.should_try(flag):
+            if self.submitter.should_try(flag, auto=True):
                 r = await self._submit_cb(flag)
                 log.info("[%s] harness flag 提交 %s -> %s", self.ch.unique_code, flag[:60], r[:40])
                 if self.submitter.completed:
@@ -1151,6 +1195,13 @@ class Worker:
         rot = getattr(self, "_rotation_text", "")
         if rot:
             parts.append(rot)
+        # 已购 hint 置顶（run 12464 复盘：hint 埋在「解法库记录」段里不够显眼，
+        # retry 轮容易原样重试）——每次轮转免费复用；重复调 hint API 会重复扣
+        # 该题 10%，notes.json 落盘后只注入不再购买
+        _hint_note = (notes.get(ch.unique_code) or "")
+        if _hint_note.startswith("[官方 hint]"):
+            parts.append("## 官方提示（已购，免费复用——本轮主攻方向：先按此验证，再扩展）\n"
+                         + _hint_note[len("[官方 hint]"):].strip())
         if desc_hints:
             parts.append("## CVE 线索（题目描述命中，优先查公开 PoC）\n" + "\n".join(f"- {h}" for h in desc_hints))
         port_hints = self._port_hints()
@@ -1187,7 +1238,10 @@ class Worker:
             "1. 当前工作目录是你的战场：脚本/产出文件都留在这里；关键发现追加进 NOTES.md，"
             "已排除方向登记进 STATE.md 的 ## ELIMINATED；**执行过的关键命令追加进 TRANSCRIPT.md"
             "（一行一条），可复用脚本存进 scripts/ 目录**——分治线/重跑轮会先读这些文件续跑。\n"
-            "2. 拿到 flag 立即执行 `./submit_flag.sh <flag>` 确认提交成功；"
+            "2. **CLAIM/EVIDENCE 提交纪律（强制）**：拿到疑似 flag 先在心里过一遍证据——"
+            "它是否来自你亲眼读到的工具输出？是则立即提交并附证据来源：\n"
+            "   ./submit_flag.sh <flag> 'cat /challenge/flag.txt 的输出'\n"
+            "   推断/拼接/其他题残留/猜测的 flag **禁止提交**（提交必错还烧请求）；"
             "提交响应里 remaining>0 说明还有 flag 没拿，全部拿齐后停止。\n"
             "3. **接力块（强制，防超时断点丢失）**：每达成一个攻击原语（任意文件读/RCE/破密码/"
             "建隧道/拿到 shell）或证死一条路，**立即**用 bash 追加进 RELAY.md——不要攒到会话结束，"
@@ -1195,6 +1249,9 @@ class Worker:
             "   echo '已达成原语: <胜利态，如 SSRF→内网 10.0.0.5:8080 可达>' >> RELAY.md\n"
             "   echo '已证死路: <方向> — <一句原因>' >> RELAY.md\n"
             "   echo '下一步: <紧接原语的具体命令/payload>' >> RELAY.md\n"
+            "   多阶段/多 flag 题另维护 HOSTS.md 资产台账：拿下一台主机立即追加一行"
+            "`- 主机 | 端口/服务 | 凭据(已试/命中) | flag 状态`——台账跨线共享，"
+            "横向线开打前必读，不打 flag 已归零的主机。\n"
             "4. 禁止长时间盲扫（几万行字典全量爆破）；优先理解业务逻辑、已知 CVE、默认凭证。\n"
             "5. 分析过程用英文输出（工具输出解析更稳）；flag 格式为 flag{...}，"
             "必须从靶场环境实际读取（文件/环境变量/数据库），严禁构造猜测。\n"
@@ -1203,7 +1260,7 @@ class Worker:
             "——后续所有题自动注入，解一题惠全题。")
         parts.append(
             "## 攻击面清单（按序执行，勿跳步——对标榜首 agent 的强制方法论）\n"
-            "1. **先读工作区历史**：RELAY.md（接力块：原语/死路/下一步，最优先）、NOTES.md（已有发现）、"
+            "1. **先读工作区历史**：RELAY.md（接力块：原语/死路/下一步，最优先）、HOSTS.md（资产台账：主机/凭据/flag 状态）、NOTES.md（已有发现）、"
             "STATE.md（断点/已排除）、TRANSCRIPT.md（命令日志）、scripts/（可复用脚本）——不重做已做的事。\n"
             "2. **指纹优先不盲扫**：curl 首页/robots.txt/响应头判断产品框架；"
             "已知组件（泛微/致远/Shiro/Log4j/Struts2/ThinkPHP 等）直接查公开 PoC。\n"
@@ -1253,12 +1310,27 @@ class Worker:
         if not os.path.exists(relay_path):
             with open(relay_path, "w") as f:
                 f.write("# 接力块（已达成原语/已证死路/下一步，跨线共享）\n")
+        hosts_path = os.path.join(self.ws, "HOSTS.md")
+        if not os.path.exists(hosts_path):
+            with open(hosts_path, "w") as f:
+                f.write("# 资产台账（追加行：- 主机 | 端口/服务 | 凭据(已试/命中) | flag 状态）\n")
         # 显式提交通道：claude 用 bash 跑脚本获得提交反馈闭环（输出捕获通道兜底）
         submit_sh = os.path.join(self.ws, "submit_flag.sh")
         if not os.path.exists(submit_sh):
             with open(submit_sh, "w") as f:
                 f.write("#!/bin/bash\n# 提交 flag（平台 API 直连，bsrc-agent 生成）\n"
-                        "FLAG=\"$1\"\n[ -z \"$FLAG\" ] && { echo 'usage: ./submit_flag.sh <flag>'; exit 1; }\n"
+                        "# 用法: ./submit_flag.sh <flag> '<RAW EVIDENCE：该 flag 从哪条工具输出读到>'\n"
+                        "FLAG=\"$1\"; EVID=\"$2\"\n"
+                        "[ -z \"$FLAG\" ] && { echo 'usage: ./submit_flag.sh <flag> \"<RAW EVIDENCE 来源>\"'; exit 1; }\n"
+                        "# CLAIM/EVIDENCE 闸门（对标 hxbai 69 flag 仅 4 错提）：第 1 次提交起就要声明证据来源。\n"
+                        "# 证据 = 亲眼读到的工具输出（cat /flag、数据库查询、env 等）；推断/拼接/猜测不算。\n"
+                        "# 已在 NOTES.md 记录过该 flag 来源的（来源闸门产物）视为已声明，免重复。\n"
+                        "if [ ${#EVID} -lt 6 ] && ! grep -Fq \"$FLAG\" NOTES.md 2>/dev/null; then\n"
+                        "  echo '[证据拒绝] 请附 RAW EVIDENCE 再提交：'\n"
+                        "  echo \"  ./submit_flag.sh $FLAG 'cat /flag.txt 第 3 行输出'\"\n"
+                        "  echo '  证据必须来自真实工具输出；推断、拼接、猜测的 flag 禁止提交（省一次必错请求）。'\n"
+                        "  exit 1\n"
+                        "fi\n"
                         "# 格式校验：平台 flag 两形态——UUID 或 leetspeak（f 系列二进制题），其余疑似猜测拒绝\n"
                         "echo \"$FLAG\" | grep -qiE '^flag\\{([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-z_]{8,64})\\}$' \\\n"
                         "  || { echo '格式拒绝：非合法 flag 形态，请从靶场环境实际读取 flag，不要猜测'; exit 1; }\n"
@@ -1339,12 +1411,23 @@ class Worker:
         #   复现题 pro 双线烧满 30min 超时，事后挖出 flag 却是 duplicate，纯浪费）
         use_hard_model = (ch.difficulty == "hard" or self.attempt >= 1) and not has_completed_sol
         hard_model = self.cfg.llm_model_hard if use_hard_model else ""
-        # effort max（CLAUDE_HARD_EFFORT，默认 max）：与 pro 同触发（pro 会话才有深思考价值）
-        hard_effort = self.cfg.claude_hard_effort if hard_model else ""
+        # effort 分级（run 12464 复盘：pro 全场 reasoning=0——探测超时被降级导致
+        # 思考预算全丢，只买到知识没买到思考）：
+        # - medium/hard：全程 effort max（攻坚深度优先）
+        # - easy：首轮不开（快扫吞吐优先——hxbai 零思考 4h23m 拿 92.57 的效率证据），
+        #   一轮没解决说明不是秒解题，retry 轮（attempt≥1）开 max 深挖
+        if self.ch.difficulty == "easy" and self.attempt <= 0:
+            hard_effort = ""
+        else:
+            hard_effort = self.cfg.claude_hard_effort
         # claude 模式 hint（P1，run 10048 复盘进阶 hard 单线瞎转）：retry 轮（attempt≥1）
         # 自动注入官方提示，落盘 notes.json 下轮复现免扣分。首轮内断点重跑处兜底再拉。
+        # Cairn_X 复盘（官方榜 94.61）：148 次 hint 换 71 flag——卡住就买方向是最便宜的得分。
+        # 首轮即注入条件（run 12464 复盘：hard 首线 25min 无 hint 空转、渗透 60.71 全场最大短板）：
+        # free 策略 + hard 或多 flag 题 attempt=0 直接带 hint 开工（每条扣该题 10%，
+        # 换方向指引远划算）；easy/medium 单 flag flash 能解，留给断点重跑再拉。
         hint_text = ""
-        if self.attempt >= 1:
+        if self.attempt >= 1 or self._should_hint_upfront():
             hint_text = await self._auto_hint()
         # retry 轮指挥官 brief（Heimdall advisor 模式）：强模型读全部进度产出定向指令
         # （官方提示一并喂给 advisor，防止 brief 与 hint 方向矛盾）
@@ -1362,16 +1445,20 @@ class Worker:
         # 防踩：子 agent 各自独立工作目录 lineX/（约定），共享文件追加带线名前缀，串线线索只交接。
         _ROLES: dict[str, tuple[str, str]] = {
             "A": ("入口面", "目标 Web 服务的初始突破（默认凭证/已知 CVE/文件上传等）。"),
-            "B": ("内网横向", "按 NOTES.md 主机清单逐台探测/利用；新主机地址/端口/指纹登记进 NOTES.md。"),
+            "B": ("内网横向", "按 HOSTS.md 资产台账逐台探测/利用；新主机立即登记台账一行"
+                              "（- 主机 | 端口/服务 | 凭据 | flag 状态）。"),
             "C": ("提权与收尾", "对已发现的主机/服务做提权与深入利用，专攻其他线没拿到的面。"),
             "D": ("独立侦察", "走与其它线完全不同的路径（非 Web 端口/云元数据/供应链依赖/隐藏接口），"
                              "发现关键线索立即写 NOTES.md。"),
             "E": ("CVE 专攻", "对已识别的组件指纹查 searchsploit/公开 PoC 直接利用。"),
             "F": ("云与逃逸", "IMDS 凭证（169.254.169.254）/docker.sock/k8s API/容器逃逸路径专项。"),
-            "G": ("横向-凭证攻击", "用 NOTES.md 主机清单与已有凭证逐台登录/爆破（sshpass/redis-cli/hydra），"
-                                  "优先复用已知口令。"),
-            "H": ("收尾直读", "专攻本机与已拿主机的 flag 文件直读（/challenge/flagN.txt、"
-                             "find / -maxdepth 3 -name 'flag*'），补其他线漏掉的面。"),
+            "G": ("横向-凭证攻击", "把所有已收集凭据写进 /opt/tools/creds.txt，对 HOSTS.md 台账"
+                                  "逐台跑 /opt/tools/creds_replay.sh（SSH/管理端口批量重放）；"
+                                  "盲区用 fscan -h <网段> 补扫（存活/弱口令/常见漏洞），"
+                                  "命中立即登记台账。"),
+            "H": ("收尾直读", "对每台已拿主机跑 bash /opt/tools/flag_sweep.sh（全量旗标清点，"
+                             "经跳板用 ssh 'bash -s' < /opt/tools/flag_sweep.sh），"
+                             "补其他线漏掉的面。"),
         }
         master_role = ""  # 主控角色指令（多 flag/hard 题启用；断点重跑复用同一角色）
         if not has_completed_sol and (ch.flag_count >= 2 or ch.difficulty == "hard"):
@@ -1386,16 +1473,16 @@ class Worker:
             master_role = (
                 f"## 你的角色（主控 agent，用 Task 工具并行派发子 agent 攻坚）\n"
                 f"本题共 {ch.flag_count} 面 flag，你负责统筹全局，不亲自做侦察细节：\n"
-                f"1. 先读 NOTES.md、STATE.md、RELAY.md：已拿到的 flag 与已排除方向不要重复攻。\n"
+                f"1. 先读 NOTES.md、STATE.md、RELAY.md、HOSTS.md（资产台账）：已拿到的 flag 与已排除方向不要重复攻。\n"
                 f"2. 用 Task 工具**一次性并行派发 {len(line_keys)} 个子 agent**，各自独立上下文分头攻坚，"
                 f"方向互不重叠：\n{subtask_table}\n"
                 "3. 每个子 agent 的指令里必须包含（防互相踩）：\n"
                 "   - 独立工作目录 line_{线号}/：所有脚本/输出/临时文件只写在这里，"
                 "禁止写工作目录之外的任何文件（共享文件除外）；"
-                "line 目录内的 NOTES.md/STATE.md/RELAY.md/submit_flag.sh 是软链"
+                "line 目录内的 NOTES.md/STATE.md/RELAY.md/HOSTS.md/submit_flag.sh 是软链"
                 "（指向共享文件），cd 进去后照样用相对路径追加/提交\n"
                 "   - 共享文件只追加且带线名前缀：`echo '- [X线] <发现>' >> NOTES.md`"
-                "（RELAY.md、STATE.md 的 INTENTS/ELIMINATED 同理），禁止重排/覆盖他人内容\n"
+                "（RELAY.md、HOSTS.md 台账、STATE.md 的 INTENTS/ELIMINATED 同理），禁止重排/覆盖他人内容\n"
                 "   - 拿到 flag 立即用 bash 执行 `./submit_flag.sh <flag>` 提交\n"
                 "   - 发现其它方向攻击面的线索：写进 NOTES.md 交接（注明给哪条线），不要自己深入\n"
                 "   - 结束前返回三行总结：已达成原语 / 已证死路 / 下一步\n"
@@ -1413,13 +1500,18 @@ class Worker:
                     "拿到任意文件读取/RCE 后先逐个直读提交，比打内网快得多。\n"
                     "2. **画内网拓扑**：`ip addr; ip route; cat /etc/hosts; arp -a`——"
                     "docker 网段常见 172.17-31.0/24，记下本机地址与网关。\n"
-                    "3. **内网存活扫描**：对所在网段 .1-.15 扫 80/8080/22/21/6379/3306/445"
-                    "（nc -zv -w2 循环即可，别用大字典全量扫）。\n"
-                    "4. **凭证复用**：NOTES.md 里每个已拿凭证都去试内网每台主机"
-                    "（sshpass / redis-cli / curl 带凭据），登记主机清单进 NOTES.md。\n"
+                    "3. **内网存活扫描**：`fscan -h <网段> -nopoc` 一把梭（存活/端口/弱口令）；"
+                    "无 fscan 时对 .1-.15 手扫 80/8080/22/21/6379/3306/445（nc -zv -w2）。\n"
+                    "4. **凭证复用**：把所有已拿凭证写进 /opt/tools/creds.txt（每行 user:password），"
+                    "对 HOSTS.md 台账逐台跑 `/opt/tools/creds_replay.sh <IP>` 批量重放"
+                    "（SSH/管理端口），命中登记台账。\n"
                     "5. **容器/宿主逃逸**：检查 /var/run/docker.sock 挂载、overlay 挂载、"
                     "/proc/self/status 里的宿主机特征——多面题高分段常靠逃逸到宿主或其他容器。\n"
-                    "6. 每台新主机重复 1-5；每面 flag 一到手立即 ./submit_flag.sh，然后继续下一面。")
+                    "6. **隧道穿透**：需要全工具打内网时 chisel（目标: `./chisel server -p 8000 --reverse`；"
+                    "本地: `chisel client http://目标:8000 r:socks` 后 proxychains4 走 127.0.0.1:1080）"
+                    "或 `ssh -D 1080 user@跳板` 等价。\n"
+                    "7. 每台新主机重复 1-6 并跑 flag_sweep.sh；每面 flag 一到手立即 ./submit_flag.sh，"
+                    "然后继续下一面；台账同步更新。")
             # 主进程 cwd = 工作区根；子 agent 约定目录先建好。
             # 共享文件软链进各 line 目录（f54063c 重构曾误删，2026-08-24 review 恢复）：
             # 子 agent 按指令 cd line_X 后，相对路径的 NOTES.md 追加与 ./submit_flag.sh
@@ -1428,7 +1520,7 @@ class Worker:
             for key in line_keys:
                 line_dir = os.path.join(self.ws, f"line_{key}")
                 os.makedirs(line_dir, exist_ok=True)
-                for name in ("NOTES.md", "STATE.md", "RELAY.md", "submit_flag.sh"):
+                for name in ("NOTES.md", "STATE.md", "RELAY.md", "HOSTS.md", "submit_flag.sh"):
                     src, dst = os.path.join(self.ws, name), os.path.join(line_dir, name)
                     if os.path.exists(src) and not os.path.lexists(dst):
                         os.symlink(src, dst)
@@ -1463,7 +1555,7 @@ class Worker:
             log.info("[%s] claude 提前退出未拿全 flag，断点重跑一次（%ds）", ch.unique_code, retry_s)
             retry_prompt = self._build_claude_prompt(ch, sol, notes, has_completed_sol, desc_hints, recon_report, master_role)
             retry_prompt += ("\n\n## 断点续跑（第二次尝试）\n"
-                             "上次运行已结束但 flag 未拿全。先读 RELAY.md（接力块：原语/死路/下一步）、"
+                             "上次运行已结束但 flag 未拿全。先读 RELAY.md（接力块：原语/死路/下一步）、HOSTS.md（资产台账）、"
                              "NOTES.md 与 STATE.md 了解已有进展与已排除方向，从断点继续，"
                              "禁止重复已排除方向；全部 flag 拿齐前不要停止。")
             # 首轮内断点重跑兜底拉 hint（attempt=0 时上面没拉过）：已花完一轮时间，指引方向
@@ -1488,6 +1580,12 @@ class Worker:
         self.result.reason = ("all flags captured" if self.result.completed
                               else "claude done" if (res.output_text or res.events)
                               else "claude no output (timeout?)")
+        # 零进展退出轮转（run 12464 复盘：f2-05 第三轮收卷前 25min 还在盲猜）：
+        # attempt≥2 且无 flag 且无断点 → 标记 no_progress，scheduler 不再入
+        # 常规 retry 队列；队列耗尽后的平台回查轮（NEVER_STOP）仍会回挖这些题。
+        if (not self.result.completed and self.attempt >= 2
+                and not self.submitter.correct and not self._has_progress()):
+            self.result.reason = f"no_progress: attempt {self.attempt} 无 flag 无断点，退出轮转（末尾回查轮可回挖）"
         self._record_claude_solution(res)
         try:
             with open(os.path.join(self.ws, "claude-transcript.jsonl"), "a") as f:
@@ -1878,7 +1976,7 @@ class Worker:
                         self._state_append("FACTS", f"- CVE 线索 {hint}")
                     # 自动捕获输出中的 flag
                     for flag in extract_flags(out):
-                        if self.submitter.should_try(flag):
+                        if self.submitter.should_try(flag, auto=True):
                             r = await self._submit_cb(flag)
                             log.info("[%s] 自动捕获提交 %s -> %s", ch.unique_code, flag[:60], r[:40])
                             if r.startswith("✅"):

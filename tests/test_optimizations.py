@@ -1,4 +1,5 @@
 """针对本轮优化点的回归测试：解法清洗、超时分级、token 估算、预侦察解析、调度优先级。"""
+import os
 import time
 
 from agent.config import Config
@@ -51,16 +52,27 @@ def test_timeout_first_attempt_hard_fast_fail():
     assert w._scaled_timeout_s() == 25 * 60
 
 
-def test_timeout_retry_hard_40min():
-    """hard 第 2 次尝试 35min。"""
-    w = _mk_worker(unique_code="b-02", flag_count=4, difficulty="hard", attempt=1)
+def _give_progress(w):
+    """给 worker 一个带 RELAY 内容的临时工作区（模拟有断点）。"""
+    import tempfile
+    d = tempfile.mkdtemp()
+    w.ws = d
+    w.notes_path = os.path.join(d, "NOTES.md")
+    with open(os.path.join(d, "RELAY.md"), "w") as f:
+        f.write("# 接力块\n已达成原语: SSRF→内网可达\n")
+    return w
+
+
+def test_timeout_retry_hard_tiered():
+    """hard retry 分级（run 12464 复盘）：有断点 35/40min，无断点 12min 快验轮。"""
+    import os as _os
+    w = _give_progress(_mk_worker(unique_code="b-02", flag_count=4, difficulty="hard", attempt=1))
     assert w._scaled_timeout_s() == 35 * 60
-
-
-def test_timeout_hard_third_round_90min():
-    """hard 第 3 次及以后尝试 40min。"""
-    w = _mk_worker(unique_code="b-02", flag_count=4, difficulty="hard", attempt=2)
+    w = _give_progress(_mk_worker(unique_code="b-02", flag_count=4, difficulty="hard", attempt=2))
     assert w._scaled_timeout_s() == 40 * 60
+    # 无断点（不设工作区）：快验轮
+    w2 = _mk_worker(unique_code="b-02", flag_count=4, difficulty="hard", attempt=2)
+    assert w2._scaled_timeout_s() == 12 * 60
 
 
 def test_timeout_easy_below_cap():

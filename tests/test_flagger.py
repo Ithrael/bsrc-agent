@@ -67,3 +67,21 @@ def test_submitter_reuses_platform_progress():
     assert s.correct_count == 2
     s.record("flag{new}", True, 100, correct_count=3)
     assert s.completed
+
+
+def test_auto_channel_wrong_cap_fuse():
+    """run 12464 复盘：auto 通道（正则捕获）累计错提 ≥cap 熔断；显式通道不熔断。"""
+    s = FlagSubmitter("x", expected_flags=1, wrong_cap=3)
+    for i in range(3):
+        assert s.should_try(f"flag{{{chr(97 + i)}1b2c3d4}}", auto=True)
+        s.record(f"flag{{{chr(97 + i)}1b2c3d4}}", False, 0)
+    # auto 通道熔断
+    assert not s.should_try("flag{z9y8x7w6}", auto=True)
+    # 显式通道（LLM submit_flag 调用）仍放行——c-02 错 23 次仍解出的教训
+    assert s.should_try("flag{z9y8x7w6}")
+    # 正确提交不受影响：显式通道提交正确后 completed
+    s.record("flag{z9y8x7w6}", True, 100, correct_count=1)
+    assert s.completed
+    # wrong_total 不因正确提交清零（auto 通道保持关闭）
+    assert s.wrong_total == 3
+    assert not s.should_try("flag{q1w2e3r4t5}", auto=True)

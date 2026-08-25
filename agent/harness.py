@@ -84,7 +84,13 @@ def _claude_env(cfg, model_override: str = "") -> dict:
     env["ANTHROPIC_MODEL"] = model
     env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = model
     env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = model
-    env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = model
+    # haiku 槽（含内部杂务调用：标题生成/上下文压缩）固定走便宜主力模型（默认 flash）：
+    # - ANTHROPIC_SMALL_FAST_MODEL 不设时，CC 内部调用以 Anthropic haiku 模型名打网关，
+    #   DeepSeek 网关把未知名字兜底映射到 deepseek-chat（run 12464：1617 次内部调用
+    #   8241 万 token 走了 deepseek-chat）；显式指定后归位 flash
+    # - 即使会话主模型是 pro（攻坚），内部杂务也不该烧 pro
+    env["ANTHROPIC_SMALL_FAST_MODEL"] = cfg.llm_model
+    env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = cfg.llm_model
     env["SHELL"] = "/bin/bash"
     return env
 
@@ -158,7 +164,9 @@ async def run_harness(cfg, prompt: str, cwd: str, timeout_s: int,
     else:
         env, cmd = dict(os.environ), [cfg.harness_backend]
     res = HarnessResult()
-    log.info("[harness] 启动 %s（timeout %ds, cwd=%s）", cmd[0], timeout_s, cwd)
+    # 完整命令行入日志（12464 复盘：只打 cmd[0] 时无法事后判断 effort 是否被传上——
+    # 全轮 reasoning=0 却查不出哪环丢了 --effort）
+    log.info("[harness] 启动: %s（timeout %ds, cwd=%s）", " ".join(cmd), timeout_s, cwd)
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,

@@ -277,3 +277,52 @@ async def test_stagnate_check_disabled(tmp_path):
     await sched._stagnate_check()
     assert sched.pending == []
     assert len(sched.retry_queue) == 1
+
+
+# ---- endgame 收尾纪律（12464 复盘：尾段不开新硬题，只打快赢） ----
+
+def _sched_for_endgame(global_budget_min=345, endgame_min=45, elapsed_min=0):
+    import time as _t
+    from agent.scheduler import Scheduler
+    sch = Scheduler.__new__(Scheduler)
+    sch.cfg = Config()
+    sch.cfg.global_budget_min = global_budget_min
+    sch.cfg.endgame_min = endgame_min
+    sch._t0 = _t.monotonic() - elapsed_min * 60
+    sch._endgame_logged = False
+    return sch
+
+
+def test_in_endgame_threshold():
+    """345min 窗口、45min 收尾：299min 未进入，300min（=345-45）进入。"""
+    assert not _sched_for_endgame(elapsed_min=299)._in_endgame()
+    assert _sched_for_endgame(elapsed_min=300)._in_endgame()
+
+
+def test_endgame_ok_quick_wins_only():
+    """快赢=只剩一面或有完整解法；新多 flag 硬题不放行。"""
+    from agent.tsec_api import Challenge
+    sch = _sched_for_endgame()
+    one_left = Challenge.from_dict({"unique_code": "x-1", "flag_count": 4,
+                                    "correct_flag_count": 3, "difficulty": "hard"})
+    assert sch._endgame_ok(one_left)                      # 剩一面
+    fresh_big = Challenge.from_dict({"unique_code": "x-2", "flag_count": 6,
+                                     "correct_flag_count": 0, "difficulty": "hard"})
+    assert not sch._endgame_ok(fresh_big)                 # 新 6 flag 硬题
+    import agent.scheduler as sm
+    orig = sm._LIB
+    try:
+        sm._LIB = {"x-2": {"completed": True}}
+        assert sch._endgame_ok(fresh_big)                 # 有完整解法可复现
+    finally:
+        sm._LIB = orig
+
+
+def test_fscan_wired_in_image_and_playbook():
+    """fscan 进镜像 + playbook 阶段门/多 flag 清单接入（通用工具，无题目先验）。"""
+    dk = open("Dockerfile").read()
+    assert "shadow1ng/fscan" in dk
+    pb = open("agent/prompts.py").read()
+    assert "fscan -h" in pb
+    wk = open("agent/worker.py").read()
+    assert wk.count("fscan") >= 2

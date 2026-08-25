@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import sys
@@ -143,27 +144,47 @@ async def _amain() -> int:
                 cfg.claude_worker = False
                 cfg.harness_enabled = False
             if cfg.claude_worker and cfg.claude_hard_effort:
-                # effort 探测：--effort max 在 ClawGod+网关链路未实测过（第 1 次任务未用
-                # effort）。失败自动降级为无 effort（hard 题退回普通思考），不整轮赌命。
+                # effort 探测（run 12464 复盘：探测超时被当失败降级→全轮 pro reasoning=0，
+                # 只买到知识没买到思考预算）。三分支判定：
+                # - rc==0 → OK；- stderr 明确报 unknown/unrecognized/effort → 真不支持，降级；
+                # - 超时/其他错误 → 网关慢，保留 effort（claude 对不支持的能力参数会秒退报错，
+                #   不会挂着超时——超时恰恰说明参数被接受了、只是推理慢）。
                 from .harness import _claude_env
                 probe_model = cfg.llm_model_hard or cfg.llm_model
+                stderr_tail = b""
+                timed_out = False
                 try:
                     proc = await asyncio.create_subprocess_exec(
                         "claude", "-p", "回复 OK", "--effort", cfg.claude_hard_effort,
                         "--model", probe_model,
-                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
                         env=_claude_env(cfg, probe_model))
-                    rc = await asyncio.wait_for(proc.wait(), timeout=90)
+                    try:
+                        _, stderr_tail = await asyncio.wait_for(proc.communicate(), timeout=90)
+                        rc = proc.returncode
+                    except asyncio.TimeoutError:
+                        timed_out = True
+                        rc = -1
+                        with contextlib.suppress(ProcessLookupError, OSError):
+                            proc.kill()
                 except Exception as e:
                     rc = -1
                     log.warning("effort 探测异常: %s", e)
+                low = (stderr_tail or b"").lower()[:300]
                 if rc == 0:
-                    log.info("claude --effort %s 探测 OK（模型 %s）", cfg.claude_hard_effort,
-                             cfg.llm_model_hard or cfg.llm_model)
-                else:
-                    log.warning("claude --effort %s 探测失败 rc=%s：降级为无 effort 模式",
-                                cfg.claude_hard_effort, rc)
+                    log.info("claude --effort %s 探测 OK（模型 %s）：全量会话（flash/pro）均带 effort",
+                             cfg.claude_hard_effort, probe_model)
+                elif timed_out:
+                    log.warning("claude --effort %s 探测超时（90s，模型 %s）：按网关慢处理，"
+                                "保留 effort 不降级（12464 教训：超时≠不支持）",
+                                cfg.claude_hard_effort, probe_model)
+                elif any(k in low for k in (b"effort", b"unknown", b"unrecognized", b"invalid")):
+                    log.warning("claude --effort %s 探测失败 rc=%s（stderr: %s）：真不支持，降级为无 effort",
+                                cfg.claude_hard_effort, rc, low[:120])
                     cfg.claude_hard_effort = ""
+                else:
+                    log.warning("claude --effort %s 探测失败 rc=%s（stderr: %s）：非参数错误，保留 effort",
+                                cfg.claude_hard_effort, rc, low[:120] or "(空)")
         if cfg.dry_run or "--dry-run" in sys.argv:
             log.info("dry-run 完成，退出。")
             return 0

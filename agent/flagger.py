@@ -69,10 +69,16 @@ class FlagSubmitter:
 
     ``correct_count`` 以平台返回的进度为准。重试同一题时，之前已正确的
     flag 值本身不可从平台反查，不能只依赖本地 ``correct`` 集合判断完成。
+
+    错提熔断（run 12464 复盘：145 次错提全部绕过 submit_flag.sh 闸门——
+    输出捕获通道直接调 API，f2-05 盲猜 75 次、c-02 答对了还错 23 次）：
+    ``auto=True`` 的自动通道（正则捕获）累计错提 ≥ wrong_cap 次后关闭；
+    显式通道（LLM 的 submit_flag 工具调用）不熔断——c-02 错 23 次仍解出，
+    说明正确 flag 可能出现在多次错误之后，不能一刀切。
     """
 
     def __init__(self, unique_code: str, expected_flags: int,
-                 initial_correct_count: int = 0):
+                 initial_correct_count: int = 0, wrong_cap: int = 10):
         self.unique_code = unique_code
         self.expected_flags = expected_flags
         self.tried: set[str] = set()
@@ -80,13 +86,18 @@ class FlagSubmitter:
         self.score = 0
         self.correct_count = max(0, min(expected_flags, initial_correct_count))
         self.wrong_streak = 0  # 连续提交错误计数（run 12019 复盘：f2-05 连错 10 次盲猜）
+        self.wrong_total = 0   # 累计错提（auto 通道熔断用，不因正确提交清零）
+        self.wrong_cap = wrong_cap
 
     @property
     def completed(self) -> bool:
         return self.correct_count >= self.expected_flags
 
-    def should_try(self, flag: str) -> bool:
+    def should_try(self, flag: str, auto: bool = False) -> bool:
         flag = flag.strip()
+        # auto 通道熔断：正则捕获流错提打满 cap，说明输出里全是垃圾候选
+        if auto and self.wrong_total >= self.wrong_cap:
+            return False
         # 格式闸门收口在 should_try：所有提交通道（含调度器 harness worker 的
         # api.submit_flag 直连）都先问 should_try，垃圾候选在这里统一拦截。
         return bool(flag) and flag not in self.tried and plausible_flag(flag)
@@ -106,3 +117,4 @@ class FlagSubmitter:
             )
         else:
             self.wrong_streak += 1
+            self.wrong_total += 1

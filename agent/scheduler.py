@@ -93,6 +93,10 @@ class Scheduler:
         # 永不停止模式下无全局截止（deadline=∞，worker 永不触发 global deadline），
         # 有界模式退回原语义：GLOBAL_BUDGET_MIN 分钟后收尾。
         self.deadline = float("inf") if cfg.never_stop else time.monotonic() + cfg.global_budget_min * 60
+        # 开跑时刻：endgame 判定用（never_stop 下 deadline=∞，但平台 6h 硬窗仍在，
+        # 按「名义窗口 - ENDGAME_MIN」触发收尾策略）
+        self._t0 = time.monotonic()
+        self._endgame_logged = False
         self.pending: list[Challenge] = []
         self.retry_queue: list[Challenge] = []
         self.done: dict[str, dict] = {}
@@ -121,6 +125,21 @@ class Scheduler:
         self._last_progress_ts = time.monotonic()  # 最近一次 flag 增长的墙钟时间
         self._last_boost_ts = 0.0            # 上次掉速插队时间（20min 冷却防反复插同一题）
         self._last_stagnate_check = 0.0      # 上次掉速检查墙钟时间
+
+    def _in_endgame(self) -> bool:
+        """是否进入收尾段：开跑超过「名义窗口 - ENDGAME_MIN」分钟。
+
+        never_stop 下 deadline=∞，但平台 6h 硬窗不变——按 GLOBAL_BUDGET_MIN（默认
+        345min）作名义窗口，最后 ENDGAME_MIN（默认 45min）切收尾策略。"""
+        return (time.monotonic() - self._t0
+                >= (self.cfg.global_budget_min - self.cfg.endgame_min) * 60)
+
+    def _endgame_ok(self, ch: Challenge) -> bool:
+        """收尾段快赢题：只剩一面 flag、或有完整解法可短时复现的题。
+        新 hard/多 flag 大题不放行（12464 教训：尾段开新硬题=纯烧尾段槽位）。"""
+        if ch.remaining_flags <= 1:
+            return True
+        return bool(_LIB.get(ch.unique_code, {}).get("completed"))
 
     async def _watchdog(self):
         """容器看门狗：worker 在跑但容器被平台回收时自动重启并更新地址。"""
@@ -446,7 +465,8 @@ class Scheduler:
                 if fl not in flags:
                     flags.append(fl)
 
-        submitter = FlagSubmitter(code, ch.flag_count, ch.correct_flag_count)
+        submitter = FlagSubmitter(code, ch.flag_count, ch.correct_flag_count,
+                                   wrong_cap=self.cfg.wrong_submit_cap)
         h_timeout = min(90, self.cfg.harness_timeout_min * max(1, ch.flag_count)) * 60
         try:
             async with self._agent_sem:
@@ -455,7 +475,7 @@ class Scheduler:
             log.exception("[%s] harness worker 崩溃", code)
             res = None
         for flag in flags:
-            if submitter.should_try(flag):
+            if submitter.should_try(flag, auto=True):
                 try:
                     r = await self.api.submit_flag(code, flag)
                 except ApiError as e:
@@ -513,7 +533,8 @@ class Scheduler:
         工作区隔离（worker-A / worker-B），A 主攻入口面、B 主攻内网/横向。"""
         code = ch.unique_code
         log.info("[%s] 双 worker 并行（%d 分 %d flags）", code, ch.total_score, ch.flag_count)
-        submitter = FlagSubmitter(code, ch.flag_count, ch.correct_flag_count)
+        submitter = FlagSubmitter(code, ch.flag_count, ch.correct_flag_count,
+                                   wrong_cap=self.cfg.wrong_submit_cap)
         completion_event = asyncio.Event()
         notes_path = os.path.join(ws, "NOTES.md")
         if not os.path.exists(notes_path):
@@ -604,7 +625,11 @@ class Scheduler:
         }
         log.info("[%s] 结束: %s (+%d 分, %.1f 分钟)", code, res.reason, res.score, res.elapsed_min)
         await self._close_safely(code)
-        if not res.completed and self.cfg.retry_unsolved and "deadline" not in res.reason:
+        # no_progress（attempt≥2 无 flag 无断点）不进常规 retry：时间留给有希望的题；
+        # 主循环队列耗尽后的平台回查（NEVER_STOP 回查全部未解题）仍会带回它们，
+        # 满足「时间没用完就继续挖零进展题」。
+        if not res.completed and self.cfg.retry_unsolved and "deadline" not in res.reason \
+                and not res.reason.startswith("no_progress"):
             self.retry_queue.append(ch)
 
     async def run(self):
@@ -646,6 +671,11 @@ class Scheduler:
             if time.monotonic() - self._last_stagnate_check >= 60:
                 self._last_stagnate_check = time.monotonic()
                 await self._stagnate_check()
+            if self._in_endgame() and not self._endgame_logged:
+                self._endgame_logged = True
+                _reload_lib()  # 尾段判定需要最新的 completed 复现状态
+                log.info("进入收尾段（剩余 <%dmin）：只放行快赢题（剩一面/完整解法复现）",
+                         self.cfg.endgame_min)
             time_left = self.deadline - time.monotonic()
             # 队列耗尽时：先吃 retry（本轮超时未解出、有断点续跑），
             # 再回查平台把仍未被解出的题重新入队。永不停止模式下只有
@@ -691,6 +721,15 @@ class Scheduler:
                     skipped += 1
                     if skipped >= len(self.pending):
                         break  # 所有待选题都在冷却，等下一轮 15s 循环
+                    continue
+                # endgame 收尾纪律（12464 复盘：收卷前 25min 还在第三轮攻 f2-05）：
+                # 名义窗口只剩 ENDGAME_MIN 时只放行快赢题（只剩一面/有完整解法可复现），
+                # 不再开新 hard/多 flag 大题——尾段时间全部给确定性得分
+                if self._in_endgame() and not self._endgame_ok(ch):
+                    self.pending.append(ch)
+                    skipped += 1
+                    if skipped >= len(self.pending):
+                        break  # 尾段无快赢题：槽位空转至平台收卷（回查轮会持续刷新）
                     continue
                 skipped = 0
                 n = self._attempts.get(ch.unique_code, 0)

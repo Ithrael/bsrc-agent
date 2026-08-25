@@ -1,6 +1,7 @@
 """claude code 直接解题模式（CLAUDE_WORKER=1）测试：fake claude CLI 模拟 stream-json 输出，
 验证 prompt 打包、submit_flag.sh 生成、flag 双通道提交、解法落库、无输出超时判定。"""
 import json
+import os
 import time
 from pathlib import Path
 
@@ -222,6 +223,13 @@ async def test_medium_round2_timeout_25min():
     w.attempt = 1
     w.ch = Challenge.from_dict({"unique_code": "bctf-02", "flag_count": 1,
                                 "total_score": 400, "difficulty": "medium"})
+    # 有断点（RELAY 有内容）才给满预算 25min
+    import tempfile
+    d = tempfile.mkdtemp()
+    w.ws = d
+    w.notes_path = os.path.join(d, "NOTES.md")
+    with open(os.path.join(d, "RELAY.md"), "w") as f:
+        f.write("# 接力块\n已达成原语: 拿到后台凭证\n")
     assert w._scaled_timeout_s() == 25 * 60
     # 首轮快速轮转 12min
     w.attempt = 0
@@ -229,9 +237,26 @@ async def test_medium_round2_timeout_25min():
     assert w._scaled_timeout_s() == 12 * 60
 
 
+def test_medium_retry_no_progress_degrades():
+    """medium retry 无断点降为 10min 快验轮（预算分级）。"""
+    import tempfile
+    w = Worker.__new__(Worker)
+    w.cfg = Config()
+    w.ch = Challenge.from_dict({"unique_code": "bctf-02", "flag_count": 1,
+                                "total_score": 400, "difficulty": "medium"})
+    w.attempt = 1
+    d = tempfile.mkdtemp()
+    w.ws = d
+    w.notes_path = os.path.join(d, "NOTES.md")
+    assert w._scaled_timeout_s() == 10 * 60          # 无 RELAY → 快验
+    with open(os.path.join(d, "RELAY.md"), "w") as f:
+        f.write("# 接力块\n已证死路: SQLi — 预编译\n")
+    assert w._scaled_timeout_s() == 25 * 60          # 有断点 → 满预算
+
+
 @pytest.mark.asyncio
 async def test_medium_round2_uses_hard_model(tmp_path, monkeypatch):
-    """medium 二轮（attempt=1）claude 会话用 LLM_MODEL_HARD + effort；首轮用 flash 无 effort。"""
+    """effort 分级：medium/hard 全程 max；easy 首轮不开（快扫）、二轮开（12464 pro reasoning=0 教训）。"""
     import agent.harness as harness_mod
 
     srv = make_server()
@@ -272,12 +297,12 @@ async def test_medium_round2_uses_hard_model(tmp_path, monkeypatch):
     cfg.recon_boot = False
     cfg.record_solutions = False
 
-    # 首轮（attempt=0）：flash、无 effort
+    # 首轮（attempt=0）：flash 模型、effort max 全量生效
     w = Worker(cfg, object(), api, ch, addrs, str(tmp_path / "ws1"),
                deadline=time.monotonic() + 600, attempt=0)
     await w._run_claude()
     assert calls[0]["model"] == ""
-    assert calls[0]["effort"] == ""
+    assert calls[0]["effort"] == "max"
 
     # 二轮（attempt=1）：pro + effort max
     w2 = Worker(cfg, object(), api, ch, addrs, str(tmp_path / "ws2"),
@@ -297,7 +322,7 @@ async def test_medium_round2_uses_hard_model(tmp_path, monkeypatch):
     await w3._run_claude()
     assert calls[-1]["model"] == "deepseek-v4-pro"
     assert calls[-1]["effort"] == "max"
-    # easy 首轮仍 flash
+    # easy 首轮：flash 且不开 effort（快扫吞吐优先）；二轮才开 max 深挖
     w4 = Worker(cfg, object(), api, ch_easy, addrs, str(tmp_path / "ws4"),
                 deadline=time.monotonic() + 600, attempt=0)
     await w4._run_claude()
@@ -385,12 +410,12 @@ async def test_repro_challenge_skips_hard_model(tmp_path, monkeypatch):
     cfg.recon_boot = False
     cfg.record_solutions = False
 
-    # hard 复现题 attempt=0：不换 pro（无 hard_model/effort）
+    # hard 复现题 attempt=0：不换 pro（flash 走短复现），effort 仍全量 max
     w = Worker(cfg, object(), api, ch, addrs, str(tmp_path / "ws1"),
                deadline=time.monotonic() + 600, attempt=0)
     await w._run_claude()
     assert calls[0]["model"] == ""
-    assert calls[0]["effort"] == ""
+    assert calls[0]["effort"] == "max"
     # 优化4：复现题止损——单 flag 题 5min 超时 + token 熔断 clamp 50 万
     assert calls[0]["timeout_s"] == 5 * 60
     # 默认 -1：6 小时冲刺不设置 Claude 会话 token 熔断
@@ -788,3 +813,123 @@ def test_scheduler_claude_health_guard():
     sched._track_claude_health(_res("claude done"))
     assert sched._claude_fail_streak == 0
     assert sched.cfg.claude_worker
+
+
+# ---- hint 时机提前（Cairn_X 148-hint 复盘：hard/多 flag 首轮即带 hint 开工） ----
+
+def _hint_worker(difficulty="hard", flag_count=4, policy="free"):
+    w = Worker.__new__(Worker)
+    w.cfg = Config()
+    w.cfg.hint_policy = policy
+    w.ch = Challenge.from_dict({"unique_code": "b-02", "flag_count": flag_count,
+                                "total_score": 1200, "difficulty": difficulty})
+    w.attempt = 0
+    return w
+
+
+def test_hint_upfront_hard_free():
+    assert _hint_worker("hard", 1)._should_hint_upfront()          # hard 单 flag 也配
+    assert _hint_worker("medium", 2)._should_hint_upfront()        # 多 flag 题
+
+
+def test_hint_upfront_excluded():
+    assert not _hint_worker("easy", 1)._should_hint_upfront()      # flash 能解，不浪费 10%
+    assert not _hint_worker("medium", 1)._should_hint_upfront()
+    assert not _hint_worker("hard", 4, policy="stuck")._should_hint_upfront()  # stuck 策略不首轮拉
+
+
+# ---- CLAIM/EVIDENCE 提交纪律（hxbai 69 flag 仅 4 错提） ----
+
+def test_claude_prompt_has_claim_evidence_discipline(tmp_path):
+    """行动纪律含 CLAIM/EVIDENCE 条款：证据来自工具输出才提交。"""
+    w = _brief_worker(tmp_path)
+    prompt = w._build_claude_prompt(w.ch, {}, {}, False, [], "", "")
+    assert "CLAIM/EVIDENCE" in prompt
+    assert "RAW EVIDENCE" in prompt or "证据" in prompt
+    assert "禁止提交" in prompt
+
+
+def test_submit_flag_sh_requires_evidence():
+    """生成的 submit_flag.sh 第 1 次提交起要求证据参数（<6 字符拒绝），NOTES 已记来源可豁免。"""
+    src = open("agent/worker.py").read()
+    assert "EVID=" in src and "${#EVID} -lt 6" in src    # 证据长度闸门
+    assert "grep -Fq" in src and "NOTES.md" in src       # 来源已记录豁免
+    assert "[证据拒绝]" in src
+    assert "CLAIM/EVIDENCE 提交纪律" in src              # prompt 行动纪律同步
+
+
+# ---- 已购 hint 置顶（每次轮转免费复用，重复调 API 会重复扣 10%） ----
+
+def test_hint_hoisted_to_top_of_prompt(tmp_path):
+    """notes.json 里的官方 hint 提升为独立置顶段，排在解法库记录之前。"""
+    w = _brief_worker(tmp_path)
+    notes = {"bctf-31": "[官方 hint] 关注 JWT Header 里的 kid 字段与管理面板规则执行逻辑。"}
+    prompt = w._build_claude_prompt(w.ch, {}, notes, False, [], "", "")
+    assert "官方提示（已购" in prompt
+    assert "kid 字段" in prompt
+    assert "先按此验证，再扩展" in prompt
+    # 置顶段在解法库记录段之前
+    if "解法库记录" in prompt:
+        assert prompt.index("官方提示（已购") < prompt.index("解法库记录")
+
+
+def test_no_progress_not_requeued():
+    """scheduler._finish：no_progress 原因不进常规 retry 队列（末尾回查轮仍可回挖）。"""
+    import asyncio
+    from agent.scheduler import Scheduler
+    from agent.tsec_api import Challenge
+
+    async def run():
+        sch = Scheduler.__new__(Scheduler)
+        sch.cfg = Config()
+        sch.cfg.retry_unsolved = True
+        sch.api = None
+        sch.done = {}
+        sch.retry_queue = []
+        async def fake_close(code):
+            return True
+        sch._close_safely = fake_close
+        ch = Challenge.from_dict({"unique_code": "f2-05", "flag_count": 1,
+                                  "total_score": 400, "difficulty": "hard"})
+        from agent.worker import WorkerResult
+        res = WorkerResult()
+        res.completed = False
+        res.reason = "no_progress: attempt 2 无 flag 无断点，退出轮转（末尾回查轮可回挖）"
+        await sch._finish(ch, res)
+        assert sch.retry_queue == [], "no_progress 不应进入常规 retry"
+        res2 = WorkerResult()
+        res2.completed = False
+        res2.reason = "claude done"
+        await sch._finish(ch, res2)
+        assert sch.retry_queue == [ch], "普通失败仍应进入 retry"
+    asyncio.run(run())
+
+
+# ---- 多阶段渗透基建（HOSTS.md 台账 + 通用 post-exploitation 工具，run 12464 渗透 60.71 复盘） ----
+
+def test_hosts_ledger_discipline_in_prompt(tmp_path):
+    """行动纪律含 HOSTS.md 台账维护；攻击面清单把台账列入先读顺序。"""
+    w = _brief_worker(tmp_path)
+    prompt = w._build_claude_prompt(w.ch, {}, {}, False, [], "", "")
+    assert "HOSTS.md 资产台账" in prompt
+    assert prompt.index("HOSTS.md（资产台账") < prompt.index("NOTES.md（已有发现）")
+
+
+def test_killchain_tooling_scripts_exist():
+    """镜像内置的通用 post-exploitation 脚本存在且 bash 语法合法。"""
+    import subprocess
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for name in ("flag_sweep.sh", "creds_replay.sh"):
+        p = os.path.join(root, "tools", name)
+        assert os.path.exists(p), name
+        r = subprocess.run(["bash", "-n", p], capture_output=True)
+        assert r.returncode == 0, f"{name}: {r.stderr.decode()[:100]}"
+
+
+def test_subagent_shared_files_include_hosts_ledger():
+    """子 agent 软链共享文件含 HOSTS.md；Dockerfile 烤进工具与 chisel。"""
+    src = open("agent/worker.py").read()
+    assert '"RELAY.md", "HOSTS.md", "submit_flag.sh"' in src
+    dk = open("Dockerfile").read()
+    assert "chisel" in dk
+    assert "COPY tools/flag_sweep.sh tools/creds_replay.sh /opt/tools/" in dk
