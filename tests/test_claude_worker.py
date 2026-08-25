@@ -828,8 +828,11 @@ def _hint_worker(difficulty="hard", flag_count=4, policy="free"):
 
 
 def test_hint_upfront_hard_free():
-    assert _hint_worker("hard", 1)._should_hint_upfront()          # hard 单 flag 也配
-    assert _hint_worker("medium", 2)._should_hint_upfront()        # 多 flag 题
+    # run 12610 复盘：hard 单 flag 首轮带 hint 全面 -10%（a-01 500→450 等 7 题）
+    # 且无速度收益——回到 12464 首轮硬解、retry 再拉的满分策略
+    assert not _hint_worker("hard", 1)._should_hint_upfront()
+    assert _hint_worker("medium", 2)._should_hint_upfront()        # 多 flag 题保留 upfront
+    assert _hint_worker("hard", 4)._should_hint_upfront()          # 多 flag 大题（b 系列）
 
 
 def test_hint_upfront_excluded():

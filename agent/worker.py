@@ -483,12 +483,11 @@ class Worker:
     def _should_hint_upfront(self) -> bool:
         """首轮（attempt=0）是否直接带官方 hint 开工。
 
-        Cairn_X 复盘（官方榜 94.61）：148 次 hint 换 71 flag，卡住就买方向比硬扛便宜
-        （每条扣该题 10%，换整题方向指引远划算）。free 策略 + hard/多 flag 题——
-        首线空转重灾区（run 12464：hard 首线 25min 无 hint，渗透维度 60.71 最大短板）；
+        只对多 flag 大题保留（渗透链方向指引值 10%）；hard 单 flag 首轮硬解——
+        run 12610 复盘：upfront 让 hard 单 flag 题全面 -10%（a-01 500→450 等
+        7 题）且无速度收益，回到 12464「首轮无 hint、retry 轮再拉」的满分策略。
         easy/medium 单 flag flash 能解，留给断点重跑再拉。"""
-        return (self.cfg.hint_policy == "free"
-                and (self.ch.difficulty == "hard" or self.ch.flag_count >= 2))
+        return (self.cfg.hint_policy == "free" and self.ch.flag_count >= 2)
 
     async def _advisor_brief(self, hint_text: str = "") -> str:
         """retry 轮指挥官 brief（对标榜 2 Heimdall_lucky 的 observer→advisor 模式）：
