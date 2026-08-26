@@ -80,20 +80,12 @@ RUN if command -v claude >/dev/null 2>&1; then claude --version 2>/dev/null || t
 RUN git clone --depth 1 https://github.com/swisskyrepo/PayloadsAllTheThings /opt/payloads \
     && rm -rf /opt/payloads/.git || true
 
-# nuclei 引擎 + CVE 模板（只抽 http/cves 目录）：预侦察阶段精确 CVE 检测。
-# 反过度工程：不装全量 nuclei-templates（700MB），只 sparse-checkout http/cves（4104 模板 ~12MB）。
-# 引擎动态取 latest linux_amd64；两者失败均不阻断构建（本地调试无 nuclei 也正常跑，recon 侧静默跳过）。
-RUN NUCLEI_URL=$(curl -fsSL https://api.github.com/repos/projectdiscovery/nuclei/releases/latest | python3 -c "import sys,json; d=json.load(sys.stdin); print(next(a['browser_download_url'] for a in d['assets'] if 'linux_amd64.zip' in a['name']))") \
-    && curl -fsSL "$NUCLEI_URL" -o /tmp/nuclei.zip \
-    && unzip -j /tmp/nuclei.zip nuclei -d /usr/local/bin \
-    && chmod +x /usr/local/bin/nuclei \
-    && rm /tmp/nuclei.zip \
-    || true
-RUN git clone --depth 1 --filter=blob:none --sparse https://github.com/projectdiscovery/nuclei-templates.git /opt/nuclei-templates \
-    && cd /opt/nuclei-templates \
-    && git sparse-checkout set http/cves \
-    && rm -rf .git \
-    || true
+# nuclei 引擎（本地预下载 v3.11.1 zip：解压后 136MB 超 GitHub 100MB 限制，
+# 仓库只存 44MB zip，构建期解压；原动态下载因 GitHub API 不稳曾静默跳过）
+COPY tools/bin/nuclei.zip /tmp/nuclei.zip
+RUN unzip -j /tmp/nuclei.zip nuclei -d /usr/local/bin \
+    && chmod +x /usr/local/bin/nuclei && rm /tmp/nuclei.zip
+# nuclei 全套模板由下方「本地漏洞库」段 COPY（/opt/nuclei-templates）
 
 # 精简词表（多级回退：SecLists 已把 top-100.txt 改名删除，2026-08-24 构建实测 404
 # 致 hydra 词表缺失；最终兜底内置列表，保证 prompt 引用的路径永不落空）
@@ -120,6 +112,14 @@ RUN (curl -fsSL https://github.com/jpillora/chisel/releases/download/v1.10.1/chi
 #    间歇性 TLS 失败（且 release 资产名是 x64 非 amd64，旧远程下载脚本双重失效）
 COPY tools/bin/fscan /usr/local/bin/fscan
 RUN chmod +x /usr/local/bin/fscan
+# 4) 本地漏洞库（Cairn 拆解：c-02 ComfyUI 题 Cairn 用本地 PoC 检索 5 分钟秒解、
+#    我们现场回忆 CVE 310 分钟分治才解——vulhub 全套 PoC + nuclei 模板是
+#    通用公开漏洞库，无题目先验，合规；宿主机经 gh-proxy 预下载）
+COPY tools/pocs/vulhub /opt/pocs/vulhub
+COPY tools/nuclei-templates /opt/nuclei-templates
+COPY tools/pocs/PayloadsAllTheThings /opt/pocs/PayloadsAllTheThings
+COPY tools/pocs/hacktricks /opt/pocs/hacktricks
+COPY tools/pocs/PoC-in-GitHub /opt/pocs/PoC-in-GitHub
 COPY tools/flag_sweep.sh tools/creds_replay.sh /opt/tools/
 RUN chmod +x /opt/tools/flag_sweep.sh /opt/tools/creds_replay.sh && touch /opt/tools/creds.txt
 

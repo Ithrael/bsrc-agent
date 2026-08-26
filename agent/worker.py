@@ -527,7 +527,9 @@ class Worker:
                 pass
         return (f"[系统] 已连续多段无进展，自动获取官方提示（本题满分 {self.ch.total_score} 分，"
                 f"解出后约扣 {max(1, self.ch.total_score // 10)} 分；若最终未解出则不扣分）。"
-                f"围绕提示方向调整思路，不要重复已排除方向：\n{hint or '(无提示内容)'}")
+                f"围绕提示方向调整思路，不要重复已排除方向。"
+                f"提示提到具体组件/项目名时，先用 `find /opt/pocs/vulhub -maxdepth 2 -iname '*<组件名>*'` "
+                f"与 `/opt/nuclei-templates` 检索本地漏洞库，命中即按 README 利用链执行：\n{hint or '(无提示内容)'}")
 
     def _should_hint_upfront(self) -> bool:
         """首轮（attempt=0）是否直接带官方 hint 开工。
@@ -661,8 +663,10 @@ class Worker:
                 "下一步: <紧接原语的具体命令/payload>\n\n"
                 f"会话摘要（事件流尾部）：\n{digest[-6000:]}")
         try:
-            msg = await self.llm.chat([{"role": "user", "content": prompt}], None,
-                                      max_tokens=400)
+            # 15s 超时保险：蒸馏是收尾增强项，网关卡住不能阻塞轮转 300s
+            msg = await asyncio.wait_for(
+                self.llm.chat([{"role": "user", "content": prompt}], None, max_tokens=400),
+                timeout=15)
         except Exception as e:
             log.warning("[%s] 接力块蒸馏失败（跳过）: %s", self.ch.unique_code, e)
             return ""
@@ -674,10 +678,11 @@ class Worker:
         lines = [l for l in text.splitlines() if l.strip()]
         if self._relay_block_empty(lines, 6 if self.ch.flag_count >= 2 else 3):
             try:
-                msg2 = await self.llm.chat(
+                msg2 = await asyncio.wait_for(self.llm.chat(
                     [{"role": "user", "content": "上面的接力块三行全是「无」，没有可用信息。"
                       "请重新审视会话摘要，找出哪怕一个具体细节（一个端口、一个报错、"
-                      "一个疑似端点、一个失败原因）写进三行里。"}], None, max_tokens=400)
+                      "一个疑似端点、一个失败原因）写进三行里。"}], None, max_tokens=400),
+                    timeout=15)
                 text2 = (msg2.get("content") or "").strip()
                 if text2:
                     text = text2
@@ -1591,13 +1596,19 @@ class Worker:
                              "补其他线漏掉的面。"),
         }
         master_role = ""  # 主控角色指令（多 flag/hard 题启用；断点重跑复用同一角色）
-        if not has_completed_sol and (ch.flag_count >= 2 or ch.difficulty == "hard"):
+        if not has_completed_sol and (ch.flag_count >= 2 or ch.difficulty in ("hard", "medium")):
             if ch.flag_count >= 5:
                 line_keys = "ABCDEFGH"   # 八个子 agent 方向（b-02 级 6 flags 大题）
             elif ch.flag_count >= 3:
                 line_keys = "ABCDEF"     # 六个（b-01/b-03 级 4 flags）
+            elif ch.difficulty == "hard":
+                line_keys = "ABCDEF"     # hard 单 flag 六线（原四线：Cairn 每题 8 线，
+                                         # 前 2.5h 密度差距主因之一是单 flag 题无分治）
+            elif ch.flag_count >= 2:
+                line_keys = "ADEF"       # 2 面 medium 四线（不变）
             else:
-                line_keys = "ADEF"       # 四个（2 flags / hard 单 flag）
+                line_keys = "AD"         # medium 单 flag 两线探路（A 入口 + D 独立侦察，
+                                         # 新增：medium 首轮 12min 从单线串行试错变双线并行）
             subtask_table = "\n".join(
                 f"- [{key}线] {_ROLES[key][0]}：{_ROLES[key][1]}" for key in line_keys)
             master_role = (
@@ -1622,7 +1633,10 @@ class Worker:
                 "针对缺口再派新一轮子 agent（换攻击面/换主机/换凭证），直到全部拿齐或时间不足。\n"
                 "5. 意图节流（ATX 吸收）：若所有方向都已试过且无新线索可派，"
                 "不要为派而派——直接结束会话，调度器会按工作区断点续跑，空转派发纯烧 token。\n"
-                "6. 拿到 flag 的判定以 STATE.md 的 FACTS 为准（系统自动更新），不要凭子 agent 口头汇报。")
+                "6. 拿到 flag 的判定以 STATE.md 的 FACTS 为准（系统自动更新），不要凭子 agent 口头汇报。\n"
+                "7. 拿全即收工：每拿到一面新 flag 就检查 STATE.md 的 FACTS 进度，若已全部入账，"
+                "立即结束本回合（无需等待剩余子 agent 返回），调度器会按拿全状态收工——"
+                "子 agent 的无效等待是纯时间浪费。")
             if ch.flag_count >= 3:
                 # 多 flag 题专项清单（run 12019 复盘：b-01 1/4、b-02 2/6、b-03 1/4——
                 # 首面能拿后续纵深乏力；9489 曾靠 flagN 直读+容器逃逸+横向拿全 b-01 4/4，

@@ -244,13 +244,16 @@ class Scheduler:
         return await self.api.start_challenge(code)
 
     async def _wait_available(self, code: str, timeout_s: int = 300) -> list[str]:
-        """start 后轮询直到容器 available 拿到地址。"""
+        """start 后轮询直到容器 available 拿到地址。
+
+        轮询间隔 2s（原 5s）：容器启动是每题轮转的固定开销，40 次轮转
+        × 平均 3s 增量 ≈ 省 2 分钟；_refresh 是轻量列表接口，2s 频率安全。"""
         t0 = time.monotonic()
         while time.monotonic() - t0 < timeout_s:
             try:
                 lst = await self._refresh()
             except ApiError:
-                await asyncio.sleep(5)
+                await asyncio.sleep(2)
                 continue
             for c in lst:
                 if c.unique_code == code:
@@ -263,7 +266,7 @@ class Scheduler:
                         except ApiError:
                             pass
                     break
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)
         return []
 
     def _track_claude_health(self, res: WorkerResult):

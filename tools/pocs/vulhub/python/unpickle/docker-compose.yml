@@ -1,0 +1,7 @@
+services:
+ flask:
+   image: vulhub/flask:1.1.1
+   volumes:
+    - ./app.py:/app/app.py
+   ports:
+    - "8000:8000"

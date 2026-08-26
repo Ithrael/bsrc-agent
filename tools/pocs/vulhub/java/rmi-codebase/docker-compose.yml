@@ -1,0 +1,8 @@
+services:
+  rmi:
+    image: vulhub/j2ee:8u222
+    ports:
+      - "1099:1099"
+      - "64000:64000"
+    environment:
+      - RMIIP=127.0.0.1
