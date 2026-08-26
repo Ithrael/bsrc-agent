@@ -41,11 +41,16 @@ def anthropic_gateway_url(base_url: str) -> str:
 
     不能直接 base + "/anthropic"：base 自带路径（如 https://api.deepseek.com/v1），
     拼出 /v1/anthropic，claude SDK 再追加 /v1/messages → /v1/anthropic/v1/messages → 404（实测）。
-    DeepSeek 等厂商的 Anthropic 兼容端点在域名根 /anthropic，故先剥离路径再拼，网关改写同样适用。
+    各厂商 Anthropic 兼容端点路径不同（都先剥离路径到域名根再拼）：
+    - DeepSeek：域名根 /anthropic
+    - 智谱 GLM：/api/anthropic（13018 实测：/anthropic 404 导致 claude 全挂降级裸 LLM）
+    网关改写同样适用。
     """
     p = urlparse(base_url)
     root = urlunparse((p.scheme, p.netloc, "", "", "", ""))
-    return rewrite_gateway_url(root).rstrip("/") + "/anthropic"
+    host = (p.hostname or "").lower()
+    path = "/api/anthropic" if "bigmodel.cn" in host else "/anthropic"
+    return rewrite_gateway_url(root).rstrip("/") + path
 
 
 class LLMClient:
