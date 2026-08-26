@@ -71,15 +71,16 @@ def test_timeout_retry_hard_tiered():
     assert w._scaled_timeout_s() == 35 * 60
     w = _give_progress(_mk_worker(unique_code="b-02", flag_count=4, difficulty="hard", attempt=2))
     assert w._scaled_timeout_s() == 40 * 60
-    # 无断点（不设工作区）：快验轮
+    # 无断点（不设工作区）：快验轮（12936 复盘 12→15min，慢热题二轮需 PoC 检索时间）
     w2 = _mk_worker(unique_code="b-02", flag_count=4, difficulty="hard", attempt=2)
-    assert w2._scaled_timeout_s() == 12 * 60
+    assert w2._scaled_timeout_s() == 15 * 60
 
 
 def test_timeout_easy_below_cap():
-    """easy 首轮 8min（AePis 复盘：easy/medium 全扫 <2h，首轮快速轮转）。"""
+    """easy 首轮 12min（12936 复盘：8min 塞不进指纹+PoC检索+利用链，
+    c-03/c-09 两轮 0 分被误判死；改 12min 对齐 medium）。"""
     w = _mk_worker(unique_code="a-01", flag_count=1, difficulty="easy")
-    assert w._scaled_timeout_s() == 8 * 60
+    assert w._scaled_timeout_s() == 12 * 60
 
 
 def test_completed_sol_timeout_cap():
@@ -161,7 +162,7 @@ def test_timeout_round1_short_cap():
     assert hard._scaled_timeout_s(has_completed_sol=False) == 30 * 60
     easy = _mk_worker(unique_code="a-01", flag_count=1, difficulty="easy")
     easy.cfg.round_num = 1
-    assert easy._scaled_timeout_s(has_completed_sol=False) == 8 * 60
+    assert easy._scaled_timeout_s(has_completed_sol=False) == 12 * 60
     assert hard._scaled_timeout_s(has_completed_sol=True) == 10 * 60
 
 
@@ -206,7 +207,7 @@ def test_has_progress_ignores_empty_distill_block():
                 "## 会话蒸馏（11:00:00）\n"
                 "已达成原语: 无\n内网拓扑: 无\n已证死路: 无\n下一步: 无\n")
     assert not w._has_progress()
-    assert w._scaled_timeout_s() == 12 * 60          # 快验轮，不是 40min 满预算
+    assert w._scaled_timeout_s() == 15 * 60          # 快验轮，不是 40min 满预算
 
 
 def test_has_progress_counts_distill_with_real_content():

@@ -246,7 +246,7 @@ def test_medium_retry_no_progress_degrades():
     d = tempfile.mkdtemp()
     w.ws = d
     w.notes_path = os.path.join(d, "NOTES.md")
-    assert w._scaled_timeout_s() == 10 * 60          # 无 RELAY → 快验
+    assert w._scaled_timeout_s() == 15 * 60          # 无 RELAY → 快验（12936 复盘 10→15min）
     with open(os.path.join(d, "RELAY.md"), "w") as f:
         f.write("# 接力块\n已证死路: SQLi — 预编译\n")
     assert w._scaled_timeout_s() == 25 * 60          # 有断点 → 满预算

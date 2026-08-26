@@ -833,13 +833,19 @@ class Worker:
                 # b 系列剩面插队攻坚 1.5h 零产出；12464 一次性窗口 +2550）
                 minutes = 45
             else:
-                minutes = 25 if self.attempt <= 0 else ((35 if self.attempt == 1 else 40) if prog else 12)
+                # 无断点 retry 15min（12936 复盘：快验 12min 对二进制题不够，
+                # c 系列 PoC 检索需时间；a-03/a-16/c-04/c-05/c-08 全靠多轮 retry 解出）
+                minutes = 25 if self.attempt <= 0 else ((35 if self.attempt == 1 else 40) if prog else 15)
         elif self.ch.difficulty == "medium":
             # 首轮 12min（AePis 复盘：easy/medium 全扫 <2h，3.3min/flag），
-            # retry 有断点 25min 给足续跑；无断点 10min 快验
-            minutes = 12 if self.attempt <= 0 else (25 if prog else 10)
+            # retry 有断点 25min 给足续跑；无断点 15min（12936 复盘：无断点
+            # 快验 8min 太短漏掉慢热题——c-03/c-09 首轮 8min 窗口塞不进
+            # PoC 检索，二轮 8min 快验同样不够）
+            minutes = 12 if self.attempt <= 0 else (25 if prog else 15)
         else:
-            minutes = 8 if self.attempt <= 0 else (15 if prog else 8)
+            # easy：首轮 12min（12936 复盘：8min 塞不进指纹+PoC检索+利用链，
+            # c-03/c-09 两轮 0 分被误判死），retry 有断点 20min、无断点 15min
+            minutes = 12 if self.attempt <= 0 else (20 if prog else 15)
         if self.cfg.round_num == 1 and not has_completed_sol:
             minutes = min(minutes, 30 if self.ch.difficulty == "hard" else 20)
         return minutes * 60
@@ -1624,6 +1630,8 @@ class Worker:
                 "禁止写工作目录之外的任何文件（共享文件除外）；"
                 "line 目录内的 NOTES.md/STATE.md/RELAY.md/HOSTS.md/submit_flag.sh 是软链"
                 "（指向共享文件），cd 进去后照样用相对路径追加/提交\n"
+                "   - **开打前先 read NOTES.md/HOSTS.md 尾部**：已确认事实/已排除方向/已拿主机"
+                "清单都在里面，只做别人没做的事，别重复已排除方向或已打下的面\n"
                 "   - 共享文件只追加且带线名前缀：`echo '- [X线] <发现>' >> NOTES.md`"
                 "（RELAY.md、HOSTS.md 台账、STATE.md 的 INTENTS/ELIMINATED 同理），禁止重排/覆盖他人内容\n"
                 "   - 拿到 flag 立即用 bash 执行 `./submit_flag.sh <flag>` 提交\n"
