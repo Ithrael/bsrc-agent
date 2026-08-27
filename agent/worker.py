@@ -352,6 +352,12 @@ def _submit_flag_script(ch, ws: str) -> str:
         "  flock -x 9\n"
         "  LOCKED=1\n"
         "fi\n"
+        "# .flag_tried 去重（13174 实测：b-02 三轮 00:18:41 同一秒 5 连发、3 个是\n"
+        "# 旧 flag 重提——显式通道直连平台，不过 Python tried 去重，脚本层自己拦）。\n"
+        f"if grep -Fxq \"$FLAG\" {ws}/.flag_tried 2>/dev/null; then\n"
+        "  echo '重复提交拒绝：该 flag 此前已提交过（正确/错误都记录），不再烧平台请求'\n"
+        "  exit 1\n"
+        "fi\n"
         "# 连错干预（防盲猜空转：run 12019 f2-05 连错 10 次复盘）：连续错 5 次后强提醒\n"
         f"WRONG=$(cat {ws}/.flag_wrong 2>/dev/null || echo 0)\n"
         "if [ \"$WRONG\" -ge 5 ]; then\n"
@@ -373,6 +379,7 @@ def _submit_flag_script(ch, ws: str) -> str:
         "  -H \"Content-Type: application/json\" \\\n"
         f"  -d '{{\"unique_code\": \"{ch.unique_code}\", \"flag\": \"'\"$FLAG\"'\"}}')\n"
         "echo \"$RESP\"\n"
+        f"echo \"$FLAG\" >> {ws}/.flag_tried\n"
         "# 进度解析：平台响应带 correct_flag_count/total_flag_count\n"
         "N=$(echo \"$RESP\" | grep -o '\"correct_flag_count\"[^0-9]*[0-9]*' | grep -o '[0-9]*$' | head -1)\n"
         "T=$(echo \"$RESP\" | grep -o '\"total_flag_count\"[^0-9]*[0-9]*' | grep -o '[0-9]*$' | head -1)\n"
@@ -391,6 +398,52 @@ def _submit_flag_script(ch, ws: str) -> str:
         f"  echo $((WRONG + 1)) > {ws}/.flag_wrong\n"
         "fi\n"
         "if [ \"$LOCKED\" = 1 ]; then flock -u 9; fi\n")
+
+
+def _run_event_stats(ws: str) -> dict[str, dict]:
+    """读 run_dir/events.jsonl 聚合成每题统计（attempts/solve_prob/p50）。
+
+    Worker 不能 import scheduler（循环依赖），独立实现精简版，与
+    scheduler._load_events 同口径。托管沙箱跑完即销毁，events.jsonl 只在
+    本轮内有效（跨轮不持久——solutions.json 才是跨轮通道）。
+    paired worker 工作区在 run_dir/<code>/worker-A：向上找两级。"""
+    stats: dict[str, dict] = {}
+    if not ws:
+        return stats
+    base = os.path.dirname(os.path.abspath(ws))
+    for cand in (base, os.path.dirname(base)):
+        try:
+            with open(os.path.join(cand, "events.jsonl")) as f:
+                events = [json.loads(l) for l in f if l.strip()]
+        except (OSError, ValueError):
+            continue
+        for e in events:
+            code = e.get("challenge")
+            if not code:
+                continue
+            st = stats.setdefault(code, {"attempts": 0, "completed": 0, "durations": []})
+            st["attempts"] += 1
+            if e.get("completed"):
+                st["completed"] += 1
+                if e.get("elapsed_min"):
+                    st["durations"].append(float(e["elapsed_min"]))
+        break
+    for st in stats.values():
+        d = sorted(st["durations"])
+        st["p50"] = d[len(d) // 2] if d else None
+        st["solve_prob"] = st["completed"] / st["attempts"]
+    return stats
+
+
+def _zero_score_history(ws: str, code: str) -> int:
+    """events.jsonl 里该题「≥2 次 attempt 且全零分」的 attempt 数（0 = 无零分历史）。
+
+    13174 实测：b-02 三轮 125min 0 分硬攻（同面重复打、槽位时间打水漂）——
+    零分历史是「换打法/削减预算」的最强信号。"""
+    st = _run_event_stats(ws).get(code)
+    if not st or st.get("attempts", 0) < 2 or st.get("solve_prob", 0) > 0:
+        return 0
+    return st["attempts"]
 
 
 class Worker:
@@ -947,6 +1000,11 @@ class Worker:
             minutes = 12 if self.attempt <= 0 else (20 if prog else 15)
         if self.cfg.round_num == 1 and not has_completed_sol:
             minutes = min(minutes, 30 if self.ch.difficulty == "hard" else 20)
+        # 零分历史预算封顶（13174 实测：b-02 三轮 125min 0 分硬攻，槽位时间
+        # 打水漂）：本题 ≥2 次 attempt 仍零分时，单次预算封顶 20min 试水轮，
+        # 省下的时间给有转化率的题。events.jsonl 轮内有效（跨轮沙箱销毁）。
+        if self.attempt >= 2 and _zero_score_history(getattr(self, "ws", ""), self.ch.unique_code) >= 2:
+            minutes = min(minutes, 20)
         return minutes * 60
 
     def _scaled_max_steps(self) -> float:
@@ -1568,6 +1626,17 @@ class Worker:
                          + _hint_note[len("[官方 hint]"):].strip())
         if desc_hints:
             parts.append("## CVE 线索（题目描述命中，优先查公开 PoC）\n" + "\n".join(f"- {h}" for h in desc_hints))
+        # 零分历史警告（events.jsonl 轮内实测）：≥2 次 attempt 全零分时强制换打法
+        # （13174 实测 b-02 三轮硬攻同面、错提风暴——重复已失败的路是纯烧 token）
+        z = _zero_score_history(getattr(self, "ws", ""), ch.unique_code)
+        if z >= 2:
+            parts.append(
+                f"## ⚠️ 历史零分警告（本题已 {z} 次尝试全部 0 分）\n"
+                "前几次打法均未奏效，**禁止重复已失败的方向**：\n"
+                "1. 先读 RELAY.md/NOTES.md 里「已证死路」，一条都不要重试；\n"
+                "2. 优先 (a) 官方提示方向（若有）(b) /opt/pocs/poc-index.json 与 nuclei "
+                "模板精确命中组件/CVE (c) 与前几轮完全不同的攻击面；\n"
+                "3. 拿不到确凿证据的 flag 不要提交（瞎猜必错还烧请求）。")
         port_hints = self._port_hints()
         if port_hints:
             parts.append("## 端口线索（目标端口命中已知攻击面，直接参考）\n" + "\n".join(f"- {h}" for h in port_hints))

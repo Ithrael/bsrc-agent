@@ -1044,6 +1044,16 @@ async def test_submit_flag_sh_real_execution(tmp_path):
     assert "flag 已正确提交: flag{mock_flag_01}" in state
     assert "flag 进度: 1/1" in state
     assert (ws / ".flag_wrong").read_text().strip() == "0"
+    # .flag_tried 去重（13174 实测同一秒 5 连发旧 flag）：重复提交被脚本拦截，
+    # 不打平台（mock 计数不变），STATE.md 登记行只有一条
+    r3 = subprocess.run(["bash", str(sh), "flag{mock_flag_01}", "重复提交"],
+                        cwd=sub, env=env, capture_output=True, text=True)
+    assert r3.returncode != 0
+    assert "重复提交拒绝" in r3.stdout
+    assert state.count("flag 已正确提交: flag{mock_flag_01}") == 1
+    challenges = await TsecClient(f"http://{host}:{port}", TOKEN).list_challenges()
+    c = next(x for x in challenges if x.unique_code == "mock_web_01")
+    assert c.correct_flag_count == 1     # 重复提交没有打平台
     await TsecClient(f"http://{host}:{port}", TOKEN).close()
 
 
@@ -1347,3 +1357,78 @@ def test_run_meta_fields(tmp_path):
     assert meta["fan_out"] == 8 and meta["tokens"] == 999
     assert meta["first_flag_s"] is not None and meta["first_flag_s"] > 0
     assert meta["primitives"] == 2      # 「无」占位行不算
+
+
+# ---- 零分历史联动（13174 实测：b-02 三轮 125min 0 分硬攻） ----
+
+def test_zero_score_history_caps_timeout(tmp_path):
+    """events.jsonl 记录 ≥2 次零分 attempt 后：hard attempt=2 有断点的 40min
+    预算封顶 20min（试水轮）；无零分历史不受影响。"""
+    run_dir = tmp_path / "runs_x"
+    code_dir = run_dir / "bctf-02"
+    code_dir.mkdir(parents=True)
+    (code_dir / "RELAY.md").write_text("已达成原语: RCE\n")
+    (run_dir / "events.jsonl").write_text("\n".join(json.dumps(e) for e in [
+        {"challenge": "bctf-02", "completed": False, "elapsed_min": 30.0},
+        {"challenge": "bctf-02", "completed": False, "elapsed_min": 25.0},
+    ]) + "\n")
+
+    w = Worker.__new__(Worker)
+    w.cfg = Config()
+    w.ch = Challenge.from_dict({"unique_code": "bctf-02", "flag_count": 6,
+                                "total_score": 1800, "difficulty": "hard"})
+    w.attempt = 2
+    w.ws = str(code_dir)
+    w.notes_path = str(code_dir / "NOTES.md")
+    assert w._scaled_timeout_s() == 20 * 60          # 40min → 封顶 20min
+
+    # 无零分历史：硬题 attempt=2 有断点仍是 40min
+    code_dir_y = tmp_path / "runs_y" / "bctf-02"
+    code_dir_y.mkdir(parents=True)
+    (code_dir_y / "RELAY.md").write_text("已达成原语: RCE\n")
+    w2 = Worker.__new__(Worker)
+    w2.cfg = Config()
+    w2.ch = w.ch
+    w2.attempt = 2
+    w2.ws = str(code_dir_y)
+    w2.notes_path = str(code_dir_y / "NOTES.md")
+    assert w2._scaled_timeout_s() == 40 * 60
+
+    # 有部分分数（solve_prob > 0）的历史：不封顶
+    run_dir2 = tmp_path / "runs_z"
+    code_dir2 = run_dir2 / "bctf-03"
+    code_dir2.mkdir(parents=True)
+    (code_dir2 / "RELAY.md").write_text("已达成原语: RCE\n")
+    (run_dir2 / "events.jsonl").write_text("\n".join(json.dumps(e) for e in [
+        {"challenge": "bctf-03", "completed": False, "elapsed_min": 30.0},
+        {"challenge": "bctf-03", "completed": True, "elapsed_min": 12.0},
+    ]) + "\n")
+    w3 = Worker.__new__(Worker)
+    w3.cfg = Config()
+    w3.ch = Challenge.from_dict({"unique_code": "bctf-03", "flag_count": 4,
+                                 "total_score": 1200, "difficulty": "hard"})
+    w3.attempt = 2
+    w3.ws = str(code_dir2)
+    w3.notes_path = str(code_dir2 / "NOTES.md")
+    assert w3._scaled_timeout_s() == 40 * 60
+
+
+def test_zero_score_history_warning_in_prompt(tmp_path):
+    """_build_claude_prompt 注入历史零分警告（≥2 次 attempt 全 0 分）。"""
+    run_dir = tmp_path / "runs_w"
+    code_dir = run_dir / "bctf-31"
+    code_dir.mkdir(parents=True)
+    (run_dir / "events.jsonl").write_text("\n".join(json.dumps(e) for e in [
+        {"challenge": "bctf-31", "completed": False, "elapsed_min": 30.0},
+        {"challenge": "bctf-31", "completed": False, "elapsed_min": 20.0},
+    ]) + "\n")
+    w = _brief_worker(tmp_path)
+    w.ws = str(code_dir)
+    prompt = w._build_claude_prompt(w.ch, {}, {}, False, [], "", "")
+    assert "历史零分警告" in prompt
+    assert "2 次尝试" in prompt
+    # 无零分历史：不注入
+    w2 = _brief_worker(tmp_path)
+    w2.ws = str(tmp_path / "runs_empty" / "bctf-31")
+    prompt2 = w2._build_claude_prompt(w2.ch, {}, {}, False, [], "", "")
+    assert "历史零分警告" not in prompt2
