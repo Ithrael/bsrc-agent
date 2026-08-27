@@ -1286,6 +1286,8 @@ class Worker:
                     time.strftime("%Y-%m-%d ") + m.group(3), "%Y-%m-%d %H:%M:%S"))
             except ValueError:
                 continue
+            if t > wall0 + 300:
+                t -= 86400          # 跨午夜：时间戳属于昨天（00:0x 开的 attempt 读 23:xx 残留行）
             if t < wall0 - 5:        # 本 attempt 之前的残留行：跳过
                 continue
             return int(m.group(1)), int(m.group(2))
@@ -1315,6 +1317,8 @@ class Worker:
                     time.strftime("%Y-%m-%d ") + m.group(0), "%Y-%m-%d %H:%M:%S"))
             except ValueError:
                 continue
+            if t > wall0 + 300:
+                t -= 86400          # 跨午夜：时间戳属于昨天（00:0x 开的 attempt 读 23:xx 残留行）
             if t < wall0 - 5:
                 continue  # 上轮残留的登记行（STATE.md 跨 attempt 持久），不算本轮
             off = t - wall0

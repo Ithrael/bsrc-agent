@@ -1144,15 +1144,16 @@ def test_state_flag_progress_parses_latest(tmp_path):
     w.state_path = str(tmp_path / "STATE.md")
     w._started_wall = time.time() - 60          # 本 attempt 60 秒前开始
     now = time.strftime("%H:%M:%S")
+    old = time.strftime("%H:%M:%S", time.localtime(time.time() - 3600))  # 1 小时前
     (tmp_path / "STATE.md").write_text(
         "## FACTS\n"
-        "- flag 进度: 3/4 (10:00:00)\n"          # 上轮残留（时间戳更早）：跳过
+        f"- flag 进度: 3/4 ({old})\n"            # 上轮残留（时间戳更早）：跳过
         f"- flag 进度: 2/4 ({now})\n"
         "- flag 进度: 1/4\n")                    # 无时间戳（初始行）：跳过
     assert w._state_flag_progress() == (2, 4)
     # 只有残留行：返回 None（不误触发完成/不虚增计数）
     (tmp_path / "STATE.md").write_text(
-        "## FACTS\n- flag 进度: 3/4 (10:00:00)\n- flag 进度: 1/4\n")
+        f"## FACTS\n- flag 进度: 3/4 ({old})\n- flag 进度: 1/4\n")
     assert w._state_flag_progress() is None
 
 

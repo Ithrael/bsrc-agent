@@ -427,3 +427,113 @@ def test_claude_health_tracks_harness_path():
         sch._track_claude_health(r)
     assert not sch.cfg.harness_enabled          # 连续崩溃触发全局降级
     assert not sch.cfg.claude_worker
+
+
+# ---- 槽位空转修复（13174 实测：pending 空 + 任务在跑时 retry 永不拉起） ----
+
+@pytest.mark.asyncio
+async def test_pull_retry_into_pending_filters_completed(tmp_path):
+    """retry 并入：平台快照过滤已完成题、按优先级排序、清空 retry 队列。"""
+    from agent.scheduler import Scheduler
+    from agent.tsec_api import Challenge
+
+    ch_a = Challenge.from_dict({"unique_code": "rr-1", "flag_count": 1,
+                                "total_score": 500, "difficulty": "easy"})
+    ch_b = Challenge.from_dict({"unique_code": "rr-2", "flag_count": 1,
+                                "total_score": 100, "difficulty": "easy"})
+
+    class FakeApi:
+        async def list_challenges(self):
+            done = Challenge.from_dict({"unique_code": "rr-2", "flag_count": 1,
+                                        "correct_flag_count": 1, "total_score": 100,
+                                        "difficulty": "easy", "is_completed": True})
+            alive = Challenge.from_dict({"unique_code": "rr-1", "flag_count": 1,
+                                         "correct_flag_count": 0, "total_score": 500,
+                                         "difficulty": "easy", "is_completed": False})
+            return [done, alive]
+
+    sch = Scheduler.__new__(Scheduler)
+    sch.cfg = Config()
+    sch.cfg.round_num = 2
+    sch.run_dir = str(tmp_path)
+    sch.api = FakeApi()
+    sch._events = {}
+    sch.pending = []
+    sch.retry_queue = [ch_a, ch_b]
+    assert await sch._pull_retry_into_pending() is True
+    assert [c.unique_code for c in sch.pending] == ["rr-1"]   # rr-2 平台已完成被滤掉
+    assert sch.retry_queue == []
+    # retry 空：直接返回 False 不发请求
+    assert await sch._pull_retry_into_pending() is False
+
+
+@pytest.mark.asyncio
+async def test_no_idle_slots_retry_dispatched_while_task_running(tmp_path, monkeypatch):
+    """槽位空转修复核心场景：pending 空 + 长任务占着槽位时，retry 队列立即补空槽——
+    fail 题的第 2 次 attempt 必须发生在 slow 题结束之前（旧逻辑要等全部任务
+    结束才拉 retry，空槽空转 8s 到 slow 跑完）。"""
+    import asyncio
+
+    from agent.worker import WorkerResult
+
+    srv = make_server()
+    # 只留 slow + fail 两题（默认 mock_web_01/bin 平台侧永不完成会死循环）
+    srv.state = {
+        "mock_slow_01": _extra_challenge("mock_slow_01", "flag{mock_slow_01}"),
+        "mock_fail_01": _extra_challenge("mock_fail_01", "flag{mock_fail_01}"),
+    }
+    host, port = srv.server_address
+    api = TsecClient(f"http://{host}:{port}", TOKEN)
+    cfg = Config()
+    cfg.max_concurrent = 3
+    cfg.recon_boot = False
+    cfg.record_solutions = False
+    cfg.stagnate_boost_min = 0   # 关掉掉速插队：只验证空槽补位路径本身
+    sched = Scheduler(cfg, FakeLLM(), api, str(tmp_path))
+
+    calls = {"slow": 0, "fail": []}
+    slow_ended: list[float] = []
+
+    async def fake_run_one(ch, attempt=0):
+        if ch.unique_code == "mock_slow_01":
+            calls["slow"] += 1
+            await asyncio.sleep(8)          # 长任务占住 1 个槽位
+            slow_ended.append(time.monotonic())
+            done_slow = calls["slow"] >= 2  # 第 2 次 attempt 才算完成
+        elif ch.unique_code == "mock_fail_01":
+            calls["fail"].append(time.monotonic())
+            done_slow = False
+        else:
+            done_slow = True                # 其他 mock 题立即完成
+        flag = {"mock_slow_01": "flag{mock_slow_01}",
+                "mock_fail_01": "flag{mock_fail_01}"}.get(ch.unique_code, "")
+        if ch.unique_code == "mock_fail_01":
+            r = WorkerResult()
+            r.completed = len(calls["fail"]) >= 3   # 第 3 次 attempt 才算完成
+        else:
+            r = WorkerResult()
+            r.completed = done_slow
+        if r.completed:
+            if flag:
+                await sched.api.submit_flag(ch.unique_code, flag)  # 平台侧入账（终局退出条件）
+            r.score = ch.total_score
+            r.flags = [flag] if flag else []
+            r.reason = "all flags captured"
+        else:
+            r.reason = "claude done"
+        await sched._finish(ch, r)
+
+    monkeypatch.setattr(sched, "_run_one", fake_run_one)
+    done = await sched.run()
+    try:
+        assert calls["slow"] == 2, f"slow 首轮失败 + retry 完成，实际 {calls['slow']}"
+        assert len(calls["fail"]) == 3, f"fail 3 次 attempt 后完成，实际 {calls['fail']}"
+        # 核心断言：fail 的第 2 次 attempt（空槽补位）发生在 slow 结束之前
+        assert calls["fail"][1] < slow_ended[0], (
+            f"空槽应在 slow 运行期间被 retry 补位：fail_att2={calls['fail'][1]:.1f} "
+            f"slow_end={slow_ended[0]:.1f}（旧逻辑空转 8s）")
+        assert done["mock_slow_01"]["completed"]
+        assert done["mock_fail_01"]["completed"]
+    finally:
+        await api.close()
+        srv.shutdown()

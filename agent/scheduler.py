@@ -757,6 +757,29 @@ class Scheduler:
             self.pending = (sorted(promo, key=lambda c: _priority(c, self.cfg.round_num, getattr(self, "_events", {})))
                             + self.pending)
 
+    async def _pull_retry_into_pending(self) -> bool:
+        """retry 队列并入 pending（按平台快照过滤已完成题）。返回是否有题可派。
+
+        13174 实测修复：此前只在「pending 空且无任务在跑」时拉取 retry——
+        b 系列长预算攻坚期间其余槽位空转 10-30 分钟（历史多轮尾段空窗同源）。
+        现在主循环每个 tick（15s）只要有空槽就拉取补位，槽位永不平白空转。"""
+        if not self.retry_queue:
+            return False
+        _reload_lib()  # 本轮的 partial/completed 记录参与重试排序
+        try:
+            fresh = {c.unique_code: c for c in await self._refresh()}
+            retry_todo = [fresh.get(c.unique_code, c) for c in self.retry_queue
+                          if not _challenge_completed(fresh.get(c.unique_code, c))]
+        except ApiError:
+            retry_todo = self.retry_queue
+        self.retry_queue = []
+        self.pending = sorted(
+            retry_todo,
+            key=lambda c: _priority(c, self.cfg.round_num, getattr(self, "_events", {})))
+        if retry_todo:
+            log.info("retry 队列 %d 题并入待解（空槽立即补位）", len(retry_todo))
+        return bool(retry_todo)
+
     async def _platform_recheck(self) -> bool:
         """回查平台把仍未解出的题重新入队。返回 False = 全部解开（可退出）。
         钉子题（_dead）不参与常规回挖；只剩钉子题未解时仍回挖——其他题全解了，
@@ -824,17 +847,7 @@ class Scheduler:
             # 再回查平台把仍未被解出的题重新入队。永不停止模式下只有
             # 「平台已无未解题」才退出；有界模式额外受全局 deadline 约束。
             if not self.pending and not tasks:
-                if self.retry_queue:
-                    _reload_lib()  # 本轮的 partial/completed 记录参与重试排序
-                    try:
-                        fresh = {c.unique_code: c for c in await self._refresh()}
-                        retry_todo = [fresh.get(c.unique_code, c) for c in self.retry_queue
-                                      if not _challenge_completed(fresh.get(c.unique_code, c))]
-                    except ApiError:
-                        retry_todo = self.retry_queue
-                    log.info("主队列完成，重试 %d 道未解出题（本轮已记录部分进展，续跑）", len(retry_todo))
-                    self.retry_queue = []
-                    self.pending = sorted(retry_todo, key=lambda c: _priority(c, self.cfg.round_num, getattr(self, "_events", {})))
+                if await self._pull_retry_into_pending():
                     continue
                 # retry 也空：回查平台。还有未解出的（含 start/容器失败的终局题）就再来一轮。
                 if self.cfg.never_stop or time_left > 120:
@@ -849,9 +862,16 @@ class Scheduler:
 
             # 补充新任务（首轮尝试限长超时；retry 轮预算分级放长）
             # gate 固定 3 并发（平台上限写死）：槽位一空立即补位，不允许空闲。
+            # 主循环每 15s 一个 tick，空槽检查天然是这个粒度（无需额外轮询器）。
             skipped = 0
-            while (len(tasks) < self.effective_max and self.pending
+            while (len(tasks) < self.effective_max
                    and (self.cfg.never_stop or time_left > 120)):
+                if not self.pending:
+                    # 槽位空转修复（13174 实测：b 系列长预算攻坚期间 pending 空、
+                    # 其他任务在跑时 retry 队列永不被拉起，空槽空转 10-30 分钟——
+                    # 历史多轮「尾段空窗」同源）。pending 空但有空槽就把 retry 拉进来。
+                    if not await self._pull_retry_into_pending():
+                        break
                 ch = self.pending.pop(0)
                 wait_until = self._start_backoff.get(ch.unique_code, 0)
                 if time.monotonic() < wait_until:
