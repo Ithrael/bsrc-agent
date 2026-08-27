@@ -534,11 +534,14 @@ class Worker:
     def _should_hint_upfront(self) -> bool:
         """首轮（attempt=0）是否直接带官方 hint 开工。
 
-        只对多 flag 大题保留（渗透链方向指引值 10%）；hard 单 flag 首轮硬解——
+        多 flag 大题保留（渗透链方向指引值 10%）；hard 单 flag 首轮硬解——
         run 12610 复盘：upfront 让 hard 单 flag 题全面 -10%（a-01 500→450 等
-        7 题）且无速度收益，回到 12464「首轮无 hint、retry 轮再拉」的满分策略。
-        easy/medium 单 flag flash 能解，留给断点重跑再拉。"""
-        return (self.cfg.hint_policy == "free" and self.ch.flag_count >= 2)
+        7 题）且无速度收益。
+        easy + retry 轮（attempt≥1）：12936 复盘 c-03/c-09 首轮 12min 打不透、
+        retry 再空转——100 分题花 10 分买方向值得；250 分 e 系列首轮仍硬解保满分。"""
+        return (self.cfg.hint_policy == "free" and self.ch.flag_count >= 2) or (
+            self.cfg.hint_policy == "free" and self.attempt >= 1
+            and self.ch.difficulty == "easy" and self.ch.total_score <= 150)
 
     async def _workspace_digest(self) -> str:
         """轮内重 launch 工作区速览（ATX 吸收：续跑轮把上轮工作区尾部全量内联进
@@ -1584,6 +1587,18 @@ class Worker:
         # 后半程 claude 秒退空转。子 agent 共享主进程运行时，资源占用降一个量级）。
         # 方向数按题分级：flag≥5 八个 / flag 3-4 六个 / flag 2 或 hard 四个。
         # 防踩：子 agent 各自独立工作目录 lineX/（约定），共享文件追加带线名前缀，串线线索只交接。
+        # 单 flag 题独立攻克角度（Cairn 撒网语义：每条线全权解这道题、角度互不重叠，
+        # 谁先解出谁提交——竞品 24 路并发就是同题多路独立试错，不是方向分工）
+        _SOLO_ANGLES: dict[str, tuple[str, str]] = {
+            "A": ("已知 CVE 检索", "先指纹识别组件/框架，grep /opt/pocs 与 nuclei 模板找现成 PoC 直接打"),
+            "B": ("业务逻辑", "状态机跳步/越权/竞态/参数篡改——按业务流分析，不急着找注入"),
+            "C": ("注入类", "SQLi/SSTI/命令注入/表达式注入——把每个参数当注入点逐个测"),
+            "D": ("认证与越权", "默认凭证/弱口令/JWT 伪造/session 篡改/IDOR 遍历"),
+            "E": ("文件与路径", "文件上传/任意文件读/路径穿越/备份与源码泄露"),
+            "F": ("信息泄露", "JS 源码/注释/报错/接口文档/敏感配置/.git"),
+            "G": ("协议与网络", "SSRF/端口复用/非 HTTP 服务/云元数据"),
+            "H": ("综合深挖", "先读共享 NOTES 补别人漏掉的面，从已有线索最深点继续"),
+        }
         _ROLES: dict[str, tuple[str, str]] = {
             "A": ("入口面", "目标 Web 服务的初始突破（默认凭证/已知 CVE/文件上传等）。"),
             "B": ("内网横向", "按 HOSTS.md 资产台账逐台探测/利用；新主机立即登记台账一行"
@@ -1604,25 +1619,36 @@ class Worker:
         master_role = ""  # 主控角色指令（多 flag/hard 题启用；断点重跑复用同一角色）
         if not has_completed_sol and (ch.flag_count >= 2 or ch.difficulty in ("hard", "medium")):
             if ch.flag_count >= 5:
-                line_keys = "ABCDEFGH"   # 八个子 agent 方向（b-02 级 6 flags 大题）
+                line_keys = "ABCDEFGH"   # b-02 级 6 flags 大题：8 线方向分工
             elif ch.flag_count >= 3:
-                line_keys = "ABCDEF"     # 六个（b-01/b-03 级 4 flags）
-            elif ch.difficulty == "hard":
-                line_keys = "ABCDEF"     # hard 单 flag 六线（原四线：Cairn 每题 8 线，
-                                         # 前 2.5h 密度差距主因之一是单 flag 题无分治）
+                line_keys = "ABCDEF"     # b-01/b-03 级 4 flags：6 线方向分工
             elif ch.flag_count >= 2:
-                line_keys = "ADEF"       # 2 面 medium 四线（不变）
+                line_keys = "ADEF"       # 2 面 medium：4 线分工
+            elif ch.difficulty == "hard":
+                line_keys = "ABCDEFGH"   # hard 单 flag：8 线独立攻克（Cairn 撒网，
+                                         # 竞品 24 路并发 = 同题多路独立试错）
             else:
-                line_keys = "AD"         # medium 单 flag 两线探路（A 入口 + D 独立侦察，
-                                         # 新增：medium 首轮 12min 从单线串行试错变双线并行）
-            subtask_table = "\n".join(
-                f"- [{key}线] {_ROLES[key][0]}：{_ROLES[key][1]}" for key in line_keys)
+                line_keys = "ABCDEF"     # medium 单 flag：6 线独立攻克
+            if ch.flag_count >= 2:
+                # 多 flag 题：方向分工（内网链需要协作，b 系列已验证）
+                subtask_table = "\n".join(
+                    f"- [{key}线] {_ROLES[key][0]}：{_ROLES[key][1]}" for key in line_keys)
+                role_head = f"方向互不重叠：\n{subtask_table}\n"
+                handoff_line = "   - 发现其它方向攻击面的线索：写进 NOTES.md 交接（注明给哪条线），不要自己深入\n"
+            else:
+                # 单 flag 题：独立攻克（每条线全权解这道题，角度不同，谁先解出谁提交）
+                subtask_table = "\n".join(
+                    f"- [{key}线] {_SOLO_ANGLES[key][0]}：{_SOLO_ANGLES[key][1]}" for key in line_keys)
+                role_head = (
+                    f"各线从不同角度独立攻克同一目标（角度互不重叠，但每个子 agent 都全权"
+                    f"负责解出这道题、拿到 flag 就提交）：\n{subtask_table}\n")
+                handoff_line = "   - 发现其它角度的线索：写进 NOTES.md 交接（注明给哪条线），不要自己深入\n"
             master_role = (
                 f"## 你的角色（主控 agent，用 Task 工具并行派发子 agent 攻坚）\n"
                 f"本题共 {ch.flag_count} 面 flag，你负责统筹全局，不亲自做侦察细节：\n"
                 f"1. 先读 NOTES.md、STATE.md、RELAY.md、HOSTS.md（资产台账）：已拿到的 flag 与已排除方向不要重复攻。\n"
                 f"2. 用 Task 工具**一次性并行派发 {len(line_keys)} 个子 agent**，各自独立上下文分头攻坚，"
-                f"方向互不重叠：\n{subtask_table}\n"
+                f"{role_head}"
                 "   每个 Task 的 model 参数指定为 deepseek-v4-flash（子 agent 打宽用 flash，"
                 "主控统筹思考用 pro——12641 复盘：尾段 24 个 pro 会话空烧 1.5h 零产出，成本错配）\n"
                 "3. 每个子 agent 的指令里必须包含（防互相踩）：\n"
@@ -1635,7 +1661,7 @@ class Worker:
                 "   - 共享文件只追加且带线名前缀：`echo '- [X线] <发现>' >> NOTES.md`"
                 "（RELAY.md、HOSTS.md 台账、STATE.md 的 INTENTS/ELIMINATED 同理），禁止重排/覆盖他人内容\n"
                 "   - 拿到 flag 立即用 bash 执行 `./submit_flag.sh <flag>` 提交\n"
-                "   - 发现其它方向攻击面的线索：写进 NOTES.md 交接（注明给哪条线），不要自己深入\n"
+                f"{handoff_line}"
                 "   - 结束前返回三行总结：已达成原语 / 已证死路 / 下一步\n"
                 "4. 子 agent 全部返回后：读它们的总结与 NOTES.md 新增，判断还缺哪几面 flag，"
                 "针对缺口再派新一轮子 agent（换攻击面/换主机/换凭证），直到全部拿齐或时间不足。\n"

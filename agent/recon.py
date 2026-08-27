@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import uuid
 
 log = logging.getLogger("recon")
@@ -120,6 +121,31 @@ async def _http_probe(cwd: str, host: str, port: int) -> str:
     return f"[{port}] {out.strip()}"
 
 
+_COMPONENT_RE = re.compile(
+    r"(?i)(comfyui|ollama|vllm|nginx|apache|tomcat|spring|django|flask|laravel|"
+    r"thinkphp|wordpress|gitlab|confluence|jenkins|struts|log4j|fastjson|weblogic|"
+    r"jboss|elasticsearch|redis|mysql|postgresql|mariadb|minio|cacti|grafana|"
+    r"phpmyadmin|rabbitmq|kafka|zookeeper|nacos|shiro|solr|activemq|druid|"
+    r"cas|onlyoffice|nextcloud|seafile|gitea|gogs|harbor|kubeflow|mlflow)")
+
+
+async def _poc_lookup(cwd: str, components: list[str]) -> str:
+    """PoC 预检（13023 复盘落地）：指纹识别到组件名后 grep 本地漏洞库，
+    命中路径直接进预侦察报告——省 claude 自己 grep 的 3-5 轮。
+    通用工具检索（类型级，无题目先验），本地/沙箱无漏洞库时静默返回空。"""
+    hits: list[str] = []
+    for comp in components[:4]:
+        out = await _run_cmd(
+            f"find /opt/pocs/vulhub -maxdepth 2 -iname '*{comp}*' -type d 2>/dev/null | head -5; "
+            f"grep -ril '{comp}' /opt/pocs/PayloadsAllTheThings 2>/dev/null | head -3",
+            cwd, 15)
+        if out.strip():
+            hits.append(f"- {comp}:\n{out.strip()}")
+    if hits:
+        return "### 本地漏洞库命中（直接按 README 利用链执行）\n" + "\n".join(hits)
+    return ""
+
+
 async def _nuclei_scan(cwd: str, host: str, ports: list[int]) -> str:
     """nuclei CVE 模板扫描：只扫本地 http/cves 目录，命中即精确 CVE 编号（高价值）。
 
@@ -186,6 +212,13 @@ async def recon_targets(addrs: list[str], workspace: str, budget_s: int = 75) ->
                 continue
             if str(r).strip() and "(失败" not in str(r):
                 lines.append(str(r).strip())
+        # PoC 预检：指纹文本提取组件名 → grep 本地漏洞库（省 claude 检索轮次）
+        joined = "\n".join(str(r) for r in results if isinstance(r, str))
+        comps = sorted(set(_COMPONENT_RE.findall(joined)))
+        if comps:
+            poc = await _poc_lookup(workspace, comps)
+            if poc:
+                lines.append(poc)
         return "\n\n".join(lines)[:6000]
     except Exception as e:
         log.warning("recon 失败: %s", e)
