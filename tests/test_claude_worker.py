@@ -1003,3 +1003,327 @@ def test_record_harness_solution(tmp_path, monkeypatch):
     record_harness_solution("x-02", "quick fail", completed=False, elapsed_min=3.0)
     lib = json.loads(sol_p.read_text())
     assert "x-02" not in lib                         # 短命失败不落库
+
+
+# ---- 2026-08-27 修复回归：证据统一 / STATE 进度早停 / 分类 playbook / events.jsonl ----
+
+@pytest.mark.asyncio
+async def test_submit_flag_sh_real_execution(tmp_path):
+    """真实执行 submit_flag.sh（不是只 grep 源码）：无证据被证据闸门拒绝（exit≠0）；
+    带证据提交成功并登记 STATE.md「flag 已正确提交」+「flag 进度: 1/1」。"""
+    import subprocess
+    srv = make_server()
+    host, port = srv.server_address
+    ch = Challenge.from_dict({"unique_code": "mock_web_01", "flag_count": 1,
+                              "total_score": 100, "difficulty": "easy"})
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "NOTES.md").write_text("# notes\n")
+    (ws / "STATE.md").write_text("# state\n## FACTS\n- flag 进度: 0/1\n")
+    sh = ws / "submit_flag.sh"
+    sh.write_text(worker_mod._submit_flag_script(ch, str(ws)))
+    sh.chmod(0o755)
+    env = {"BENCHMARK_BASE_URL": f"http://{host}:{port}",
+           "BENCHMARK_TOKEN": TOKEN,
+           "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+    # 无证据 → 闸门拒绝，不打平台（mock 的 correct 计数不变）
+    r1 = subprocess.run(["bash", str(sh), "flag{mock_flag_01}"],
+                        cwd=ws, env=env, capture_output=True, text=True)
+    assert r1.returncode != 0
+    assert "证据拒绝" in r1.stdout
+    # 带证据 → 成功 + STATE.md 双行登记（进度行是 Python drain 完成判定的输入）
+    r2 = subprocess.run(["bash", str(sh), "flag{mock_flag_01}", "cat /flag 第一行输出"],
+                        cwd=ws, env=env, capture_output=True, text=True)
+    assert r2.returncode == 0, r2.stdout
+    assert '"correct": true' in r2.stdout
+    state = (ws / "STATE.md").read_text()
+    assert "flag 已正确提交: flag{mock_flag_01}" in state
+    assert "flag 进度: 1/1" in state
+    await TsecClient(f"http://{host}:{port}", TOKEN).close()
+
+
+@pytest.mark.asyncio
+async def test_submit_flag_sh_no_evidence_does_not_submit(tmp_path):
+    """证据闸门拒绝时不产生任何平台请求：mock correct 计数保持 0（省一次必错请求）。"""
+    import subprocess
+    srv = make_server()
+    host, port = srv.server_address
+    api = TsecClient(f"http://{host}:{port}", TOKEN)
+    ch = Challenge.from_dict({"unique_code": "mock_web_01", "flag_count": 1,
+                              "total_score": 100, "difficulty": "easy"})
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "NOTES.md").write_text("# notes\n")
+    (ws / "STATE.md").write_text("# state\n")
+    sh = ws / "submit_flag.sh"
+    sh.write_text(worker_mod._submit_flag_script(ch, str(ws)))
+    sh.chmod(0o755)
+    env = {"BENCHMARK_BASE_URL": f"http://{host}:{port}",
+           "BENCHMARK_TOKEN": TOKEN,
+           "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+    r = subprocess.run(["bash", str(sh), "flag{mock_flag_01}"],
+                       cwd=ws, env=env, capture_output=True, text=True)
+    assert r.returncode != 0
+    challenges = await api.list_challenges()
+    c = next(x for x in challenges if x.unique_code == "mock_web_01")
+    assert c.correct_flag_count == 0
+    await api.close()
+
+
+@pytest.mark.asyncio
+async def test_state_progress_completes_and_stops_early(tmp_path, monkeypatch):
+    """修复 3 核心场景：子 agent 经 submit_flag.sh 提交最后一面（STATE.md 进度行
+    1/1），主进程事件流从未出现该 flag → drain 读进度行置完成事件杀主进程，
+    不等到它 sleep 60 自己退出。"""
+    srv = make_server()
+    host, port = srv.server_address
+    api = TsecClient(f"http://{host}:{port}", TOKEN)
+    ch = next(c for c in await api.list_challenges() if c.unique_code == "mock_web_01")
+    addrs = await api.start_challenge(ch.unique_code)
+
+    sol_path = tmp_path / "solutions.json"
+    sol_path.write_text("{}")
+    notes_path = tmp_path / "notes.json"
+    notes_path.write_text("{}")
+    monkeypatch.setattr(worker_mod, "solution_lib_path", lambda: str(sol_path))
+    monkeypatch.setattr(worker_mod, "notes_lib_path", lambda: str(notes_path))
+
+    # fake claude：模拟子 agent 已提交成功（STATE.md 有进度行 + 登记行），
+    # 主进程流只输出不含 flag 的总结，随后 sleep 60
+    p = tmp_path / "fake-claude.sh"
+    p.write_text("#!/bin/bash\n"
+                 "echo '## FACTS' >> STATE.md\n"
+                 "echo \"- flag 已正确提交: flag{mock_flag_01} ($(date +%H:%M:%S))\" >> STATE.md\n"
+                 "echo \"- flag 进度: 1/1 ($(date +%H:%M:%S))\" >> STATE.md\n"
+                 "echo '{\"type\":\"result\",\"result\":\"sub-agent submitted internally\"}'\n"
+                 "sleep 60\n")
+    p.chmod(0o755)
+
+    cfg = Config()
+    cfg.claude_worker = True
+    cfg.harness_backend = str(p)
+    cfg.recon_boot = False
+    cfg.record_solutions = False
+    monkeypatch.setattr(Worker, "_drain_interval_s", 0.2)
+
+    t0 = time.monotonic()
+    w = Worker(cfg, object(), api, ch, addrs, str(tmp_path / "ws"),
+               deadline=time.monotonic() + 600)
+    res = await w.run()
+    elapsed = time.monotonic() - t0
+
+    assert res.completed, res.reason
+    assert res.flags == ["flag{mock_flag_01}"]
+    assert elapsed < 30, f"drain 应读 STATE 进度提前杀主进程，实际跑了 {elapsed:.1f}s"
+    await api.close()
+
+
+def test_state_flag_progress_parses_latest(tmp_path):
+    """STATE.md 进度行只认本 attempt 开始后写入的（带时间戳）：上轮残留行与
+    无时间戳初始行不做完成判定（flag 每轮重新生成，上轮 3/4 ≠ 本轮 3/4）。"""
+    w = Worker.__new__(Worker)
+    w.state_path = str(tmp_path / "STATE.md")
+    w._started_wall = time.time() - 60          # 本 attempt 60 秒前开始
+    now = time.strftime("%H:%M:%S")
+    (tmp_path / "STATE.md").write_text(
+        "## FACTS\n"
+        "- flag 进度: 3/4 (10:00:00)\n"          # 上轮残留（时间戳更早）：跳过
+        f"- flag 进度: 2/4 ({now})\n"
+        "- flag 进度: 1/4\n")                    # 无时间戳（初始行）：跳过
+    assert w._state_flag_progress() == (2, 4)
+    # 只有残留行：返回 None（不误触发完成/不虚增计数）
+    (tmp_path / "STATE.md").write_text(
+        "## FACTS\n- flag 进度: 3/4 (10:00:00)\n- flag 进度: 1/4\n")
+    assert w._state_flag_progress() is None
+
+
+@pytest.mark.asyncio
+async def test_subagent_instruction_requires_evidence(tmp_path, monkeypatch):
+    """子 agent 指令与脚本用法一致：必须带 RAW EVIDENCE 参数（此前只写
+    ./submit_flag.sh <flag>，会被脚本证据闸门直接拒绝）。"""
+    srv = make_server()
+    srv.state.update({
+        "mock_pair_02": {
+            "unique_code": "mock_pair_02",
+            "description": "mock：三 flag（触发分治）",
+            "difficulty": "hard",
+            "level": 1,
+            "total_score": 1200,
+            "flag_count": 3,
+            "correct_flag_count": 0,
+            "is_completed": False,
+            "container_status": "stopped",
+            "container_addr": [],
+            "_flags": ["flag{p_02a}", "flag{p_02b}", "flag{p_02c}"],
+        },
+    })
+    host, port = srv.server_address
+    api = TsecClient(f"http://{host}:{port}", TOKEN)
+    ch = next(c for c in await api.list_challenges() if c.unique_code == "mock_pair_02")
+    addrs = await api.start_challenge(ch.unique_code)
+
+    sol_path = tmp_path / "solutions.json"
+    sol_path.write_text("{}")
+    notes_path = tmp_path / "notes.json"
+    notes_path.write_text("{}")
+    monkeypatch.setattr(worker_mod, "solution_lib_path", lambda: str(sol_path))
+    monkeypatch.setattr(worker_mod, "notes_lib_path", lambda: str(notes_path))
+
+    prompt_file = tmp_path / "master_prompt.txt"
+    p = tmp_path / "fake-claude.sh"
+    p.write_text("#!/bin/bash\n"
+                 "cat > " + str(prompt_file) + "\n"
+                 "echo '{\"type\":\"result\",\"result\":\"no flag\"}'\n")
+    p.chmod(0o755)
+
+    cfg = Config()
+    cfg.claude_worker = True
+    cfg.harness_backend = str(p)
+    cfg.recon_boot = False
+    cfg.record_solutions = False
+
+    w = Worker(cfg, object(), api, ch, addrs, str(tmp_path / "ws"),
+               deadline=time.monotonic() + 600)
+    await w.run()
+
+    master = prompt_file.read_text()
+    assert "./submit_flag.sh <flag> '<RAW EVIDENCE" in master
+    assert "`./submit_flag.sh <flag>` 提交" not in master   # 旧裸用法已移除
+    await api.close()
+
+
+def test_claude_prompt_injects_category_playbook(tmp_path):
+    """修复 5：生产路径复用分类 playbook——b 系列注入多阶段渗透速查、
+    f 系列注入二进制逆向速查（且不再塞偏 Web 的攻击面清单）。"""
+    w = _brief_worker(tmp_path)
+    ch_b = Challenge.from_dict({"unique_code": "b-02", "flag_count": 6,
+                                "correct_flag_count": 0, "total_score": 1200,
+                                "difficulty": "hard"})
+    p_b = w._build_claude_prompt(ch_b, {}, {}, False, [], "", "")
+    assert "多阶段渗透速查" in p_b
+    assert "攻击面清单" in p_b          # b 系列是 Web 多阶段：保留清单
+    ch_f = Challenge.from_dict({"unique_code": "f2-05", "flag_count": 1,
+                                "correct_flag_count": 0, "total_score": 400,
+                                "difficulty": "hard"})
+    p_f = w._build_claude_prompt(ch_f, {}, {}, False, [], "", "")
+    assert "二进制逆向" in p_f
+    assert "攻击面清单" not in p_f      # 非 Web 类删除无关段落（注册矩阵等纯噪音）
+
+
+def test_claude_prompt_exec_env_distinction(tmp_path):
+    """修复 5：明确区分解题容器 shell 与目标环境执行；云元数据/直读命令标注从目标发起。"""
+    w = _brief_worker(tmp_path)
+    ch = Challenge.from_dict({"unique_code": "a-01", "flag_count": 1,
+                              "correct_flag_count": 0, "total_score": 500,
+                              "difficulty": "easy"})
+    p = w._build_claude_prompt(ch, {}, {}, False, [], "", "")
+    assert "解题容器" in p and "不是目标" in p
+    assert "从**目标环境** curl" in p or "从**目标环境**" in p
+    # 云环境必查条目带「从目标发起」标注
+    assert "从目标发起，不是解题容器" in p
+
+
+def test_load_events_aggregates(tmp_path):
+    """events.jsonl 聚合：attempts/completed/p50（只统计解出的耗时）/solve_prob。"""
+    from agent.scheduler import _load_events
+    (tmp_path / "events.jsonl").write_text("\n".join(json.dumps(e) for e in [
+        {"challenge": "b-02", "completed": True, "elapsed_min": 20.0, "score": 1},
+        {"challenge": "b-02", "completed": True, "elapsed_min": 30.0, "score": 1},
+        {"challenge": "b-02", "completed": True, "elapsed_min": 10.0, "score": 1},
+        {"challenge": "b-02", "completed": False, "elapsed_min": 15.0, "score": 0},
+        {"challenge": "x-99", "completed": False, "elapsed_min": 12.0, "score": 0},
+    ]) + "\n")
+    st = _load_events(str(tmp_path))
+    assert st["b-02"]["attempts"] == 4
+    assert st["b-02"]["completed"] == 3
+    assert st["b-02"]["p50"] == 20.0      # 解出耗时中位数（10/20/30）
+    assert st["b-02"]["solve_prob"] == 0.75
+    assert st["x-99"]["solve_prob"] == 0.0 and st["x-99"]["p50"] is None
+    assert _load_events(str(tmp_path / "missing")) == {}
+
+
+def test_priority_learns_from_events(tmp_path):
+    """修复 6：实测高解出率的剩一面题提到断点档；多轮零解题降权；
+    P50 耗时替换难度估算。"""
+    from agent.scheduler import _priority
+    ch1 = Challenge.from_dict({"unique_code": "x-01", "flag_count": 2,
+                               "correct_flag_count": 1, "total_score": 500,
+                               "difficulty": "medium"})
+    ch2 = Challenge.from_dict({"unique_code": "x-02", "flag_count": 1,
+                               "correct_flag_count": 0, "total_score": 500,
+                               "difficulty": "medium"})
+    base1 = _priority(ch1, 2)
+    high = {"x-01": {"attempts": 4, "completed": 3, "p50": 8.0, "solve_prob": 0.75}}
+    p1 = _priority(ch1, 2, high)
+    assert p1 // 1000 == 1               # 高解出率剩一面 ≈ 断点档
+    assert p1 < base1                    # 且比无实测数据时更靠前
+    zero = {"x-02": {"attempts": 3, "completed": 0, "p50": None, "solve_prob": 0.0}}
+    base2 = _priority(ch2, 2)
+    p2 = _priority(ch2, 2, zero)
+    assert p2 // 1000 == base2 // 1000 + 4   # 多轮零解降权
+    # P50 进入 est 分量
+    p3 = _priority(ch2, 2, {"x-02": {"attempts": 1, "completed": 1, "p50": 3.0, "solve_prob": 1.0}})
+    assert p3 % 1000 == 3.0
+
+
+def test_finish_records_events(tmp_path):
+    """_finish 落一行 events.jsonl（challenge/attempt/meta 全量字段），聚合随刷新。"""
+    import asyncio
+    from agent.scheduler import Scheduler
+
+    async def run():
+        sch = Scheduler.__new__(Scheduler)
+        sch.cfg = Config()
+        sch.cfg.retry_unsolved = True
+        sch.run_dir = str(tmp_path)
+        sch._events = {}
+        sch._attempts = {"x-01": 1}
+        sch._dead = set()
+        sch.done = {}
+        sch.retry_queue = []
+
+        async def fake_close(code):
+            return True
+        sch._close_safely = fake_close
+        ch = Challenge.from_dict({"unique_code": "x-01", "flag_count": 1,
+                                  "correct_flag_count": 0, "total_score": 100,
+                                  "difficulty": "easy"})
+        res = worker_mod.WorkerResult()
+        res.completed = True
+        res.score = 100
+        res.flags = ["flag{aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"]
+        res.reason = "all flags captured"
+        res.elapsed_min = 3.2
+        res.meta = {"model": "deepseek-v4-flash", "fan_out": 6, "tokens": 12345,
+                    "first_flag_s": 42.0, "primitives": 2}
+        await sch._finish(ch, res)
+        assert sch._events["x-01"]["solve_prob"] == 1.0
+        lines = (tmp_path / "events.jsonl").read_text().strip().splitlines()
+        assert len(lines) == 1
+        ev = json.loads(lines[0])
+        assert ev["challenge"] == "x-01" and ev["attempt"] == 1
+        assert ev["model"] == "deepseek-v4-flash" and ev["fan_out"] == 6
+        assert ev["first_flag_s"] == 42.0 and ev["completed"] is True
+    asyncio.run(run())
+
+
+def test_run_meta_fields(tmp_path):
+    """_run_meta：模型/fan-out/token/首 flag 秒数/原语计数齐全（events.jsonl 输入）。"""
+    w = Worker.__new__(Worker)
+    w.cfg = Config()
+    w._used_model = "deepseek-v4-pro"
+    w._fan_out = 8
+    w._tokens_used = 999
+    w._started_wall = time.time() - 120
+    w.state_path = str(tmp_path / "STATE.md")
+    now = time.strftime("%H:%M:%S")
+    (tmp_path / "STATE.md").write_text(
+        f"## FACTS\n- flag 已正确提交: flag{{x}} ({now})\n- flag 进度: 1/4\n")
+    w.ws = str(tmp_path)
+    (tmp_path / "RELAY.md").write_text(
+        "# 接力块\n已达成原语: RCE\n已达成原语: 无\n已达成原语: 拿到 admin 凭据\n")
+    meta = w._run_meta()
+    assert meta["model"] == "deepseek-v4-pro"
+    assert meta["fan_out"] == 8 and meta["tokens"] == 999
+    assert meta["first_flag_s"] is not None and meta["first_flag_s"] > 0
+    assert meta["primitives"] == 2      # 「无」占位行不算

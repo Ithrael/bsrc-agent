@@ -49,11 +49,43 @@ def _challenge_completed(ch: Challenge) -> bool:
     )
 
 
-def _priority(ch: Challenge, round_num: int = 2) -> float:
+def _load_events(run_dir: str) -> dict[str, dict]:
+    """读 events.jsonl 聚合成每题统计：attempts / completed / p50（完整解出耗时
+    中位数，只统计解出的 attempt）/ solve_prob。损坏/缺失返回空 dict——这是
+    增强项不是前置依赖（fix 6：实测数据驱动排序替代部分硬编码阈值）。"""
+    stats: dict[str, dict] = {}
+    if not run_dir:
+        return stats
+    try:
+        with open(os.path.join(run_dir, "events.jsonl")) as f:
+            events = [json.loads(l) for l in f if l.strip()]
+    except (OSError, ValueError):
+        return stats
+    for e in events:
+        code = e.get("challenge")
+        if not code:
+            continue
+        st = stats.setdefault(code, {"attempts": 0, "completed": 0, "durations": []})
+        st["attempts"] += 1
+        if e.get("completed"):
+            st["completed"] += 1
+            if e.get("elapsed_min"):
+                st["durations"].append(float(e["elapsed_min"]))
+    for st in stats.values():
+        d = sorted(st["durations"])
+        st["p50"] = d[len(d) // 2] if d else None
+        st["solve_prob"] = st["completed"] / st["attempts"]
+    return stats
+
+
+def _priority(ch: Challenge, round_num: int = 2,
+              stats: dict[str, dict] | None = None) -> float:
     """按「完整解出题目数 / 墙钟时间」排序，而不是按分值排序。
 
     多 flag 题只有全部 flag 都拿到才增加一道已解题，因此剩余一面应显著
     优先于全新的多 flag 大题；同一档内 easy/medium/hard 依次尝试。
+    stats（events.jsonl 实测聚合）：P50 完整解出耗时替代难度估算；
+    高解出率剩一面题提到断点档；多轮实测零解的题降权。
     """
     info = _LIB.get(ch.unique_code) or {}
     difficulty_rank = {"easy": 0, "medium": 1, "hard": 2}.get(ch.difficulty, 3)
@@ -75,6 +107,17 @@ def _priority(ch: Challenge, round_num: int = 2) -> float:
         # 到与 partial 多面同级（run 12396 复盘：b-02 1800 分从头到尾没启动，
         # 槽位被单 flag 题反复占满，子 agent 无题可派，整段无分治低效期）。
         rank = (5 if ch.total_score >= 1000 else 8) + difficulty_rank
+
+    st = (stats or {}).get(ch.unique_code)
+    if st and st.get("attempts"):
+        # 实测数据校正（fix 6）：此前每轮 result 直接覆盖 done[code]，无法比较
+        # 不同模型/fan-out 的真实收益；events.jsonl 让优先级从数据学习
+        if st.get("p50"):
+            est = max(1.0, min(est, float(st["p50"])))   # 历史 P50 优于难度估算
+        if st.get("solve_prob", 0) >= 0.6 and remaining <= 1:
+            rank = 1                     # 实测高解出率的剩一面题 ≈ 断点题
+        elif st.get("solve_prob", 0) == 0.0 and st.get("attempts", 0) >= 2:
+            rank += 4                    # 多轮实测零解：降权（仍高于全新多面大题）
 
     if round_num == 1 and not info:
         rank -= 10                       # 保留 ROUND=1 的全题覆盖语义
@@ -101,6 +144,8 @@ class Scheduler:
         self.retry_queue: list[Challenge] = []
         self.done: dict[str, dict] = {}
         self.running: dict[str, asyncio.Task] = {}
+        # 实测事件统计（events.jsonl 聚合）：选题优先级从历史数据学习
+        self._events: dict[str, dict] = _load_events(run_dir) if run_dir else {}
         # 平台题目槽位硬上限为 3；即使环境变量误填更大，也不能把 start 打爆。
         self.effective_max = min(_PLATFORM_MAX_CONCURRENT, max(1, cfg.max_concurrent))
         self._sem = asyncio.Semaphore(self.effective_max)
@@ -498,6 +543,9 @@ class Scheduler:
         merged.reason = "all flags captured" if merged.completed else \
             ("harness crash" if res is None else f"harness done ({res.events} events)")
         merged.elapsed_min = h_timeout / 60 if not merged.completed else 0
+        merged.meta = {"model": f"harness:{self.cfg.harness_backend}",
+                       "fan_out": 0,
+                       "tokens": res.total_tokens if res else 0}
         try:
             with open(os.path.join(ws, "RESULT.json"), "w") as f:
                 json.dump({
@@ -607,6 +655,11 @@ class Scheduler:
                 else:
                     reasons.append(f"{tag}: crash {type(r).__name__}")
             merged.reason = " / ".join(reasons)
+            merged.meta = {"model": f"paired:{self.cfg.llm_model}",
+                           "fan_out": 2,
+                           "tokens": sum((r.meta or {}).get("tokens", 0)
+                                         if isinstance(r, WorkerResult) else 0
+                                         for r in (res_a, res_b))}
         finally:
             self.active_workers.pop(code, None)
         try:
@@ -621,9 +674,40 @@ class Scheduler:
             pass
         await self._finish(ch, merged)
 
+    def _record_event(self, ch: Challenge, res: WorkerResult):
+        """append 一行事件到 run_dir/events.jsonl（fix 6）：challenge/attempt/
+        模型/fan-out/起止时长/首 flag 时间/原语数/token/最终 flag 数/退出原因。
+        用于跨 attempt 比较不同模型、角色与 fan-out 的真实收益；done[code]
+        此前每次结果覆盖，无法做这种比较。"""
+        run_dir = getattr(self, "run_dir", "")
+        if not run_dir:
+            return
+        rec = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "challenge": ch.unique_code,
+            "attempt": self._attempts.get(ch.unique_code, 0),
+            "difficulty": ch.difficulty,
+            "total_score": ch.total_score,
+            "flag_count": ch.flag_count,
+            "elapsed_min": round(res.elapsed_min, 1),
+            "flags_final": len(res.flags or []),
+            "completed": bool(res.completed),
+            "score": res.score,
+            "reason": res.reason,
+        }
+        rec.update(res.meta or {})
+        try:
+            os.makedirs(run_dir, exist_ok=True)
+            with open(os.path.join(run_dir, "events.jsonl"), "a") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            self._events = _load_events(run_dir)  # 聚合刷新：下一次排序用最新数据
+        except OSError:
+            pass
+
     async def _finish(self, ch: Challenge, res: WorkerResult):
         """收尾：记录 done、关闭容器、未解出进 retry 队列。"""
         code = ch.unique_code
+        self._record_event(ch, res)
         self.done[code] = {
             "completed": res.completed, "score": res.score,
             "flags": res.flags, "reason": res.reason,
@@ -670,7 +754,7 @@ class Scheduler:
         self.retry_queue = []
         if promo:
             _reload_lib()
-            self.pending = (sorted(promo, key=lambda c: _priority(c, self.cfg.round_num))
+            self.pending = (sorted(promo, key=lambda c: _priority(c, self.cfg.round_num, getattr(self, "_events", {})))
                             + self.pending)
 
     async def _platform_recheck(self) -> bool:
@@ -688,7 +772,7 @@ class Scheduler:
             return False
         alive = [c for c in remaining if c.unique_code not in self._dead]
         _reload_lib()
-        self.pending = sorted(alive or remaining, key=lambda c: _priority(c, self.cfg.round_num))
+        self.pending = sorted(alive or remaining, key=lambda c: _priority(c, self.cfg.round_num, getattr(self, "_events", {})))
         return True
 
     async def run(self):
@@ -716,7 +800,7 @@ class Scheduler:
         already = sum(c.total_score for c in challenges if _challenge_completed(c))
         log.info("共 %d 题，已完成 %d（已有 %d 分），待解 %d", len(challenges),
                  len(challenges) - len(todo), already, len(todo))
-        self.pending = sorted(todo, key=lambda c: _priority(c, self.cfg.round_num))
+        self.pending = sorted(todo, key=lambda c: _priority(c, self.cfg.round_num, getattr(self, "_events", {})))
         wd = asyncio.create_task(self._watchdog())
 
         tasks: set[asyncio.Task] = set()
@@ -750,7 +834,7 @@ class Scheduler:
                         retry_todo = self.retry_queue
                     log.info("主队列完成，重试 %d 道未解出题（本轮已记录部分进展，续跑）", len(retry_todo))
                     self.retry_queue = []
-                    self.pending = sorted(retry_todo, key=lambda c: _priority(c, self.cfg.round_num))
+                    self.pending = sorted(retry_todo, key=lambda c: _priority(c, self.cfg.round_num, getattr(self, "_events", {})))
                     continue
                 # retry 也空：回查平台。还有未解出的（含 start/容器失败的终局题）就再来一轮。
                 if self.cfg.never_stop or time_left > 120:

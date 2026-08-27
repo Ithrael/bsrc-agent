@@ -1,6 +1,9 @@
 """针对本轮优化点的回归测试：解法清洗、超时分级、token 估算、预侦察解析、调度优先级。"""
+import json
 import os
 import time
+
+import pytest
 
 from agent.config import Config
 from agent.recon import _parse_hosts
@@ -251,3 +254,97 @@ def test_addr_host_port_tolerates_scheme():
     assert _addr_host_port("10.0.0.1:80") == ("10.0.0.1", 80)
     assert _addr_host_port("10.0.0.2") is None
     assert _addr_host_port("https://h:8443") == ("h", 8443)
+
+
+# ---- 两阶段预侦察修复（2026-08-27：逗号路径/443 https/开放端口回灌/索引精查） ----
+
+def test_parse_open_ports_nmap_and_socket_fallback():
+    from agent.recon import _parse_open_ports
+    assert _parse_open_ports("22/tcp open ssh\n80/tcp  open  http\n443/tcp open https\n8080/tcp closed") == [22, 80, 443]
+    assert _parse_open_ports("open: [80, 443, 8080]") == [80, 443, 8080]
+    assert _parse_open_ports("(超时)") == []
+    assert _parse_open_ports("") == []
+
+
+def test_port_plan_feeds_open_ports_and_caps():
+    """端口计划：题目显式端口 + nmap 开放端口（非 HTTP 跳过）+ 两者皆无才回退预设表。"""
+    from agent.recon import _port_plan
+    plan = _port_plan(["10.0.0.1"], ["http://10.0.0.1:8080/x"],
+                      {"10.0.0.1": [22, 80, 443, 3000]})
+    ports = plan["10.0.0.1"]
+    assert ports[0] == 8080            # 题目显式端口最优先
+    assert 80 in ports and 443 in ports and 3000 in ports   # 开放端口回灌
+    assert 22 not in ports             # SSH 等非 HTTP 端口跳过（curl 打上去白挂超时）
+    assert len(ports) <= 8             # 每 host 上限
+    # 扫描失败/无开放端口：回退预设表
+    assert _port_plan(["10.0.0.2"], [], {})["10.0.0.2"][:2] == [80, 8080]
+
+
+def test_sensitive_paths_have_no_commas():
+    """回归锁：敏感路径表不得含逗号——旧实现 shell 实际访问 /robots.txt, 等错路径。"""
+    from agent.recon import _SENSITIVE_PATHS
+    assert any(p.endswith(",") for p in _SENSITIVE_PATHS) is False
+    assert "/robots.txt" in _SENSITIVE_PATHS and "/.git/HEAD" in _SENSITIVE_PATHS
+
+
+def test_schemes_for_https_ports():
+    from agent.recon import _schemes_for
+    assert _schemes_for(443) == ("https", "http")    # 修复：443/8443 曾全用 http
+    assert _schemes_for(8443)[0] == "https"
+    assert _schemes_for(80) == ("http", "https")
+
+
+@pytest.mark.asyncio
+async def test_poc_lookup_uses_index(monkeypatch, tmp_path):
+    """索引优先：poc-index.json 存在时 O(1) 精查（不跑 find/grep）；组件名与 CVE 都命中。"""
+    import agent.recon as recon_mod
+    idx = tmp_path / "poc-index.json"
+    idx.write_text(json.dumps({
+        "components": {"comfyui": ["/opt/pocs/vulhub/comfyui", "/opt/pocs/vulhub/comfyui/README.md"]},
+        "cves": {"cve-2025-67303": ["/opt/nuclei-templates/http/cves/2025/CVE-2025-67303.yaml"]},
+    }))
+    monkeypatch.setattr(recon_mod, "_POC_INDEX", str(idx))
+    out = await recon_mod._poc_lookup(".", ["ComfyUI"], ["CVE-2025-67303"])
+    assert "comfyui" in out
+    assert "CVE-2025-67303.yaml" in out
+    # 未命中条目不出现
+    out2 = await recon_mod._poc_lookup(".", ["nonexistent"], [])
+    assert out2 == ""
+
+
+@pytest.mark.asyncio
+async def test_poc_lookup_falls_back_when_index_missing(monkeypatch, tmp_path):
+    """索引缺失（本地开发）：回退旧 find/grep 行为（此处路径不存在，静默返回空不报错）。"""
+    import agent.recon as recon_mod
+    monkeypatch.setattr(recon_mod, "_POC_INDEX", str(tmp_path / "no-such-index.json"))
+    out = await recon_mod._poc_lookup(tmp_path, ["comfyui"], [])
+    assert out == ""
+
+
+def test_build_poc_index_cli(tmp_path):
+    """索引生成器：vulhub 组件/README、PoC-in-GitHub JSON、nuclei 模板、CVE 子目录全收录。"""
+    import subprocess
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    script = root / "tools" / "build_poc_index.py"
+    pocs = tmp_path / "pocs"
+    nuclei = tmp_path / "nuclei-templates"
+    (pocs / "vulhub" / "comfyui").mkdir(parents=True)
+    (pocs / "vulhub" / "comfyui" / "README.md").write_text("exploit chain")
+    (pocs / "vulhub" / "comfyui" / "CVE-2025-67303").mkdir()
+    (pocs / "PoC-in-GitHub" / "2025").mkdir(parents=True)
+    (pocs / "PoC-in-GitHub" / "2025" / "CVE-2024-36401.json").write_text("{}")
+    (nuclei / "http" / "cves" / "2025").mkdir(parents=True)
+    (nuclei / "http" / "cves" / "2025" / "CVE-2024-36401.yaml").write_text("id: x")
+    out_path = tmp_path / "poc-index.json"
+    r = subprocess.run([sys.executable, str(script), str(pocs), str(nuclei), str(out_path)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    idx = json.loads(out_path.read_text())
+    assert "comfyui" in idx["components"]
+    assert any(p.endswith("README.md") for p in idx["components"]["comfyui"])
+    assert idx["cves"]["cve-2025-67303"] == [str(pocs / "vulhub" / "comfyui" / "CVE-2025-67303")]
+    cve36401 = idx["cves"]["cve-2024-36401"]
+    assert str(pocs / "PoC-in-GitHub" / "2025" / "CVE-2024-36401.json") in cve36401
+    assert str(nuclei / "http" / "cves" / "2025" / "CVE-2024-36401.yaml") in cve36401

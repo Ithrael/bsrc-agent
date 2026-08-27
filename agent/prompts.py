@@ -171,17 +171,24 @@ _DESC_HINTS = (
 )
 
 
-def playbook_for(unique_code: str, description: str = "") -> str:
-    """前缀匹配优先，描述关键词兜底，最后回退 Web playbook（百度靶场 Web 占 67%）。"""
+def playbook_key_for(unique_code: str, description: str = "") -> str:
+    """返回命中的 playbook 键（与 playbook_for 同一路由）：前缀匹配优先，
+    描述关键词兜底，最后回退 Web（百度靶场 Web 占 67%）。
+    claude 模式用键判断「是否注入偏 Web 的通用清单」等题型相关段落。"""
     code = (unique_code or "").lower().replace("-", "").replace("_", "")
-    for prefix, pb in PLAYBOOKS.items():
+    for prefix in PLAYBOOKS:
         if code.startswith(prefix):
-            return pb
+            return prefix
     desc = (description or "").lower()
     for prefix, keywords in _DESC_HINTS:
         if any(k in desc for k in keywords):
-            return PLAYBOOKS[prefix]
-    return PLAYBOOKS["a"]
+            return prefix
+    return "a"
+
+
+def playbook_for(unique_code: str, description: str = "") -> str:
+    """前缀匹配优先，描述关键词兜底，最后回退 Web playbook（百度靶场 Web 占 67%）。"""
+    return PLAYBOOKS[playbook_key_for(unique_code, description)]
 
 
 def global_intel() -> str:

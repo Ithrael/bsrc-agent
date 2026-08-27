@@ -160,6 +160,10 @@ def _extract_urls(text: str, known: set[str]) -> list[str]:
     return found[:4]  # 每次最多 4 个新端点，防噪音
 
 
+# 非 Web 类 playbook（二进制 f / 区块链 h）：claude prompt 不塞偏 Web 的攻击面清单
+# （fix 5：删除无关段落——注册矩阵/权限矩阵/API 枚举对二进制题是纯噪音）
+_NON_WEB_PB = {"f", "h"}
+
 # 端口 → 常见攻击面关键词（通用渗透知识，代码化，供换方向时生成「未尝试攻击面」建议）
 _PORT_SURFACE = {
     80: ["目录枚举", "SQL 注入", "文件上传", "LFI"],
@@ -263,6 +267,7 @@ class WorkerResult:
         self.reason = ""
         self.steps = 0
         self.elapsed_min = 0.0
+        self.meta: dict | None = None  # 事件统计元数据（scheduler events.jsonl 用）
 
 
 def record_harness_solution(code: str, note: str, completed: bool, elapsed_min: float):
@@ -305,6 +310,82 @@ def record_harness_solution(code: str, note: str, completed: bool, elapsed_min: 
                          n[i:i + 1000].replace("\n", " "))
     except OSError:
         pass
+
+
+def _submit_flag_script(ch, ws: str) -> str:
+    """生成 submit_flag.sh（显式提交通道，claude 用 bash 跑脚本获得提交反馈闭环）。
+
+    CLAIM/EVIDENCE 证据闸门 + 格式校验 + 连错/来源干预 + 平台提交 + STATE.md 进度
+    登记。提交与 .flag_wrong/STATE.md 更新用 flock 串行化（同题 6-8 个子 Agent
+    并发提交时防竞争写坏）；容器 Kali 自带 flock，本地 macOS 无 flock 时跳过
+    （本地调试/测试环境没有并发提交者）。
+    进度行 `- flag 进度: N/TOTAL`（从平台响应解析 correct/total_flag_count）供
+    Python drain 周期读取——显式通道提交不进主事件流，这是主进程实时感知
+    「拿全」的唯一通道。"""
+    return (
+        "#!/bin/bash\n"
+        "# 提交 flag（平台 API 直连，bsrc-agent 生成）\n"
+        "# 用法: ./submit_flag.sh <flag> '<RAW EVIDENCE：该 flag 从哪条工具输出读到>'\n"
+        "FLAG=\"$1\"; EVID=\"$2\"\n"
+        "[ -z \"$FLAG\" ] && { echo 'usage: ./submit_flag.sh <flag> \"<RAW EVIDENCE 来源>\"'; exit 1; }\n"
+        "# CLAIM/EVIDENCE 闸门（对标 hxbai 69 flag 仅 4 错提）：第 1 次提交起就要声明证据来源。\n"
+        "# 证据 = 亲眼读到的工具输出（cat /flag、数据库查询、env 等）；推断/拼接/猜测不算。\n"
+        "# 已在 NOTES.md 记录过该 flag 来源的（来源闸门产物）视为已声明，免重复。\n"
+        "if [ ${#EVID} -lt 6 ] && ! grep -Fq \"$FLAG\" NOTES.md 2>/dev/null; then\n"
+        "  echo '[证据拒绝] 请附 RAW EVIDENCE 再提交：'\n"
+        "  echo \"  ./submit_flag.sh $FLAG 'cat /flag.txt 第 3 行输出'\"\n"
+        "  echo '  证据必须来自真实工具输出；推断、拼接、猜测的 flag 禁止提交（省一次必错请求）。'\n"
+        "  exit 1\n"
+        "fi\n"
+        "# 格式校验：平台 flag 两形态——UUID 或 leetspeak（f 系列二进制题），其余疑似猜测拒绝\n"
+        "echo \"$FLAG\" | grep -qiE '^flag\\{([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-z_]{8,64})\\}$' \\\n"
+        "  || { echo '格式拒绝：非合法 flag 形态，请从靶场环境实际读取 flag，不要猜测'; exit 1; }\n"
+        "# flock 串行化（flock 缺失时跳过：本地 macOS 调试/测试无并发提交者）\n"
+        "LOCKED=0\n"
+        "if command -v flock >/dev/null 2>&1; then\n"
+        f"  exec 9>{ws}/.flag_lock\n"
+        "  flock -x 9\n"
+        "  LOCKED=1\n"
+        "fi\n"
+        "# 连错干预（防盲猜空转：run 12019 f2-05 连错 10 次复盘）：连续错 5 次后强提醒\n"
+        f"WRONG=$(cat {ws}/.flag_wrong 2>/dev/null || echo 0)\n"
+        "if [ \"$WRONG\" -ge 5 ]; then\n"
+        "  echo \"⚠️ 本题已连续猜错 $WRONG 次：停止提交无证据的 flag！回到侦察（在**目标环境** find / -maxdepth 3 -name 'flag*' 2>/dev/null、数据库、env——不是自己的解题容器），或拉官方提示（先确认其他线是否已拉过：grep -i 'hint' NOTES.md RELAY.md 2>/dev/null；重复拉会重复扣分）：\"\n"
+        f"  echo \"curl -s -m 15 \\\"$BENCHMARK_BASE_URL/openapi/v1/challenges/hint?unique_code={ch.unique_code}\\\" -H \\\"BENCHMARK_TOKEN: $BENCHMARK_TOKEN\\\"\"\n"
+        "fi\n"
+        "# 来源闸门（对抗校验：连错 ≥3 次后，提交前 NOTES.md 必须已记录该 flag 的来源，"
+        "# 防脚本循环盲猜——循环脚本不会写 NOTES，连续猜 3 次后全被挡）\n"
+        "if [ \"$WRONG\" -ge 3 ]; then\n"
+        "  if ! grep -Fq \"$FLAG\" NOTES.md 2>/dev/null; then\n"
+        "    echo \"❌ 来源闸门：已连续错 $WRONG 次，提交前必须先在 NOTES.md 记录该 flag 的来源：\"\n"
+        "    echo \"   echo '- [flag 来源] $FLAG ← <哪个文件/哪条命令的输出>' >> NOTES.md\"\n"
+        "    echo \"   记录后重试提交。禁止无来源盲猜。\"\n"
+        "    exit 1\n"
+        "  fi\n"
+        "fi\n"
+        "RESP=$(curl -s -m 15 --retry 3 --retry-delay 2 --retry-all-errors -X POST \"$BENCHMARK_BASE_URL/openapi/v1/challenges/submit\" \\\n"
+        "  -H \"BENCHMARK_TOKEN: $BENCHMARK_TOKEN\" \\\n"
+        "  -H \"Content-Type: application/json\" \\\n"
+        f"  -d '{{\"unique_code\": \"{ch.unique_code}\", \"flag\": \"'\"$FLAG\"'\"}}')\n"
+        "echo \"$RESP\"\n"
+        "# 进度解析：平台响应带 correct_flag_count/total_flag_count\n"
+        "N=$(echo \"$RESP\" | grep -o '\"correct_flag_count\"[^0-9]*[0-9]*' | grep -o '[0-9]*$' | head -1)\n"
+        "T=$(echo \"$RESP\" | grep -o '\"total_flag_count\"[^0-9]*[0-9]*' | grep -o '[0-9]*$' | head -1)\n"
+        "# 提交成功自动登记 STATE.md：分治各线实时共享 flag 进度，"
+        "# 不再重复攻已提交的面（会话复盘：重跑线浪费多轮验证 duplicate）。"
+        "# 进度行是 Python drain 的完成判定输入——显式通道提交不进主事件流。"
+        "# 共享文件走绝对路径（脚本经软链从各线子目录执行，相对路径会写错位置）\n"
+        "if echo \"$RESP\" | grep -q '\"correct\": *true'; then\n"
+        f"  echo 0 > {ws}/.flag_wrong\n"
+        f"  echo \"## FACTS\" >> {ws}/STATE.md\n"
+        f"  echo \"- flag 已正确提交: $FLAG ($(date +%H:%M:%S))\" >> {ws}/STATE.md\n"
+        "  if [ -n \"$N\" ] && [ -n \"$T\" ]; then\n"
+        f"    echo \"- flag 进度: $N/$T ($(date +%H:%M:%S))\" >> {ws}/STATE.md\n"
+        "  fi\n"
+        "else\n"
+        f"  echo $((WRONG + 1)) > {ws}/.flag_wrong\n"
+        "fi\n"
+        "if [ \"$LOCKED\" = 1 ]; then flock -u 9; fi\n")
 
 
 class Worker:
@@ -368,6 +449,12 @@ class Worker:
         self._system_prompt = ""
         # 本题 LLM token 消耗（in+out），第一轮 token 熔断用
         self._challenge_tokens = 0
+        # 事件统计元数据（scheduler events.jsonl 实测数据驱动排序，2026-08-27）
+        self._started_wall = time.time()          # 首 flag 偏移量解析 STATE 时间戳用
+        self._first_flag_at: float | None = None  # Python 通道首个正确 flag 的相对秒数
+        self._used_model = ""                     # claude 会话实际使用的模型
+        self._fan_out = 0                         # Task 子 agent 分治方向数
+        self._tokens_used = 0                     # harness 会话累计 token
         # Cairn 式 explore 切片状态（run 8900 复盘落地）：
         self._segment_no = 0                # 当前段号（elapsed // 段长）
         self._segment_start_facts = 0       # 本段开始时 STATE.md FACTS 行数（无进展判定）
@@ -408,6 +495,8 @@ class Worker:
                 # 同题多 Agent 可能同时提交同一个 flag，重复递增会把 2/3 误判成 3/3。
                 # 正常 submit 响应会用平台返回的 correct_flag_count 校准计数。
                 self.submitter.record(flag, True, 0)
+                if self._first_flag_at is None:
+                    self._first_flag_at = time.monotonic() - self.started
                 if self.submitter.completed:
                     self._completion_event.set()
                 return f"[duplicate] 该 flag 此前已正确提交过。"
@@ -415,6 +504,8 @@ class Worker:
                     f"read_file {_API_DOC_PATH} 后用 platform_api 工具按文档自行适配提交。")
         self.submitter.record(flag, res.correct, res.awarded, res.correct_flag_count)
         if res.correct:
+            if self._first_flag_at is None:
+                self._first_flag_at = time.monotonic() - self.started
             log.info("[%s] FLAG 正确 +%d (%d/%d)", self.ch.unique_code, res.awarded,
                      res.correct_flag_count, res.total_flag_count)
             # 结构化状态：flag 进度是双 worker 分工与防漏面的最关键事实
@@ -1167,6 +1258,114 @@ class Worker:
             pass
         return flags
 
+    def _state_flag_progress(self) -> tuple[int, int] | None:
+        """STATE.md 里本 attempt 最新一条 flag 进度行（`- flag 进度: N/TOTAL (HH:MM:SS)`）。
+
+        只认带时间戳且晚于本 attempt 开始的行：STATE.md 跨 attempt 持久，上轮
+        残留的进度行（如 3/4）不能当本轮进度——flag 每轮重新生成，上轮 3/4 ≠
+        本轮 3/4，误信会虚增计数或误触发完成。时间戳由 submit_flag.sh 写入；
+        无时间戳的初始行/Python 通道行不做完成判定（Python 通道的提交器本身
+        就是准的）。"""
+        try:
+            with open(self.state_path) as f:
+                lines = f.read().splitlines()
+        except OSError:
+            return None
+        wall0 = getattr(self, "_started_wall", time.time())
+        for line in reversed(lines):
+            m = re.search(r"flag 进度:\s*(\d+)/(\d+)\s*\((\d{2}:\d{2}:\d{2})\)", line)
+            if not m:
+                continue
+            try:
+                t = time.mktime(time.strptime(
+                    time.strftime("%Y-%m-%d ") + m.group(3), "%Y-%m-%d %H:%M:%S"))
+            except ValueError:
+                continue
+            if t < wall0 - 5:        # 本 attempt 之前的残留行：跳过
+                continue
+            return int(m.group(1)), int(m.group(2))
+        return None
+
+    def _first_flag_offset(self) -> float | None:
+        """首 flag 到手的相对秒数（events.jsonl 用）：Python 提交通道用内存
+        时间戳（_first_flag_at）；script 显式通道解析 STATE.md 登记行里的
+        HH:MM:SS 时间戳（与 _started_wall 求差，跨午夜 +86400 兜底）。
+        两条通道都拿不到返回 None。"""
+        if getattr(self, "_first_flag_at", None) is not None:
+            return round(self._first_flag_at, 1)
+        try:
+            with open(self.state_path) as f:
+                lines = f.read().splitlines()
+        except OSError:
+            return None
+        wall0 = getattr(self, "_started_wall", time.time())
+        for line in lines:
+            if "flag 已正确提交" not in line:
+                continue
+            m = re.search(r"(\d{2}):(\d{2}):(\d{2})", line)
+            if not m:
+                continue
+            try:
+                t = time.mktime(time.strptime(
+                    time.strftime("%Y-%m-%d ") + m.group(0), "%Y-%m-%d %H:%M:%S"))
+            except ValueError:
+                continue
+            if t < wall0 - 5:
+                continue  # 上轮残留的登记行（STATE.md 跨 attempt 持久），不算本轮
+            off = t - wall0
+            if off < 0:
+                off += 86400  # 跨午夜兜底
+            return max(0.0, round(off, 1))
+        return None
+
+    def _relay_primitives(self) -> int:
+        """RELAY.md 已达成原语计数（非「无」占位行）——渗透深度粗粒度代理指标。"""
+        ws = getattr(self, "ws", "")
+        try:
+            with open(os.path.join(ws, "RELAY.md")) as f:
+                lines = f.read().splitlines()
+        except OSError:
+            return 0
+        n = 0
+        for ln in lines:
+            s = ln.strip()
+            if not s.startswith("已达成原语"):
+                continue
+            if ":" in s and "无" in s.split(":", 1)[1] and "<" not in s:
+                continue  # 蒸馏空块的「已达成原语: 无」占位不算
+            n += 1
+        return n
+
+    def _run_meta(self) -> dict:
+        """事件统计元数据（scheduler events.jsonl 实测数据排序用，fix 6）：
+        模型/fan-out/token/首 flag 相对秒数/已达成原语数。"""
+        return {
+            "model": getattr(self, "_used_model", "") or self.cfg.llm_model,
+            "fan_out": getattr(self, "_fan_out", 0),
+            "tokens": getattr(self, "_tokens_used", 0),
+            "first_flag_s": self._first_flag_offset(),
+            "primitives": self._relay_primitives(),
+        }
+
+    async def _sync_state_progress(self):
+        """读 STATE.md 进度行校准提交器并判断拿全（2026-08-27 修复：Task 子 agent
+        的 submit_flag.sh 显式通道提交不进 Python 事件流，此前完成事件不触发、
+        主进程与其他子 agent 继续烧时间直到 Claude 自己退出——STATE.md 进度行
+        是主进程实时感知「拿全」的唯一通道）；拿全立即置 _completion_event，
+        run_harness 杀主进程组提前收工，不等超时。"""
+        if self.submitter.completed:
+            return
+        prog = self._state_flag_progress()
+        if not prog or prog[1] <= 0:
+            return
+        n, total = prog
+        if n > self.submitter.correct_count:
+            self.submitter.correct_count = min(total, n)
+        if n >= total or self.submitter.completed:
+            log.info("[%s] STATE.md 进度 %d/%d：全部 flag 已入账，触发提前收工",
+                     self.ch.unique_code, n, total)
+            self._completion_event.set()
+
     async def _settle_claude_flags(self):
         """claude 会话收尾统一记账：事件流捕获 + STATE.md 登记行都过提交闸门。"""
         await self._submit_harness_flags()
@@ -1179,15 +1378,18 @@ class Worker:
                     break
 
     async def _drain_harness_flags(self):
-        """harness 运行期间周期提交已捕获 flag。
+        """harness 运行期间周期提交已捕获 flag + 读 STATE.md 进度（submit_flag.sh
+        显式通道写入）。
 
         on_text 是同步回调只能收集不能 await；harness 长跑（hard 双线 30min）时若等到
         结束才提交，flag 早已在事件流里出现过却白等——10585 复盘 e3-04 超时后挖出的
         flag 是 duplicate。drain 每 _drain_interval_s 提交一轮，flag 一到手立刻入账。
-        """
+        同时 _sync_state_progress 兜住显式通道：子 agent 提交最后一面 → STATE.md
+        更新 → 完成事件置位杀主进程，主进程/其他子 agent 不再空烧。"""
         while True:
             await asyncio.sleep(self._drain_interval_s)
             await self._submit_harness_flags()
+            await self._sync_state_progress()
 
     async def _run_harness_with_drain(self, prompt: str, timeout_s: int, **kw):
         """带实时 flag 提交与完成早停的 harness 包装。
@@ -1330,7 +1532,16 @@ class Worker:
 
     def _build_claude_prompt(self, ch, sol, notes, has_completed_sol, desc_hints,
                              recon_report: str = "", role_extra: str = "") -> str:
-        """claude 直接解题的初始 prompt：题目 + CVE/端口线索 + 解法库 + 预侦察 + 行动纪律。"""
+        """claude 直接解题的初始 prompt：题目 + 分类作战手册 + CVE/端口线索 +
+        解法库 + 预侦察 + 行动纪律。
+
+        2026-08-27 修复：此前默认生产路径（CLAUDE_WORKER=1）不调用 playbook_for()，
+        分类策略只服务裸 LLM 路径，claude 收到的是一份偏 Web 的通用清单——现在按
+        分类注入对应 playbook；二进制/区块链等非 Web 类题目不再塞 Web 攻击面清单。
+        """
+        # 分类作战手册：与裸 LLM 路径同一路由（prompts.playbook_for），按题型注入
+        pb_key = prompts.playbook_key_for(ch.unique_code, ch.description or "")
+        playbook = prompts.PLAYBOOKS.get(pb_key, prompts.PLAYBOOKS["a"])
         parts = ["你是一名顶级自动化渗透测试 Agent，正在 Tsecbench 评测环境中独立解一道安全挑战题。"
                  "全程无人工干预：自主完成侦察、分析、漏洞利用，获取 flag。",
                  f"## 题目\n- 编号: {ch.unique_code}\n- 描述: {ch.description or '(无)'}\n"
@@ -1351,6 +1562,8 @@ class Worker:
         port_hints = self._port_hints()
         if port_hints:
             parts.append("## 端口线索（目标端口命中已知攻击面，直接参考）\n" + "\n".join(f"- {h}" for h in port_hints))
+        # 分类作战手册注入（fix 5：生产路径复用 prompts 的 Web/二进制/云/AI/区块链策略）
+        parts.append(f"## 分类作战手册（本类题型速查，先读再做）\n{playbook.strip()}")
         # 全局情报（intel.json + .new JSONL，跨题共享实测结论：解一题惠全题，claude 模式注入）
         from .config import read_intel
         intel = read_intel()
@@ -1403,21 +1616,31 @@ class Worker:
             "用 bash 追加 JSON 行：`echo '{\"<标题>\": \"<内容>\"}' >> " + intel_lib_path() + ".new`"
             "——后续所有题自动注入，解一题惠全题。")
         parts.append(
-            "## 攻击面清单（按序执行，勿跳步——对标榜首 agent 的强制方法论）\n"
-            "1. **先读工作区历史**：RELAY.md（接力块：原语/死路/下一步，最优先）、HOSTS.md（资产台账：主机/凭据/flag 状态）、NOTES.md（已有发现）、"
-            "STATE.md（断点/已排除）、TRANSCRIPT.md（命令日志）、scripts/（可复用脚本）——不重做已做的事。\n"
-            "2. **指纹优先不盲扫**：curl 首页/robots.txt/响应头判断产品框架；"
-            "已知组件（泛微/致远/Shiro/Log4j/Struts2/ThinkPHP 等）直接查公开 PoC。\n"
-            "3. **云环境必查**：curl -s http://169.254.169.254/latest/meta-data/ 和 "
-            "http://metadata.tencentyun.com/latest/meta-data/（IMDS 凭证/元数据泄露）。\n"
-            "4. **注册账号矩阵**：有注册/登录功能就注册 2+ 账号（test1@test.com/Test123456!），"
-            "凭证立即写 NOTES.md；无注册页则试默认凭证（admin/admin、admin/123456、test/test）。\n"
-            "5. **权限测试矩阵**（拿到任意账号后）：水平越权（A 会话访问 B 资源，改 URL 中 ID）；"
-            "垂直越权（普通用户打 /admin/*、/api/admin/*）；未认证访问（不带会话打需登录接口）；"
-            "参数篡改（role=admin、JWT claims 修改）。\n"
-            "6. **API 枚举**：/api/v1/*、/api/user/*、/api/admin/* 等前端不暴露的隐藏端点。\n"
-            "7. **横向移动**（拿到凭证/Shell 后）：看网卡与内网网段，sshpass 尝试 SSH、"
-            "nc 探测常见端口，逐台主机重复 2-6 步。")
+            "## 执行环境区分（强制：打错地方等于白打）\n"
+            "你的 shell 是**解题容器**，不是目标。对目标环境的一切操作必须经漏洞通道执行："
+            "命令注入/RCE 的 shell、WebShell、SSRF（file:///http://）、`sshpass -p <pass> "
+            "ssh user@target 'cmd'`、反弹 shell。`curl 169.254.169.254`、`find / -name flag*`、"
+            "`cat /flag`、`ip addr`、`cat /etc/hosts` 这类涉及目标文件系统/元数据/内网的命令，"
+            "执行前先想清楚它在哪台机器上跑——打在自己容器里只会看到自己容器的元数据，"
+            "永远拿不到目标 flag。")
+        if pb_key not in _NON_WEB_PB:
+            parts.append(
+                "## 攻击面清单（按序执行，勿跳步——对标榜首 agent 的强制方法论）\n"
+                "1. **先读工作区历史**：RELAY.md（接力块：原语/死路/下一步，最优先）、HOSTS.md（资产台账：主机/凭据/flag 状态）、NOTES.md（已有发现）、"
+                "STATE.md（断点/已排除）、TRANSCRIPT.md（命令日志）、scripts/（可复用脚本）——不重做已做的事。\n"
+                "2. **指纹优先不盲扫**：curl 首页/robots.txt/响应头判断产品框架；"
+                "已知组件（泛微/致远/Shiro/Log4j/Struts2/ThinkPHP 等）直接查公开 PoC。\n"
+                "3. **云环境必查（从目标发起，不是解题容器）**：拿到 SSRF/命令执行/RCE 后，"
+                "从**目标环境** curl -s http://169.254.169.254/latest/meta-data/ 和 "
+                "http://metadata.tencentyun.com/latest/meta-data/（IMDS 凭证/元数据泄露）。\n"
+                "4. **注册账号矩阵**：有注册/登录功能就注册 2+ 账号（test1@test.com/Test123456!），"
+                "凭证立即写 NOTES.md；无注册页则试默认凭证（admin/admin、admin/123456、test/test）。\n"
+                "5. **权限测试矩阵**（拿到任意账号后）：水平越权（A 会话访问 B 资源，改 URL 中 ID）；"
+                "垂直越权（普通用户打 /admin/*、/api/admin/*）；未认证访问（不带会话打需登录接口）；"
+                "参数篡改（role=admin、JWT claims 修改）。\n"
+                "6. **API 枚举**：/api/v1/*、/api/user/*、/api/admin/* 等前端不暴露的隐藏端点。\n"
+                "7. **横向移动**（拿到凭证/Shell 后）：看网卡与内网网段，sshpass 尝试 SSH、"
+                "nc 探测常见端口，逐台主机重复 2-6 步。")
         parts.append(
             "## 工具用法速查（容器已装，直接按此使用）\n"
             "- 端口扫描: nmap -Pn -T3 --max-rate 400 <target>\n"
@@ -1462,53 +1685,7 @@ class Worker:
         submit_sh = os.path.join(self.ws, "submit_flag.sh")
         if not os.path.exists(submit_sh):
             with open(submit_sh, "w") as f:
-                f.write("#!/bin/bash\n# 提交 flag（平台 API 直连，bsrc-agent 生成）\n"
-                        "# 用法: ./submit_flag.sh <flag> '<RAW EVIDENCE：该 flag 从哪条工具输出读到>'\n"
-                        "FLAG=\"$1\"; EVID=\"$2\"\n"
-                        "[ -z \"$FLAG\" ] && { echo 'usage: ./submit_flag.sh <flag> \"<RAW EVIDENCE 来源>\"'; exit 1; }\n"
-                        "# CLAIM/EVIDENCE 闸门（对标 hxbai 69 flag 仅 4 错提）：第 1 次提交起就要声明证据来源。\n"
-                        "# 证据 = 亲眼读到的工具输出（cat /flag、数据库查询、env 等）；推断/拼接/猜测不算。\n"
-                        "# 已在 NOTES.md 记录过该 flag 来源的（来源闸门产物）视为已声明，免重复。\n"
-                        "if [ ${#EVID} -lt 6 ] && ! grep -Fq \"$FLAG\" NOTES.md 2>/dev/null; then\n"
-                        "  echo '[证据拒绝] 请附 RAW EVIDENCE 再提交：'\n"
-                        "  echo \"  ./submit_flag.sh $FLAG 'cat /flag.txt 第 3 行输出'\"\n"
-                        "  echo '  证据必须来自真实工具输出；推断、拼接、猜测的 flag 禁止提交（省一次必错请求）。'\n"
-                        "  exit 1\n"
-                        "fi\n"
-                        "# 格式校验：平台 flag 两形态——UUID 或 leetspeak（f 系列二进制题），其余疑似猜测拒绝\n"
-                        "echo \"$FLAG\" | grep -qiE '^flag\\{([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-z_]{8,64})\\}$' \\\n"
-                        "  || { echo '格式拒绝：非合法 flag 形态，请从靶场环境实际读取 flag，不要猜测'; exit 1; }\n"
-                        "# 连错干预（防盲猜空转：run 12019 f2-05 连错 10 次复盘）：连续错 5 次后强提醒\n"
-                        f"WRONG=$(cat {self.ws}/.flag_wrong 2>/dev/null || echo 0)\n"
-                        "if [ \"$WRONG\" -ge 5 ]; then\n"
-                        "  echo \"⚠️ 本题已连续猜错 $WRONG 次：停止提交无证据的 flag！回到侦察（find / -maxdepth 3 -name 'flag*' 2>/dev/null、数据库、env），或拉官方提示（先确认其他线是否已拉过：grep -i 'hint' NOTES.md RELAY.md 2>/dev/null；重复拉会重复扣分）：\"\n"
-                        "  echo \"curl -s -m 15 \\\"$BENCHMARK_BASE_URL/openapi/v1/challenges/hint?unique_code={ch.unique_code}\\\" -H \\\"BENCHMARK_TOKEN: $BENCHMARK_TOKEN\\\"\"\n"
-                        "fi\n"
-                        "# 来源闸门（对抗校验：连错 ≥3 次后，提交前 NOTES.md 必须已记录该 flag 的来源，"
-                        "# 防脚本循环盲猜——循环脚本不会写 NOTES，连续猜 3 次后全被挡）\n"
-                        "if [ \"$WRONG\" -ge 3 ]; then\n"
-                        "  if ! grep -Fq \"$FLAG\" NOTES.md 2>/dev/null; then\n"
-                        "    echo \"❌ 来源闸门：已连续错 $WRONG 次，提交前必须先在 NOTES.md 记录该 flag 的来源：\"\n"
-                        "    echo \"   echo '- [flag 来源] $FLAG ← <哪个文件/哪条命令的输出>' >> NOTES.md\"\n"
-                        "    echo \"   记录后重试提交。禁止无来源盲猜。\"\n"
-                        "    exit 1\n"
-                        "  fi\n"
-                        "fi\n"
-                        "RESP=$(curl -s -m 15 --retry 3 --retry-delay 2 --retry-all-errors -X POST \"$BENCHMARK_BASE_URL/openapi/v1/challenges/submit\" \\\n"
-                        "  -H \"BENCHMARK_TOKEN: $BENCHMARK_TOKEN\" \\\n"
-                        "  -H \"Content-Type: application/json\" \\\n"
-                        f"  -d '{{\"unique_code\": \"{ch.unique_code}\", \"flag\": \"'\"$FLAG\"'\"}}')\n"
-                        "echo \"$RESP\"\n"
-                        "# 提交成功自动登记 STATE.md：分治各线实时共享 flag 进度，"
-                        "# 不再重复攻已提交的面（会话复盘：重跑线浪费多轮验证 duplicate）\n"
-                        "# 共享文件走绝对路径（脚本经软链从各线子目录执行，相对路径会写错位置）\n"
-                        "if echo \"$RESP\" | grep -q '\"correct\": *true'; then\n"
-                        f"  echo 0 > {self.ws}/.flag_wrong\n"
-                        f"  echo \"## FACTS\" >> {self.ws}/STATE.md\n"
-                        f"  echo \"- flag 已正确提交: $FLAG\" >> {self.ws}/STATE.md\n"
-                        "else\n"
-                        f"  echo $((WRONG + 1)) > {self.ws}/.flag_wrong\n"
-                        "fi\n")
+                f.write(_submit_flag_script(ch, self.ws))
             os.chmod(submit_sh, 0o755)
 
         # 解法库 / 专家复盘 / CVE 线索
@@ -1555,6 +1732,7 @@ class Worker:
         #   复现题 pro 双线烧满 30min 超时，事后挖出 flag 却是 duplicate，纯浪费）
         use_hard_model = (ch.difficulty == "hard" or self.attempt >= 1) and not has_completed_sol
         hard_model = self.cfg.llm_model_hard if use_hard_model else ""
+        self._used_model = hard_model or self.cfg.llm_model
         # effort 分级（run 12464 复盘：pro 全场 reasoning=0——探测超时被降级导致
         # 思考预算全丢，只买到知识没买到思考）：
         # - medium/hard：全程 effort max（攻坚深度优先）
@@ -1607,7 +1785,7 @@ class Worker:
             "D": ("独立侦察", "走与其它线完全不同的路径（非 Web 端口/云元数据/供应链依赖/隐藏接口），"
                              "发现关键线索立即写 NOTES.md。"),
             "E": ("CVE 专攻", "对已识别的组件指纹查 searchsploit/公开 PoC 直接利用。"),
-            "F": ("云与逃逸", "IMDS 凭证（169.254.169.254）/docker.sock/k8s API/容器逃逸路径专项。"),
+            "F": ("云与逃逸", "IMDS 凭证（从目标发起 169.254.169.254，非解题容器）/docker.sock/k8s API/容器逃逸路径专项。"),
             "G": ("横向-凭证攻击", "把所有已收集凭据写进 /opt/tools/creds.txt，对 HOSTS.md 台账"
                                   "逐台跑 /opt/tools/creds_replay.sh（SSH/管理端口批量重放）；"
                                   "盲区用 fscan -h <网段> 补扫（存活/弱口令/常见漏洞），"
@@ -1629,6 +1807,7 @@ class Worker:
                                          # 竞品 24 路并发 = 同题多路独立试错）
             else:
                 line_keys = "ABCDEF"     # medium 单 flag：6 线独立攻克
+            self._fan_out = len(line_keys)  # 事件统计：本轮分治方向数
             if ch.flag_count >= 2:
                 # 多 flag 题：方向分工（内网链需要协作，b 系列已验证）
                 subtask_table = "\n".join(
@@ -1660,7 +1839,9 @@ class Worker:
                 "清单都在里面，只做别人没做的事，别重复已排除方向或已打下的面\n"
                 "   - 共享文件只追加且带线名前缀：`echo '- [X线] <发现>' >> NOTES.md`"
                 "（RELAY.md、HOSTS.md 台账、STATE.md 的 INTENTS/ELIMINATED 同理），禁止重排/覆盖他人内容\n"
-                "   - 拿到 flag 立即用 bash 执行 `./submit_flag.sh <flag>` 提交\n"
+                "   - 拿到 flag 立即用 bash 执行 `./submit_flag.sh <flag> '<RAW EVIDENCE：'"
+                "该 flag 从哪条工具输出读到>'` 提交——证据参数是强制闸门（脚本会拒绝"
+                "无证据提交，如 `./submit_flag.sh flag{...} 'cat /challenge/flag.txt 输出'`）\n"
                 f"{handoff_line}"
                 "   - 结束前返回三行总结：已达成原语 / 已证死路 / 下一步\n"
                 "4. 子 agent 全部返回后：读它们的总结与 NOTES.md 新增，判断还缺哪几面 flag，"
@@ -1677,9 +1858,10 @@ class Worker:
                 # 把实测有效的优先级固化进公共指令）
                 master_role += (
                     "\n\n## 多 flag 题专项清单（派发子 agent 时按需注入对应方向）\n"
-                    "1. **本机直读最优先**：`ls /challenge/ /flag* 2>/dev/null; "
+                    "1. **本机直读最优先（命令必须在目标主机上跑，不是自己的解题容器）**："
+                    "`ls /challenge/ /flag* 2>/dev/null; "
                     "find / -maxdepth 3 -name 'flag*' 2>/dev/null`——多面 flag 常挂 /challenge/flagN.txt，"
-                    "拿到任意文件读取/RCE 后先逐个直读提交，比打内网快得多。\n"
+                    "拿到任意文件读取/RCE 后在目标环境执行并逐个直读提交，比打内网快得多。\n"
                     "2. **画内网拓扑**：`ip addr; ip route; cat /etc/hosts; arp -a`——"
                     "docker 网段常见 172.17-31.0/24，记下本机地址与网关。\n"
                     "3. **内网存活扫描**：`fscan -h <网段> -nopoc` 一把梭（存活/端口/弱口令）；"
@@ -1692,7 +1874,8 @@ class Worker:
                     "6. **隧道穿透**：需要全工具打内网时 chisel（目标: `./chisel server -p 8000 --reverse`；"
                     "本地: `chisel client http://目标:8000 r:socks` 后 proxychains4 走 127.0.0.1:1080）"
                     "或 `ssh -D 1080 user@跳板` 等价。\n"
-                    "7. 每台新主机重复 1-6 并跑 flag_sweep.sh；每面 flag 一到手立即 ./submit_flag.sh，"
+                    "7. 每台新主机重复 1-6 并跑 flag_sweep.sh；每面 flag 一到手立即"
+                    " `./submit_flag.sh <flag> '<证据>'`（证据=读到的工具输出，无证据会被脚本闸门拒绝），"
                     "然后继续下一面；台账同步更新。")
             # 主进程 cwd = 工作区根；子 agent 约定目录先建好。
             # 共享文件软链进各 line 目录（f54063c 重构曾误删，2026-08-24 review 恢复）：
@@ -1716,6 +1899,7 @@ class Worker:
             res = await self._run_harness_with_drain(prompt, timeout_s,
                                     on_text=self._harness_on_text, token_budget=token_budget,
                                     model=hard_model, effort=hard_effort)
+            self._tokens_used += res.total_tokens
         else:
             prompt = self._build_claude_prompt(ch, sol, notes, has_completed_sol, desc_hints, recon_report, "")
             if self.attempt >= 1:
@@ -1726,6 +1910,7 @@ class Worker:
             res = await self._run_harness_with_drain(prompt, timeout_s,
                                     on_text=self._harness_on_text, token_budget=token_budget,
                                     model=hard_model, effort=hard_effort)
+            self._tokens_used += res.total_tokens
         # 收尾统一记账（输出捕获 + STATE.md 登记行兜底：submit_flag.sh 显式通道
         # 走平台直连，Python 侧 submitter 只能靠这两条路径感知完成）
         await self._settle_claude_flags()
@@ -1753,6 +1938,7 @@ class Worker:
             res.collected += "\n===== 断点重跑 =====\n" + res2.digest()
             res.events += res2.events
             res.total_tokens += res2.total_tokens
+            self._tokens_used += res2.total_tokens
             await self._settle_claude_flags()
 
         # 会话结束蒸馏（hxbai 模式）：未拿全时蒸馏接力块，短会话轮转不丢断点
@@ -1782,6 +1968,7 @@ class Worker:
                                    ensure_ascii=False) + "\n")
         except OSError:
             pass
+        self.result.meta = self._run_meta()
         return self.result
 
     def _record_claude_solution(self, res):
@@ -2176,6 +2363,7 @@ class Worker:
             self.result.score = self.submitter.score
             self.result.flags = sorted(self.submitter.correct)
             self._dump_notes_tail()
+        self.result.meta = self._run_meta()
         return self.result
 
     def _facts_summary(self) -> str:
