@@ -1010,7 +1010,9 @@ def test_record_harness_solution(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_submit_flag_sh_real_execution(tmp_path):
     """真实执行 submit_flag.sh（不是只 grep 源码）：无证据被证据闸门拒绝（exit≠0）；
-    带证据提交成功并登记 STATE.md「flag 已正确提交」+「flag 进度: 1/1」。"""
+    带证据提交成功并登记 STATE.md「flag 已正确提交」+「flag 进度: 1/1」。
+    从 line 子目录执行（13174 实测场景：claude bash 换目录跑，相对路径拼错）——
+    修复后 .flag_lock/.flag_wrong/STATE.md 仍落在工作区根。"""
     import subprocess
     srv = make_server()
     host, port = srv.server_address
@@ -1023,23 +1025,40 @@ async def test_submit_flag_sh_real_execution(tmp_path):
     sh = ws / "submit_flag.sh"
     sh.write_text(worker_mod._submit_flag_script(ch, str(ws)))
     sh.chmod(0o755)
+    sub = ws / "line_A"
+    sub.mkdir()
     env = {"BENCHMARK_BASE_URL": f"http://{host}:{port}",
            "BENCHMARK_TOKEN": TOKEN,
            "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
     # 无证据 → 闸门拒绝，不打平台（mock 的 correct 计数不变）
     r1 = subprocess.run(["bash", str(sh), "flag{mock_flag_01}"],
-                        cwd=ws, env=env, capture_output=True, text=True)
+                        cwd=sub, env=env, capture_output=True, text=True)
     assert r1.returncode != 0
     assert "证据拒绝" in r1.stdout
     # 带证据 → 成功 + STATE.md 双行登记（进度行是 Python drain 完成判定的输入）
     r2 = subprocess.run(["bash", str(sh), "flag{mock_flag_01}", "cat /flag 第一行输出"],
-                        cwd=ws, env=env, capture_output=True, text=True)
+                        cwd=sub, env=env, capture_output=True, text=True)
     assert r2.returncode == 0, r2.stdout
     assert '"correct": true' in r2.stdout
     state = (ws / "STATE.md").read_text()
     assert "flag 已正确提交: flag{mock_flag_01}" in state
     assert "flag 进度: 1/1" in state
+    assert (ws / ".flag_wrong").read_text().strip() == "0"
     await TsecClient(f"http://{host}:{port}", TOKEN).close()
+
+
+def test_submit_flag_script_embeds_absolute_paths():
+    """脚本内嵌的共享文件路径必须绝对化（13174 实测 bug：RUN_DIR 相对路径 +
+    claude bash 换目录执行 → .flag_lock/STATE.md 写到不存在的深层路径，
+    flock/连错计数/显式通道完成判定全失效）。"""
+    ch = Challenge.from_dict({"unique_code": "x-01", "flag_count": 1,
+                              "total_score": 100, "difficulty": "easy"})
+    src = worker_mod._submit_flag_script(ch, "runs/20260827-125035/f1-05")
+    abs_ws = os.path.abspath("runs/20260827-125035/f1-05")
+    assert f">{abs_ws}/.flag_lock" in src
+    assert f"> {abs_ws}/.flag_wrong" in src       # echo 0 > path（带空格）
+    assert f">> {abs_ws}/STATE.md" in src
+    assert f"cat {abs_ws}/.flag_wrong" in src
 
 
 @pytest.mark.asyncio

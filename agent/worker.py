@@ -322,6 +322,11 @@ def _submit_flag_script(ch, ws: str) -> str:
     进度行 `- flag 进度: N/TOTAL`（从平台响应解析 correct/total_flag_count）供
     Python drain 周期读取——显式通道提交不进主事件流，这是主进程实时感知
     「拿全」的唯一通道。"""
+    # ws 绝对化（2026-08-27 修复 13174 实测 bug）：run_dir 默认相对路径时脚本
+    # 嵌入的 .flag_lock/.flag_wrong/STATE.md 也会是相对路径，claude bash 在题目
+    # 目录/line 子目录执行后拼成不存在的深层路径——flock 失效、连错计数失效、
+    # STATE 进度登记失效（显式通道完成判定链断）。绝对路径与 bash cwd 无关。
+    ws = os.path.abspath(ws or ".")
     return (
         "#!/bin/bash\n"
         "# 提交 flag（平台 API 直连，bsrc-agent 生成）\n"

@@ -82,7 +82,11 @@ async def _amain() -> int:
     from .tsec_api import TsecClient
 
     cfg = Config()
-    run_dir = cfg.run_dir or os.path.join("runs", time.strftime("%Y%m%d-%H%M%S"))
+    # run_dir 绝对化（2026-08-27 修复）：默认相对路径 runs/... 会让 worker 工作区
+    # 也是相对路径，submit_flag.sh 里嵌入的 .flag_lock/.flag_wrong/STATE.md 路径
+    # 在 claude bash 换目录执行时拼成不存在的深层路径（13174 实测 flock Bad
+    # file descriptor + STATE.md No such file，显式通道完成判定整链失效）
+    run_dir = os.path.abspath(cfg.run_dir or os.path.join("runs", time.strftime("%Y%m%d-%H%M%S")))
     _setup_logging(run_dir)
     log = logging.getLogger("main")
 
