@@ -6,9 +6,11 @@
 from __future__ import annotations
 
 import asyncio
+import glob
 import json
 import logging
 import os
+import re
 import threading
 import time
 
@@ -49,18 +51,10 @@ def _challenge_completed(ch: Challenge) -> bool:
     )
 
 
-def _load_events(run_dir: str) -> dict[str, dict]:
-    """读 events.jsonl 聚合成每题统计：attempts / completed / p50（完整解出耗时
-    中位数，只统计解出的 attempt）/ solve_prob。损坏/缺失返回空 dict——这是
-    增强项不是前置依赖（fix 6：实测数据驱动排序替代部分硬编码阈值）。"""
+def _aggregate_events(events: list[dict]) -> dict[str, dict]:
+    """events.jsonl 行聚合成每题统计：attempts / completed / p50（完整解出耗时
+    中位数，只统计解出的 attempt）/ solve_prob。"""
     stats: dict[str, dict] = {}
-    if not run_dir:
-        return stats
-    try:
-        with open(os.path.join(run_dir, "events.jsonl")) as f:
-            events = [json.loads(l) for l in f if l.strip()]
-    except (OSError, ValueError):
-        return stats
     for e in events:
         code = e.get("challenge")
         if not code:
@@ -76,6 +70,52 @@ def _load_events(run_dir: str) -> dict[str, dict]:
         st["p50"] = d[len(d) // 2] if d else None
         st["solve_prob"] = st["completed"] / st["attempts"]
     return stats
+
+
+def _read_events(path: str) -> list[dict]:
+    try:
+        with open(path) as f:
+            return [json.loads(l) for l in f if l.strip()]
+    except (OSError, ValueError):
+        return []
+
+
+def _load_events(run_dir: str) -> dict[str, dict]:
+    """读本轮 events.jsonl 聚合。损坏/缺失返回空 dict——这是增强项不是前置依赖
+    （fix 6：实测数据驱动排序替代部分硬编码阈值）。"""
+    if not run_dir:
+        return {}
+    return _aggregate_events(_read_events(os.path.join(run_dir, "events.jsonl")))
+
+
+_RUN_DIR_TS_RE = re.compile(r"^\d{8}-\d{6}$")   # main.py 默认 runs/<时间戳> 布局
+
+
+def _load_cross_run_events(run_dir: str, lookback: int = 5) -> dict[str, dict]:
+    """跨轮合并：本轮 + 同级最近 lookback 个 run 目录的 events.jsonl 一起聚合。
+
+    run_dir 每轮新建（main.py runs/<时间戳>），此前第 2 轮开局 _events={}，
+    solve_prob/p50/零分降权全部归零、只能靠难度硬编码起步——两轮赛制的第 2 轮
+    从第 0 分钟就该带着第 1 轮的实测排序。只认时间戳命名的同级目录：测试的
+    tmp 目录 / RUN_DIR 自定义路径按字面语义单轮处理（防误并无关数据）。
+    沙箱托管单轮无同级目录，等价单轮聚合。"""
+    if not run_dir:
+        return {}
+    events = _read_events(os.path.join(run_dir, "events.jsonl"))
+    if not _RUN_DIR_TS_RE.match(os.path.basename(os.path.normpath(run_dir))):
+        return _aggregate_events(events)
+    cur = os.path.abspath(os.path.join(run_dir, "events.jsonl"))
+    parent = os.path.dirname(cur)
+    try:
+        siblings = sorted(
+            (p for p in glob.glob(os.path.join(parent, "*", "events.jsonl"))
+             if os.path.abspath(p) != cur),
+            key=os.path.getmtime, reverse=True)[:lookback]
+    except OSError:
+        siblings = []
+    for p in siblings:
+        events.extend(_read_events(p))
+    return _aggregate_events(events)
 
 
 def _priority(ch: Challenge, round_num: int = 2,
@@ -144,8 +184,8 @@ class Scheduler:
         self.retry_queue: list[Challenge] = []
         self.done: dict[str, dict] = {}
         self.running: dict[str, asyncio.Task] = {}
-        # 实测事件统计（events.jsonl 聚合）：选题优先级从历史数据学习
-        self._events: dict[str, dict] = _load_events(run_dir) if run_dir else {}
+        # 实测事件统计（events.jsonl 聚合，跨轮合并最近 5 轮）：选题优先级从历史数据学习
+        self._events: dict[str, dict] = _load_cross_run_events(run_dir) if run_dir else {}
         # 平台题目槽位硬上限为 3；即使环境变量误填更大，也不能把 start 打爆。
         self.effective_max = min(_PLATFORM_MAX_CONCURRENT, max(1, cfg.max_concurrent))
         self._sem = asyncio.Semaphore(self.effective_max)
@@ -172,6 +212,13 @@ class Scheduler:
         self._last_progress_ts = time.monotonic()  # 最近一次 flag 增长的墙钟时间
         self._last_boost_ts = 0.0            # 上次掉速插队时间（20min 冷却防反复插同一题）
         self._last_stagnate_check = 0.0      # 上次掉速检查墙钟时间
+        # 空槽回查节流（P0）：pending/retry 双空但有任务在跑时，60s 一次平台回查
+        # 把可回挖题（no_progress/钉子/平台侧新题）带回补空槽
+        self._last_idle_recheck_ts = 0.0
+        # 停滞抢占（P1）：在跑 attempt 的 (采样时刻, flag数, FACTS数)——任一变化
+        # 重置计时；零 flag 零新 FACTS 持续 ≥2×boost 窗口的 attempt 被 cancel 轮转
+        self._stagnate_sample: dict[str, tuple[float, int, int]] = {}
+        self._last_preempt_ts = 0.0          # 抢占频率上限（10min 一个，防连环误杀）
 
     def _in_endgame(self) -> bool:
         """是否进入收尾段：开跑超过「名义窗口 - ENDGAME_MIN」分钟。
@@ -187,6 +234,13 @@ class Scheduler:
         if ch.remaining_flags <= 1:
             return True
         return bool(_LIB.get(ch.unique_code, {}).get("completed"))
+
+    def _next_backoff_wakeup(self, now: float) -> float:
+        """pending 内题的最近冷却到期时间。只看 pending 内的 code：_start_backoff
+        只增不删，已完成/在跑题的陈旧到期戳会把空转睡眠拖长最多一个冷却周期。"""
+        pend = {c.unique_code for c in self.pending}
+        return min((t for code, t in self._start_backoff.items()
+                    if t > now and code in pend), default=now)
 
     async def _watchdog(self):
         """容器看门狗：worker 在跑但容器被平台回收时自动重启并更新地址。"""
@@ -244,7 +298,11 @@ class Scheduler:
         价值的多 flag 未解题强制插队到 pending 队头——worker 对多 flag 题启动即
         派 Task 子 agent 分治（4-8 线），插队即转分治。flag 计数以平台回查为准
         （harness 的 flag 走 submit_flag.sh 直连，本地 submitter 感知不到）。
-        20 分钟冷却防反复插同一题；仅插队不杀在跑任务（不干扰正在解的题）。"""
+        20 分钟冷却防反复插同一题。
+        停滞抢占（P1）：插队只改排序，3 槽全被零产出长窗口占住时插队题仍要等
+        窗口自然结束——对「零 flag 且 FACTS 连续 2×boost 窗口无新增」的在跑
+        attempt cancel 轮转（断点已落盘，retry 续跑）；有任何新事实/新 flag 的
+        窗口不动（12641 复盘：一次性窗口打穿的收益，不误杀健康窗口）。"""
         if self.cfg.stagnate_boost_min <= 0:
             return
         try:
@@ -256,10 +314,12 @@ class Scheduler:
         if total > self._last_total_flags:
             self._last_total_flags = total
             self._last_progress_ts = now
-            return
+        # 抢占采样与全局是否掉速无关（有变化就重置基线）
+        self._sample_active_workers(now)
         if now - self._last_progress_ts < self.cfg.stagnate_boost_min * 60:
             return
         if now - self._last_boost_ts < 1200:
+            self._preempt_stalled_attempts(now)   # 插队冷却中：只做抢占不放行插队
             return
         # 目标：剩余面最多的多 flag 未解题（b 系列 4-6 面大题），且不在跑/不在冷却
         fresh = {c.unique_code: c for c in challenges}
@@ -268,16 +328,62 @@ class Scheduler:
                       if fresh.get(c.unique_code, c).remaining_flags >= 2
                       and c.unique_code not in self.active_workers
                       and not _challenge_completed(fresh.get(c.unique_code, c))]
-        if not candidates:
+        if candidates:
+            target = max(candidates, key=lambda c: (c.remaining_flags, c.total_score))
+            self.pending = [c for c in self.pending if c.unique_code != target.unique_code]
+            self.retry_queue = [c for c in self.retry_queue if c.unique_code != target.unique_code]
+            self.pending.insert(0, target)
+            self._last_boost_ts = now
+            log.warning("[stagnate] 连续 %d 分钟无新 flag，强制插队 %s（%d 面剩 %d 分）"
+                        "转分治攻坚", self.cfg.stagnate_boost_min, target.unique_code,
+                        target.remaining_flags, target.total_score)
+        self._preempt_stalled_attempts(now)
+
+    def _sample_active_workers(self, now: float):
+        """记录/刷新在跑 attempt 的 (采样时刻, flag 数, FACTS 数)：任一变化即
+        重置计时（连续停滞时长从最后一次变化起算）。"""
+        for code, workers in list(getattr(self, "active_workers", {}).items()):
+            try:
+                w = workers[0]
+                cur = (len(w.submitter.correct), w._state_counts()[0])
+            except Exception:
+                self._stagnate_sample.pop(code, None)
+                continue
+            prev = self._stagnate_sample.get(code)
+            if prev and (prev[1], prev[2]) == cur:
+                continue
+            self._stagnate_sample[code] = (now, cur[0], cur[1])
+
+    def _preempt_stalled_attempts(self, now: float):
+        """cancel 全局停滞期间零产出的在跑 attempt（10min 频率上限，一轮一个）。
+        取消由 _run_one 的 CancelledError 分支结算：关容器、落事件、断点进 retry，
+        槽位立即让给插队题。只有 scheduler 直管的 Worker 路径在 active_workers
+        里（静态 harness 路径自带 ≤90min 硬超时，不参与抢占）。"""
+        if now - self._last_preempt_ts < 600:
             return
-        target = max(candidates, key=lambda c: (c.remaining_flags, c.total_score))
-        self.pending = [c for c in self.pending if c.unique_code != target.unique_code]
-        self.retry_queue = [c for c in self.retry_queue if c.unique_code != target.unique_code]
-        self.pending.insert(0, target)
-        self._last_boost_ts = now
-        log.warning("[stagnate] 连续 %d 分钟无新 flag，强制插队 %s（%d 面剩 %d 分）"
-                    "转分治攻坚", self.cfg.stagnate_boost_min, target.unique_code,
-                    target.remaining_flags, target.total_score)
+        stall_s = 2 * self.cfg.stagnate_boost_min * 60
+        victims: list[tuple[float, str]] = []
+        for code, workers in list(getattr(self, "active_workers", {}).items()):
+            s = self._stagnate_sample.get(code)
+            if not s or now - s[0] < stall_s:
+                continue
+            w = workers[0]
+            try:
+                if w.submitter.completed:
+                    continue    # 已拿全：完成事件早停已在路上，不抢
+            except Exception:
+                continue
+            victims.append((s[0], code))
+        if not victims:
+            return
+        _, code = min(victims)   # 平得最久的先让位
+        t = getattr(self, "running", {}).get(code)
+        if t and not t.done():
+            self._last_preempt_ts = now
+            log.warning("[stagnate] %s 连续 %dmin 零 flag 零新 FACTS，抢占轮转"
+                        "（断点已落盘，retry 续跑，槽位让给插队题）",
+                        code, stall_s // 60)
+            t.cancel()
 
     async def _start_throttled(self, code: str) -> list[str]:
         """start 接口限速（相邻调用 ≥0.6s）：平台文档上限 3 题并发，
@@ -315,23 +421,27 @@ class Scheduler:
         return []
 
     def _track_claude_health(self, res: WorkerResult):
-        """claude 运行时健康度：连续崩溃/无输出达阈值（默认 6 次 ≈ 全槽位两轮
-        快速失败）就全局降级裸 LLM 模式。崩溃是秒级的，坏 claude 几分钟内触发；
-        单题偶发（容器抖动）有 3 槽位余量不会误杀。任何一次正常输出即清零。
+        """claude 运行时健康度：连续崩溃/无输出达阈值就全局降级裸 LLM 模式。
+        崩溃是秒级的，坏 claude 几分钟内触发；单题偶发（容器抖动）有 3 槽位
+        余量不会误杀。任何一次正常输出即清零。
+        失败分级（P1）：秒级失败（<2min，网关断裂/运行时崩溃）几分钟内能凑满
+        证据，阈值 3 快速止损；烧满预算才发现的慢失败可能是单题难度而非运行时
+        恶化，维持 6 防误杀。
         覆盖 claude_worker 与静态 harness 两条路径（harness 崩溃同样是运行时恶化）。"""
         if not (self.cfg.claude_worker or self.cfg.harness_enabled):
             return
         r = res.reason or ""
-        if r.startswith(("crash:", "claude no output", "harness crash",
-                         "harness done (0 events)")):
-            self._claude_fail_streak += 1
-            if self._claude_fail_streak >= 6:
-                log.error("claude 连续 %d 次崩溃/无输出（运行中恶化），"
-                          "全局降级裸 LLM 模式继续解题", self._claude_fail_streak)
-                self.cfg.claude_worker = False
-                self.cfg.harness_enabled = False
-        else:
+        if not r.startswith(("crash:", "claude no output", "harness crash",
+                             "harness done (0 events)")):
             self._claude_fail_streak = 0
+            return
+        self._claude_fail_streak += 1
+        limit = 3 if res.elapsed_min < 2 else 6
+        if self._claude_fail_streak >= limit:
+            log.error("claude 连续 %d 次崩溃/无输出（运行中恶化），"
+                      "全局降级裸 LLM 模式继续解题", self._claude_fail_streak)
+            self.cfg.claude_worker = False
+            self.cfg.harness_enabled = False
 
     async def _close_safely(self, code: str) -> None:
         """close + 失败重试一次：实例泄漏会占平台槽位（3 上限写死，泄漏=槽位永久少一个）。"""
@@ -390,7 +500,14 @@ class Scheduler:
             addrs = await self._wait_available(code)
         return addrs, False
 
-    async def _run_one(self, ch: Challenge, attempt: int = 0):
+    async def _run_one(self, ch: Challenge, budget_cap_min: float = 0):
+        """单题一次 attempt。budget_cap_min>0 时单次预算封顶在该分钟数（endgame
+        放行门兜底：剩余窗口装不下满预算时 cap 到装得下为止）。
+
+        attempt 计数在容器就绪后自增（P0）：409 轮转/start 失败/容器未就绪的
+        重排不消耗重试预算——此前派发时即自增，被 409 弹两次的题首次真实运行
+        就带着 attempt≥2 上场（白拉 hint 扣 10%、错换 pro 模型、45min 窗口
+        错降 15min 快验、甚至一次失败就被钉子判死）。"""
         code = ch.unique_code
         async with self._sem:
             ws = os.path.join(self.run_dir, code)
@@ -414,26 +531,49 @@ class Scheduler:
                 self._start_backoff[code] = time.monotonic() + self.start_backoff_s
                 self.pending.append(ch)
                 return
+            attempt = self._attempts.get(code, 0)
+            self._attempts[code] = attempt + 1
             log.info("[%s] 目标: %s", code, ", ".join(addrs))
-            if self._should_use_harness(ch):
-                await self._run_harness_worker(ch, addrs, ws)
-                return
-            if self._should_pair(ch):
-                await self._run_paired(ch, addrs, ws)
-                return
-            worker = Worker(self.cfg, self.llm, self.api, ch, addrs, ws, self.deadline,
-                            attempt=attempt, agent_semaphore=self._agent_sem)
-            self.active_workers[code] = [worker]
+            worker: Worker | None = None
             try:
-                res = await worker.run()
-            except Exception as e:
-                log.exception("[%s] worker 崩溃", code)
-                res = worker.result
-                res.reason = f"crash: {type(e).__name__}: {e}"
-            finally:
+                if self._should_use_harness(ch):
+                    await self._run_harness_worker(ch, addrs, ws, budget_cap_min)
+                    return
+                if self._should_pair(ch):
+                    await self._run_paired(ch, addrs, ws, budget_cap_min)
+                    return
+                worker = Worker(self.cfg, self.llm, self.api, ch, addrs, ws, self.deadline,
+                                attempt=attempt, agent_semaphore=self._agent_sem,
+                                budget_cap_min=budget_cap_min)
+                self.active_workers[code] = [worker]
+                try:
+                    res = await worker.run()
+                except Exception as e:
+                    log.exception("[%s] worker 崩溃", code)
+                    res = worker.result
+                    res.reason = f"crash: {type(e).__name__}: {e}"
+                finally:
+                    self.active_workers.pop(code, None)
+                self._track_claude_health(res)
+                await self._finish(ch, res)
+            except asyncio.CancelledError:
+                # 停滞抢占/全局收尾的 cancel：结算已拿 flag、关容器、落事件、
+                # 断点进 retry（吞掉取消让 task 正常结束，_finish 的 close 保证
+                # 平台槽位不泄漏、题不丢）
+                log.warning("[%s] attempt 被取消（停滞抢占/收尾），落断点轮转", code)
+                res = worker.result if worker is not None else WorkerResult()
+                if worker is not None:
+                    try:
+                        res.completed = worker.submitter.completed
+                        res.score = worker.submitter.score
+                        res.flags = sorted(worker.submitter.correct)
+                        res.elapsed_min = (time.monotonic() - worker.started) / 60
+                    except Exception:
+                        pass
+                if not res.reason:
+                    res.reason = "preempted (stagnate)"
                 self.active_workers.pop(code, None)
-            self._track_claude_health(res)
-            await self._finish(ch, res)
+                await self._finish(ch, res)
 
     def _should_use_harness(self, ch: Challenge) -> bool:
         """第 2 轮攻坚题直接 harness：第 1 轮没解出的（partial）或无解法的 hard 题。
@@ -447,7 +587,8 @@ class Scheduler:
             return False
         return bool(info.get("partial")) or ch.difficulty == "hard"
 
-    async def _run_harness_worker(self, ch: Challenge, addrs: list[str], ws: str):
+    async def _run_harness_worker(self, ch: Challenge, addrs: list[str], ws: str,
+                                  budget_cap_min: float = 0):
         """单题 harness worker：prompt 注入题目信息 + 解法库/专家复盘 + 工作区约定。"""
         from .flagger import extract_flags
         from .harness import run_harness
@@ -514,6 +655,8 @@ class Scheduler:
         submitter = FlagSubmitter(code, ch.flag_count, ch.correct_flag_count,
                                    wrong_cap=self.cfg.wrong_submit_cap)
         h_timeout = min(90, self.cfg.harness_timeout_min * max(1, ch.flag_count)) * 60
+        if budget_cap_min:
+            h_timeout = min(h_timeout, int(budget_cap_min * 60))
         try:
             async with self._agent_sem:
                 res = await run_harness(self.cfg, prompt, ws, h_timeout, on_text=_on_text)
@@ -582,7 +725,8 @@ class Scheduler:
             return False
         return True
 
-    async def _run_paired(self, ch: Challenge, addrs: list[str], ws: str):
+    async def _run_paired(self, ch: Challenge, addrs: list[str], ws: str,
+                          budget_cap_min: float = 0):
         """同一容器跑 2 个 worker：共享 FlagSubmitter（进度/completed 判定）与 NOTES.md，
         工作区隔离（worker-A / worker-B），A 主攻入口面、B 主攻内网/横向。"""
         code = ch.unique_code
@@ -614,7 +758,8 @@ class Scheduler:
                      notes_path=notes_path, state_path=state_path,
                      state_lock=state_lock, role_extra=role_a,
                      transcripts=both_transcripts, agent_semaphore=self._agent_sem,
-                     completion_event=completion_event)
+                     completion_event=completion_event,
+                     budget_cap_min=budget_cap_min)
         w_b = Worker(self.cfg, self.llm, self.api, ch, addrs,
                      os.path.join(ws, "worker-B"), self.deadline,
                      submitter=submitter,
@@ -622,7 +767,8 @@ class Scheduler:
                      state_lock=state_lock, role_extra=role_b,
                      transcripts=both_transcripts,
                      write_notes_injection=False, agent_semaphore=self._agent_sem,
-                     completion_event=completion_event)  # 解法注入只由 A 写共享笔记
+                     completion_event=completion_event,
+                     budget_cap_min=budget_cap_min)  # 解法注入只由 A 写共享笔记
         self.active_workers[code] = [w_a, w_b]
         merged = WorkerResult()
         try:
@@ -700,7 +846,7 @@ class Scheduler:
             os.makedirs(run_dir, exist_ok=True)
             with open(os.path.join(run_dir, "events.jsonl"), "a") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            self._events = _load_events(run_dir)  # 聚合刷新：下一次排序用最新数据
+            self._events = _load_cross_run_events(run_dir)  # 聚合刷新（含跨轮底座）：下一次排序用最新数据
         except OSError:
             pass
 
@@ -780,10 +926,12 @@ class Scheduler:
             log.info("retry 队列 %d 题并入待解（空槽立即补位）", len(retry_todo))
         return bool(retry_todo)
 
-    async def _platform_recheck(self) -> bool:
+    async def _platform_recheck(self, exclude_running: bool = False) -> bool:
         """回查平台把仍未解出的题重新入队。返回 False = 全部解开（可退出）。
         钉子题（_dead）不参与常规回挖；只剩钉子题未解时仍回挖——其他题全解了，
-        剩余时间打死题是零机会成本的兜底（时间不用白不用）。"""
+        剩余时间打死题是零机会成本的兜底（时间不用白不用）。
+        exclude_running：任务在跑时的空槽回查用——在跑题不重入 pending
+        （旧调用点只在无任务时触发无此问题，空槽回查是新增调用点）。"""
         try:
             remaining = [c for c in await self._refresh() if not _challenge_completed(c)]
         except ApiError as e:
@@ -794,8 +942,14 @@ class Scheduler:
         if not remaining:
             return False
         alive = [c for c in remaining if c.unique_code not in self._dead]
-        _reload_lib()
-        self.pending = sorted(alive or remaining, key=lambda c: _priority(c, self.cfg.round_num, getattr(self, "_events", {})))
+        if exclude_running:
+            running = set(getattr(self, "running", {}))
+            alive = [c for c in alive if c.unique_code not in running]
+            # 全在跑/判死：pending 留空等任务结束（无任务的回查轮再兜底回挖钉子题）
+            self.pending = sorted(alive, key=lambda c: _priority(c, self.cfg.round_num, getattr(self, "_events", {}))) if alive else []
+        else:
+            _reload_lib()
+            self.pending = sorted(alive or remaining, key=lambda c: _priority(c, self.cfg.round_num, getattr(self, "_events", {})))
         return True
 
     async def run(self):
@@ -840,7 +994,8 @@ class Scheduler:
             if self._in_endgame() and not self._endgame_logged:
                 self._endgame_logged = True
                 _reload_lib()  # 尾段判定需要最新的 completed 复现状态
-                log.info("进入收尾段（剩余 <%dmin）：只放行快赢题（剩一面/完整解法复现）",
+                log.info("进入收尾段（剩余 <%dmin）：优先快赢题（剩一面/完整解法复现），"
+                         "快赢耗尽后放行最优候选（预算封顶剩余窗口，不空槽）",
                          self.cfg.endgame_min)
             time_left = self.deadline - time.monotonic()
             # 队列耗尽时：先吃 retry（本轮超时未解出、有断点续跑），
@@ -864,6 +1019,7 @@ class Scheduler:
             # gate 固定 3 并发（平台上限写死）：槽位一空立即补位，不允许空闲。
             # 主循环每 15s 一个 tick，空槽检查天然是这个粒度（无需额外轮询器）。
             skipped = 0
+            tail_relaxed = False   # endgame 快赢耗尽后放行最优候选（预算封顶，见下）
             while (len(tasks) < self.effective_max
                    and (self.cfg.never_stop or time_left > 120)):
                 if not self.pending:
@@ -871,6 +1027,14 @@ class Scheduler:
                     # 其他任务在跑时 retry 队列永不被拉起，空槽空转 10-30 分钟——
                     # 历史多轮「尾段空窗」同源）。pending 空但有空槽就把 retry 拉进来。
                     if not await self._pull_retry_into_pending():
+                        # retry 也空（其余题 completed/no_progress/钉子判死）：
+                        # 节流回查平台（60s）把可回挖的题带回补空槽（P0）——
+                        # 此前回查只在「无任何在跑任务」时触发，长窗口期间的
+                        # 空槽要等窗口自然结束，最长 45min 纯空转。
+                        now_mono = time.monotonic()
+                        if now_mono - self._last_idle_recheck_ts >= 60:
+                            self._last_idle_recheck_ts = now_mono
+                            await self._platform_recheck(exclude_running=True)
                         break
                 ch = self.pending.pop(0)
                 wait_until = self._start_backoff.get(ch.unique_code, 0)
@@ -882,27 +1046,47 @@ class Scheduler:
                     continue
                 # endgame 收尾纪律（12464 复盘：收卷前 25min 还在第三轮攻 f2-05）：
                 # 名义窗口只剩 ENDGAME_MIN 时只放行快赢题（只剩一面/有完整解法可复现），
-                # 不再开新 hard/多 flag 大题——尾段时间全部给确定性得分
-                if self._in_endgame() and not self._endgame_ok(ch):
+                # 不再开新 hard/多 flag 大题——尾段时间全部给确定性得分。
+                # 快赢耗尽后不空槽（P0）：放行最优的一道，预算封顶在尾段剩余
+                # 窗口内（空槽零机会成本，断点 partial 优先——比空转到收卷强）
+                if (self._in_endgame() and not tail_relaxed
+                        and not self._endgame_ok(ch)):
                     self.pending.append(ch)
                     skipped += 1
                     if skipped >= len(self.pending):
-                        break  # 尾段无快赢题：槽位空转至平台收卷（回查轮会持续刷新）
+                        tail_relaxed = True
+                        skipped = 0
+                        self.pending.sort(
+                            key=lambda c: _priority(c, self.cfg.round_num,
+                                                    getattr(self, "_events", {})))
                     continue
                 skipped = 0
-                n = self._attempts.get(ch.unique_code, 0)
-                self._attempts[ch.unique_code] = n + 1
-                # attempt=n：0=首轮限长超时快速轮转，retry 轮（n>0）按断点分级放长
-                t = asyncio.create_task(self._run_one(ch, attempt=n))
+                # 尾段兜底放行的非快赢题封顶单次预算 min(15, 剩余名义窗口)；
+                # 快赢题（复现/剩一面）走原分级预算
+                cap_min = 0.0
+                if self._in_endgame() and not self._endgame_ok(ch):
+                    remaining_min = (self.cfg.global_budget_min
+                                     - (time.monotonic() - self._t0) / 60)
+                    cap_min = max(5.0, min(15.0, remaining_min))
+                # attempt 计数在 _run_one 容器就绪后自增（409/start 失败不消耗）
+                t = asyncio.create_task(self._run_one(ch, budget_cap_min=cap_min))
                 tasks.add(t)
-                t.add_done_callback(tasks.discard)
+                self.running[ch.unique_code] = t
+
+                def _task_done(task, _code=ch.unique_code):
+                    tasks.discard(task)
+                    self.running.pop(_code, None)
+                    self._stagnate_sample.pop(_code, None)
+
+                t.add_done_callback(_task_done)
                 time_left = self.deadline - time.monotonic()
             if not tasks:
                 # 无在跑任务但还有待选题：只可能是全在 409/失败冷却中。
-                # 睡到最近一个冷却到期再排（不 sleep 会空转烧 CPU/API）。
+                # 睡到 pending 内题的最近冷却到期再排（不 sleep 会空转烧 CPU/API；
+                # 只看 pending 内的 code：陈旧条目会把空转睡过头最多 30s）
                 if self.pending:
                     now = time.monotonic()
-                    nxt = min((t for t in self._start_backoff.values() if t > now), default=now)
+                    nxt = self._next_backoff_wakeup(now)
                     await asyncio.sleep(max(0.5, nxt - now))
                     continue
                 await asyncio.sleep(1)  # 兜底：pending/retry 皆空，交由下一轮回查平台

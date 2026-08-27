@@ -494,7 +494,7 @@ async def test_no_idle_slots_retry_dispatched_while_task_running(tmp_path, monke
     calls = {"slow": 0, "fail": []}
     slow_ended: list[float] = []
 
-    async def fake_run_one(ch, attempt=0):
+    async def fake_run_one(ch, budget_cap_min=0.0):
         if ch.unique_code == "mock_slow_01":
             calls["slow"] += 1
             await asyncio.sleep(8)          # 长任务占住 1 个槽位

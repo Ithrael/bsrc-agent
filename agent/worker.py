@@ -463,7 +463,8 @@ class Worker:
                  transcripts: list[str] | None = None,
                  write_notes_injection: bool = True,
                  agent_semaphore: asyncio.Semaphore | None = None,
-                 completion_event: asyncio.Event | None = None):
+                 completion_event: asyncio.Event | None = None,
+                 budget_cap_min: float = 0):
         self.cfg = cfg
         self.llm = llm
         self.api = api
@@ -478,6 +479,9 @@ class Worker:
         # attempt：本题第几次被调度尝试（0=首轮，1=二轮，2+=三轮及以后）——
         # hard 预算按 attempt 递增（25/35/40min，优先腾出题目槽位）
         self.attempt = attempt
+        # 单次预算硬封顶（分钟，0=不封顶）：scheduler endgame 快赢耗尽后放行
+        # 最优候选时设置——剩余尾段窗口装不下满预算，cap 到装得下为止
+        self.budget_cap_min = budget_cap_min
         self.started = time.monotonic()
         self.result = WorkerResult()
         # 双 worker 模式：submitter/notes_path/state_path 共享，role_extra 分工提示
@@ -713,6 +717,34 @@ class Worker:
             return ""
         return ("\n\n## 上轮工作区速览（轮内续跑：已确认事实/脚本/断点都在这里，"
                 "直接从这里继续，勿重复侦察）\n" + "\n\n".join(parts))
+
+    def _facts_tail(self, n: int = 12) -> str:
+        """STATE.md 最后一个 FACTS 段的行（尾部 n 行）——子 agent 派发指令内联用。"""
+        try:
+            with open(self.state_path) as f:
+                lines = f.read().splitlines()
+        except OSError:
+            return ""
+        facts: list[str] = []
+        cur = False
+        for ln in lines:
+            if ln.startswith("## FACTS"):
+                cur = True
+                continue
+            if ln.startswith("## "):
+                cur = False
+                continue
+            if cur and ln.strip():
+                facts.append(ln.strip())
+        return "\n".join(facts[-n:])
+
+    def _hosts_tail(self, n: int = 800) -> str:
+        """HOSTS.md 资产台账尾部（子 agent 派发指令内联用）。"""
+        try:
+            with open(os.path.join(self.ws, "HOSTS.md")) as f:
+                return f.read()[-n:]
+        except OSError:
+            return ""
 
     async def _advisor_brief(self, hint_text: str = "") -> str:
         """retry 轮指挥官 brief（对标榜 2 Heimdall_lucky 的 observer→advisor 模式）：
@@ -992,8 +1024,14 @@ class Worker:
             # 首轮 12min（AePis 复盘：easy/medium 全扫 <2h，3.3min/flag），
             # retry 有断点 25min 给足续跑；无断点 15min（12936 复盘：无断点
             # 快验 8min 太短漏掉慢热题——c-03/c-09 首轮 8min 窗口塞不进
-            # PoC 检索，二轮 8min 快验同样不够）
-            minutes = 12 if self.attempt <= 0 else (25 if prog else 15)
+            # PoC 检索，二轮 8min 快验同样不够）。
+            # 多 flag 大题例外（13174 实测：b-01/b-03 首轮 12min 只拿 0/1 面，
+            # 渗透链没起就被轮转切走；12464 的 b 系列 +2550 靠一次性窗口打穿）：
+            # flag≥3 首轮给 20min，够摸入口 + 起链。
+            if self.attempt <= 0 and self.ch.flag_count >= 3:
+                minutes = 20
+            else:
+                minutes = 12 if self.attempt <= 0 else (25 if prog else 15)
         else:
             # easy：首轮 12min（12936 复盘：8min 塞不进指纹+PoC检索+利用链，
             # c-03/c-09 两轮 0 分被误判死），retry 有断点 20min、无断点 15min
@@ -1005,6 +1043,9 @@ class Worker:
         # 省下的时间给有转化率的题。events.jsonl 轮内有效（跨轮沙箱销毁）。
         if self.attempt >= 2 and _zero_score_history(getattr(self, "ws", ""), self.ch.unique_code) >= 2:
             minutes = min(minutes, 20)
+        # 尾段兜底放行（scheduler endgame relax）：预算封顶在剩余名义窗口内
+        if getattr(self, "budget_cap_min", 0):
+            minutes = min(minutes, float(self.budget_cap_min))
         return minutes * 60
 
     def _scaled_max_steps(self) -> float:
@@ -1913,8 +1954,9 @@ class Worker:
                 "禁止写工作目录之外的任何文件（共享文件除外）；"
                 "line 目录内的 NOTES.md/STATE.md/RELAY.md/HOSTS.md/submit_flag.sh 是软链"
                 "（指向共享文件），cd 进去后照样用相对路径追加/提交\n"
-                "   - **开打前先 read NOTES.md/HOSTS.md 尾部**：已确认事实/已排除方向/已拿主机"
-                "清单都在里面，只做别人没做的事，别重复已排除方向或已打下的面\n"
+                "   - **开打前先读指令末尾内联的「已确认事实与资产台账」**（已确认事实/"
+                "已排除方向/已拿主机清单都在里面，只做别人没做的事，别重复已排除方向或"
+                "已打下的面）；细节可再 read NOTES.md 尾部\n"
                 "   - 共享文件只追加且带线名前缀：`echo '- [X线] <发现>' >> NOTES.md`"
                 "（RELAY.md、HOSTS.md 台账、STATE.md 的 INTENTS/ELIMINATED 同理），禁止重排/覆盖他人内容\n"
                 "   - 拿到 flag 立即用 bash 执行 `./submit_flag.sh <flag> '<RAW EVIDENCE：'"
@@ -1967,6 +2009,16 @@ class Worker:
                     src, dst = os.path.join(self.ws, name), os.path.join(line_dir, name)
                     if os.path.exists(src) and not os.path.lexists(dst):
                         os.symlink(src, dst)
+            # 子 agent 派发上下文内联（ATX 吸收：任务创建即历史事实注入——b 系列
+            # 分治线不读共享文件就重复打面（13174 实测 b-02 三轮同面硬攻），
+            # 事实/台账直接塞进派发指令，不依赖子 agent 自觉读文件）
+            facts_inline = self._facts_tail()
+            hosts_inline = self._hosts_tail()
+            if facts_inline or hosts_inline:
+                master_role += (
+                    "\n\n## 已确认事实与资产台账（已内联进本指令，子 agent 开打即知）\n"
+                    f"{facts_inline or '(无已确认事实)'}\n"
+                    f"{hosts_inline or '(无资产台账)'}")
             prompt = self._build_claude_prompt(ch, sol, notes, has_completed_sol, desc_hints,
                                                recon_report, master_role)
             if self.attempt >= 1:
@@ -2001,6 +2053,9 @@ class Worker:
                 and "[HARNESS TIMEOUT]" not in res.collected
                 and "[HARNESS TOKEN BUDGET" not in res.collected):
             retry_s = max(300, timeout_s // 2)
+            if getattr(self, "budget_cap_min", 0):
+                # 尾段封顶轮的断点重跑同步收紧，总时长不超预算 1.5 倍
+                retry_s = min(retry_s, max(120, int(timeout_s * 0.5)))
             log.info("[%s] claude 提前退出未拿全 flag，断点重跑一次（%ds）", ch.unique_code, retry_s)
             retry_prompt = self._build_claude_prompt(ch, sol, notes, has_completed_sol, desc_hints, recon_report, master_role)
             retry_prompt += ("\n\n## 断点续跑（第二次尝试）\n"

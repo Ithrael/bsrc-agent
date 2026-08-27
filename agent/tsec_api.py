@@ -112,11 +112,18 @@ class TsecClient:
     async def close(self):
         await self._client.aclose()
 
-    async def _req(self, method: str, path: str, **kw):
+    async def _req(self, method: str, path: str, attempts: int = 4,
+                   timeout: float | None = None, **kw):
+        """attempts：网络异常/5xx 重试次数（默认 4）；timeout：单请求超时覆盖
+        （None=用 client 默认 30s）。close 等 fire-and-forget 语义的端点用
+        小 attempts + 短 timeout，防重试链把调用方（题目槽位）占住分钟级。"""
         last_exc: Exception | None = None
-        for attempt in range(4):
+        req_kw = dict(kw)
+        if timeout is not None:
+            req_kw["timeout"] = timeout
+        for attempt in range(attempts):
             try:
-                r = await self._client.request(method, path, **kw)
+                r = await self._client.request(method, path, **req_kw)
             except (httpx.TransportError, httpx.TimeoutException) as e:
                 last_exc = e
                 await asyncio.sleep(1.5 * (attempt + 1))
@@ -153,7 +160,12 @@ class TsecClient:
         return SubmitResult.from_dict(data)
 
     async def close_challenge(self, unique_code: str) -> bool:
-        data = await self._req("POST", "/openapi/v1/challenges/close", params={"unique_code": unique_code})
+        # close 是 fire-and-forget 语义：默认 4×30s 重试链在网络抖动时会把题目
+        # 槽位占住 ~4min（残留容器由调度器启动清理/start 前复用检查兜底）——
+        # 单次 10s 短超时，第二次机会交给 _close_safely 的外层重试
+        data = await self._req("POST", "/openapi/v1/challenges/close",
+                               params={"unique_code": unique_code},
+                               attempts=1, timeout=10)
         return bool(data.get("closed"))
 
     async def raw_request(self, method: str, path: str,

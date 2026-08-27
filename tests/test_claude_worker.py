@@ -783,7 +783,9 @@ async def test_smoke_claude_detects_broken_and_healthy(monkeypatch):
 
 
 def test_scheduler_claude_health_guard():
-    """运行时守卫：连续 6 次崩溃/无输出全局降级裸 LLM；任何正常输出清零计数。"""
+    """运行时守卫（失败分级）：秒级失败（<2min，网关断裂/运行时崩溃）连续 3 次
+    快速止损；烧满预算的慢失败可能是单题难度，维持 6 次防误杀；任何正常输出
+    清零计数。"""
     from agent.scheduler import Scheduler
 
     sched = Scheduler.__new__(Scheduler)
@@ -792,25 +794,39 @@ def test_scheduler_claude_health_guard():
     sched.cfg.harness_enabled = True
     sched._claude_fail_streak = 0
 
-    def _res(reason):
+    def _res(reason, elapsed=0.0):
         r = worker_mod.WorkerResult()
         r.reason = reason
+        r.elapsed_min = elapsed
         return r
 
-    for i in range(5):
+    # 秒级失败：2 次内不误杀，第 3 次触发
+    for i in range(2):
         sched._track_claude_health(_res("crash: FileNotFoundError: claude"))
-        assert sched.cfg.claude_worker, f"5 次内不误杀（第 {i + 1} 次）"
+        assert sched.cfg.claude_worker, f"秒级失败 2 次内不误杀（第 {i + 1} 次）"
     sched._track_claude_health(_res("claude no output (timeout?)"))
     assert not sched.cfg.claude_worker
     assert not sched.cfg.harness_enabled
 
+    # 慢失败（烧满预算）：5 次内不误杀，第 6 次触发
+    sched2 = Scheduler.__new__(Scheduler)
+    sched2.cfg = Config()
+    sched2.cfg.claude_worker = True
+    sched2.cfg.harness_enabled = True
+    sched2._claude_fail_streak = 0
+    for i in range(5):
+        sched2._track_claude_health(_res("crash: FileNotFoundError: claude", elapsed=25.0))
+        assert sched2.cfg.claude_worker, f"慢失败 5 次内不误杀（第 {i + 1} 次）"
+    sched2._track_claude_health(_res("claude no output (timeout?)", elapsed=25.0))
+    assert not sched2.cfg.claude_worker
+
     # 恢复场景：计数接近阈值时一次正常输出清零
-    sched.cfg.claude_worker = True
-    sched.cfg.harness_enabled = True
-    sched._claude_fail_streak = 5
-    sched._track_claude_health(_res("claude done"))
-    assert sched._claude_fail_streak == 0
-    assert sched.cfg.claude_worker
+    sched2.cfg.claude_worker = True
+    sched2.cfg.harness_enabled = True
+    sched2._claude_fail_streak = 5
+    sched2._track_claude_health(_res("claude done"))
+    assert sched2._claude_fail_streak == 0
+    assert sched2.cfg.claude_worker
 
 
 # ---- hint 时机提前（Cairn_X 148-hint 复盘：hard/多 flag 首轮即带 hint 开工） ----
@@ -1432,3 +1448,112 @@ def test_zero_score_history_warning_in_prompt(tmp_path):
     w2.ws = str(tmp_path / "runs_empty" / "bctf-31")
     prompt2 = w2._build_claude_prompt(w2.ch, {}, {}, False, [], "", "")
     assert "历史零分警告" not in prompt2
+
+
+# ---- 中尾段提速（13174 复盘：medium 多 flag 首轮太短 / 分治线不读共享文件） ----
+
+def test_medium_multi_flag_first_round_20min():
+    """medium 且 flag≥3 首轮 12min→20min（13174 实测 b-01/b-03 首轮 12min
+    只拿 0/1 面，渗透链没起就被轮转切走）；单 flag medium 首轮仍 12min。"""
+    import tempfile
+    d = tempfile.mkdtemp()
+    w = Worker.__new__(Worker)
+    w.cfg = Config()
+    w.attempt = 0
+    w.ws = d
+    w.notes_path = os.path.join(d, "NOTES.md")
+    w.ch = Challenge.from_dict({"unique_code": "b-01", "flag_count": 4,
+                                "total_score": 1200, "difficulty": "medium"})
+    assert w._scaled_timeout_s() == 20 * 60
+    w.ch = Challenge.from_dict({"unique_code": "bctf-02", "flag_count": 1,
+                                "total_score": 400, "difficulty": "medium"})
+    assert w._scaled_timeout_s() == 12 * 60
+    # retry 轮不受影响：有断点 25min
+    w.attempt = 1
+    w.ch = Challenge.from_dict({"unique_code": "b-01", "flag_count": 4,
+                                "total_score": 1200, "difficulty": "medium"})
+    with open(os.path.join(d, "RELAY.md"), "w") as f:
+        f.write("已达成原语: RCE\n")
+    assert w._scaled_timeout_s() == 25 * 60
+
+
+def test_facts_tail_parses_last_facts_section(tmp_path):
+    """_facts_tail：取最后一个 FACTS 段的行，跨段累加取尾部。"""
+    w = Worker.__new__(Worker)
+    w.state_path = str(tmp_path / "STATE.md")
+    (tmp_path / "STATE.md").write_text(
+        "## FACTS\n- 端口 80/tcp open（http）\n- 凭证 admin=admin\n"
+        "## ELIMINATED\n- SQLi 不存在\n"
+        "## FACTS\n- 内网主机 10.0.0.5\n- flag 进度: 2/4\n")
+    assert "端口 80/tcp open" in w._facts_tail()
+    assert "flag 进度: 2/4" in w._facts_tail()
+    assert "SQLi" not in w._facts_tail()      # ELIMINATED 不算 FACTS
+    (tmp_path / "STATE.md").write_text("无内容\n")
+    assert w._facts_tail() == ""
+
+
+@pytest.mark.asyncio
+async def test_subagent_dispatch_inlines_facts_and_hosts(tmp_path, monkeypatch):
+    """主控派发指令内联 FACTS 尾部 + HOSTS 台账（ATX 任务创建即历史事实注入，
+    b 系列分治线不读共享文件也能带着全部已知事实开打）。"""
+    srv = make_server()
+    srv.state.update({
+        "mock_pair_03": {
+            "unique_code": "mock_pair_03",
+            "description": "mock：三 flag 大题",
+            "difficulty": "hard",
+            "level": 1,
+            "total_score": 1200,
+            "flag_count": 3,
+            "correct_flag_count": 0,
+            "is_completed": False,
+            "container_status": "stopped",
+            "container_addr": [],
+            "_flags": ["flag{p3_a}", "flag{p3_b}", "flag{p3_c}"],
+        },
+    })
+    host, port = srv.server_address
+    api = TsecClient(f"http://{host}:{port}", TOKEN)
+    ch = next(c for c in await api.list_challenges() if c.unique_code == "mock_pair_03")
+    addrs = await api.start_challenge(ch.unique_code)
+
+    sol_path = tmp_path / "solutions.json"
+    sol_path.write_text("{}")
+    notes_path = tmp_path / "notes.json"
+    notes_path.write_text("{}")
+    monkeypatch.setattr(worker_mod, "solution_lib_path", lambda: str(sol_path))
+    monkeypatch.setattr(worker_mod, "notes_lib_path", lambda: str(notes_path))
+
+    # 预置共享文件（模拟轮内续跑：FACTS 与台账已有内容）
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "STATE.md").write_text(
+        "## FACTS\n- 端口 8080/tcp open（tomcat）\n- 凭证 admin=tomcat123\n"
+        "## ELIMINATED\n- SQLi 不存在\n")
+    (ws / "HOSTS.md").write_text(
+        "# 资产台账\n- web-1 | 8080/tomcat | admin:tomcat123 | flag1 已拿\n"
+        "- db-1 | 3306/mysql | root:root | 未拿\n")
+    (ws / "NOTES.md").write_text("# mock_pair_03 笔记\n\n目标: 127.0.0.1:80\n\n")
+
+    prompt_file = tmp_path / "master_prompt.txt"
+    p = tmp_path / "fake-claude.sh"
+    p.write_text("#!/bin/bash\n"
+                 "cat > " + str(prompt_file) + "\n"
+                 "echo '{\"type\":\"result\",\"result\":\"no flag\"}'\n")
+    p.chmod(0o755)
+
+    cfg = Config()
+    cfg.claude_worker = True
+    cfg.harness_backend = str(p)
+    cfg.recon_boot = False
+    cfg.record_solutions = False
+
+    w = Worker(cfg, object(), api, ch, addrs, str(ws), deadline=time.monotonic() + 600)
+    await w.run()
+
+    master = prompt_file.read_text()
+    assert "已确认事实与资产台账" in master
+    assert "admin=tomcat123" in master           # FACTS 内联
+    assert "db-1 | 3306/mysql | root:root" in master  # HOSTS 台账内联
+    assert "SQLi 不存在" not in master.split("已确认事实与资产台账")[1]  # ELIMINATED 不混入
+    await api.close()
