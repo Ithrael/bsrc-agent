@@ -49,6 +49,12 @@ _SENSITIVE_PATHS = ("/", "/robots.txt", "/.git/HEAD", "/.env", "/admin", "/api",
                     "/login", "/flag", "/challenge/flag.txt", "/v1/models",
                     "/v1/chat/completions", "/docs", "/openapi.json")
 
+# 指纹端点：这些路径返回的 body 里含组件名/版本（ComfyUI 的 /system_stats 返回 JSON
+# 含 comfyui_version、Ollama 的 /v1/models 含模型列表、Spring 的 /actuator/health 含
+# 服务元数据）——必须取内容而非只取状态码，否则 _COMPONENT_RE 抓不到 AI 基础设施
+# 指纹，CVE 线索喂不进 prompt（13397 c-02 ComfyUI 预侦察没识别出指纹、31min 0 分翻车）。
+_FINGERPRINT_PATHS = ("/system_stats", "/v1/models", "/actuator/health")
+
 
 def _parse_hosts(addrs: list[str]) -> list[str]:
     hosts: list[str] = []
@@ -179,12 +185,16 @@ async def _http_probe(cwd: str, host: str, port: int) -> str:
 async def _probe_scheme(cwd: str, host: str, port: int, scheme: str) -> str:
     base = f"{scheme}://{host}:{port}"
     paths = " ".join(_SENSITIVE_PATHS)  # 纯空格分隔，shell for 循环按词拆分
+    fp_paths = " ".join(_FINGERPRINT_PATHS)
     extra = "-k " if scheme == "https" else ""
     cmd = (
-        f"curl {extra}-s -m 6 -i {base}/ 2>/dev/null | head -25; echo '---STATUS---'; "
+        f"curl {extra}-s -m 6 -i {base}/ 2>/dev/null | head -40; echo '---STATUS---'; "
         f"for p in {paths}; do "
         f"code=$(curl {extra}-s -m 3 -o /dev/null -w '%{{http_code}}' {base}$p 2>/dev/null); "
-        f"echo \"$p -> $code\"; done"
+        f"echo \"$p -> $code\"; done; "
+        f"echo '---FINGERPRINT---'; "
+        f"for p in {fp_paths}; do "
+        f"echo \"== $p ==\"; curl {extra}-s -m 4 {base}$p 2>/dev/null | head -15; done"
     )
     out = await _run_cmd(cmd, cwd, 40)
     if not out or "(超时)" in out or "(失败" in out:

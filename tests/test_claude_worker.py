@@ -272,7 +272,7 @@ async def test_medium_round2_uses_hard_model(tmp_path, monkeypatch):
     calls: list[dict] = []
 
     async def fake_run_harness(cfg, prompt, cwd, timeout_s, on_text=None,
-                               token_budget=0, model="", effort="", stop_event=None):
+                               token_budget=0, model="", effort="", stop_event=None, resume_session_id=""):
         calls.append({"model": model, "effort": effort, "timeout_s": timeout_s})
         from agent.harness import HarnessResult
         r = HarnessResult()
@@ -381,7 +381,7 @@ async def test_repro_challenge_skips_hard_model(tmp_path, monkeypatch):
     calls: list[dict] = []
 
     async def fake_run_harness(cfg, prompt, cwd, timeout_s, on_text=None,
-                               token_budget=0, model="", effort="", stop_event=None):
+                               token_budget=0, model="", effort="", stop_event=None, resume_session_id=""):
         calls.append({"model": model, "effort": effort, "timeout_s": timeout_s,
                       "token_budget": token_budget})
         from agent.harness import HarnessResult
@@ -439,7 +439,7 @@ async def test_repro_multi_flag_timeout_10min(tmp_path, monkeypatch):
     calls: list[dict] = []
 
     async def fake_run_harness(cfg, prompt, cwd, timeout_s, on_text=None,
-                               token_budget=0, model="", effort="", stop_event=None):
+                               token_budget=0, model="", effort="", stop_event=None, resume_session_id=""):
         calls.append({"timeout_s": timeout_s, "token_budget": token_budget})
         from agent.harness import HarnessResult
         r = HarnessResult()

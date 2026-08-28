@@ -44,6 +44,18 @@ _JUNK_INNER = {"flag", "test", "xxx", "example", "placeholder", "sample",
                "mock", "fake", "guess", "example_flag", "the_flag", "found"}
 
 
+def _default_wrong_cap(unique_code: str, base_cap: int) -> int:
+    """按题型调 auto 通道错提熔断阈值。
+
+    二进制题（f 系列）flag 是 leetspeak 形态（FLAG{g0_1t4b_...}），格式闸门
+    plausible_flag 对「合法 leetspeak 瞎猜」形同虚设——13397 实测 f2-05 错 11 次、
+    f2-01 错 10 次（纯盲猜烧请求，且都是最终未解的死题）。f 系列减半（≥3），
+    让 auto 通道（正则捕获）更早停，显式通道（submit_flag.sh）不受影响。"""
+    if (unique_code or "").startswith("f"):
+        return max(3, base_cap // 2)
+    return base_cap
+
+
 def plausible_flag(flag: str) -> bool:
     """提交前格式闸门：所有提交通道（LLM 工具/harness 输出捕获/调度器直连）统一过这里。
 
@@ -87,7 +99,7 @@ class FlagSubmitter:
         self.correct_count = max(0, min(expected_flags, initial_correct_count))
         self.wrong_streak = 0  # 连续提交错误计数（run 12019 复盘：f2-05 连错 10 次盲猜）
         self.wrong_total = 0   # 累计错提（auto 通道熔断用，不因正确提交清零）
-        self.wrong_cap = wrong_cap
+        self.wrong_cap = _default_wrong_cap(unique_code, wrong_cap)
 
     @property
     def completed(self) -> bool:

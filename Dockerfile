@@ -122,6 +122,9 @@ COPY tools/pocs/hacktricks /opt/pocs/hacktricks
 COPY tools/pocs/PoC-in-GitHub /opt/pocs/PoC-in-GitHub
 COPY tools/flag_sweep.sh tools/creds_replay.sh /opt/tools/
 RUN chmod +x /opt/tools/flag_sweep.sh /opt/tools/creds_replay.sh && touch /opt/tools/creds.txt
+# 离线知识包（2026-08-28）：提权/容器逃逸/反弹shell/默认凭证/pwn 速查——
+# flash 模型知识召回弱，高频命令直接查文件比现场回忆快且准
+COPY tools/knowledge /opt/knowledge
 # 漏洞库索引（2026-08-27）：构建期把离线漏洞库预解析成 组件名/CVE → 路径 的
 # poc-index.json，运行时 O(1) 精查——替代每个 Agent 在几百 MB 文档里递归 grep
 COPY tools/build_poc_index.py /tmp/build_poc_index.py

@@ -515,7 +515,16 @@ async def test_no_idle_slots_retry_dispatched_while_task_running(tmp_path, monke
             r.completed = done_slow
         if r.completed:
             if flag:
-                await sched.api.submit_flag(ch.unique_code, flag)  # 平台侧入账（终局退出条件）
+                # duplicate 容忍：高负载下 mock server 连接抖动会让 tsec_api 重试
+                # 同一提交，平台幂等返回 409 duplicate——产品 _submit_cb 本就按
+                # 幂等处理，fake 同样不能让 attempt 因它崩溃（否则调度合法地
+                # 多派一轮，时间敏感断言被污染）
+                from agent.tsec_api import ApiError
+                try:
+                    await sched.api.submit_flag(ch.unique_code, flag)
+                except ApiError as e:
+                    if "duplicate" not in (e.code or ""):
+                        raise
             r.score = ch.total_score
             r.flags = [flag] if flag else []
             r.reason = "all flags captured"

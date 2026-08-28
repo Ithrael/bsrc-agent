@@ -99,7 +99,13 @@ async def _amain() -> int:
 
     api = TsecClient(cfg.benchmark_base_url, cfg.benchmark_token)
     llm = LLMClient(cfg.llm_base_url, cfg.llm_api_key, cfg.llm_model,
-                    cfg.llm_max_tokens, cfg.llm_temperature, cfg.llm_timeout_s)
+                    cfg.llm_max_tokens, cfg.llm_temperature, cfg.llm_timeout_s,
+                    fallback_base_url=cfg.llm_base_url_fallback,
+                    fallback_api_key=cfg.llm_api_key_fallback,
+                    fallback_model=cfg.llm_model_fallback)
+    if cfg.llm_base_url_fallback:
+        log.info("LLM 备用通道: %s（主通道连续 3 次网络/5xx 失败自动切换）",
+                 cfg.llm_base_url_fallback)
     log.info("LLM endpoint: %s", llm.base_url)
     try:
         # 连通性自检

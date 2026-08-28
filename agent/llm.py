@@ -54,8 +54,16 @@ def anthropic_gateway_url(base_url: str) -> str:
 
 
 class LLMClient:
+    """OpenAI 兼容客户端，支持双通道 fallback（方案4）：主网关连续 3 次网络/5xx
+    失败自动切备用网关（LLM_BASE_URL_FALLBACK），备用连续 5 次成功切回主。
+    claude 通道已有「降级裸 LLM」保险，这里补上裸循环自身的最后一块：主网关
+    抖动期间解题/蒸馏/advisor 不停摆。400/401 不触发切换（请求本身的问题，
+    换通道也一样失败）。"""
+
     def __init__(self, base_url: str, api_key: str, model: str,
-                 max_tokens: int = 8192, temperature: float = 0.2, timeout_s: int = 300):
+                 max_tokens: int = 8192, temperature: float = 0.2, timeout_s: int = 300,
+                 fallback_base_url: str = "", fallback_api_key: str = "",
+                 fallback_model: str = ""):
         self.base_url = rewrite_gateway_url(base_url).rstrip("/")
         self.api_key = api_key
         self.model = model
@@ -70,9 +78,38 @@ class LLMClient:
             timeout=timeout_s,
             trust_env=False,  # 沙箱内无公网代理，直连网关
         )
+        # 备用通道（空配置=禁用）：状态机 _active ∈ {"main","fallback"}
+        self._fallback_base_url = rewrite_gateway_url(fallback_base_url).rstrip("/") \
+            if fallback_base_url else ""
+        self._fallback_model = fallback_model or model
+        self._fallback_client: httpx.AsyncClient | None = None
+        if self._fallback_base_url:
+            self._fallback_client = httpx.AsyncClient(
+                base_url=self._fallback_base_url,
+                headers={"Authorization": f"Bearer {fallback_api_key or api_key}"},
+                timeout=timeout_s,
+                trust_env=False)
+        self._active = "main"
+        self._fail_streak = 0        # 当前通道连续失败（网络/5xx/429）
+        self._fallback_ok_streak = 0 # 备用通道连续成功（够 5 次切回主）
+
+    def _cur(self) -> tuple[httpx.AsyncClient, str]:
+        """当前通道 (client, model)。fallback 模型可不同（如主 deepseek 备智谱）。"""
+        if self._active == "fallback" and self._fallback_client is not None:
+            return self._fallback_client, self._fallback_model
+        return self._client, self.model
+
+    def _switch(self, to: str):
+        self._active = to
+        self._fail_streak = 0
+        self._fallback_ok_streak = 0
+        url = self._fallback_base_url if to == "fallback" else self.base_url
+        log.warning("LLM 通道切换 -> %s（%s）", to, url)
 
     async def close(self):
         await self._client.aclose()
+        if self._fallback_client is not None:
+            await self._fallback_client.aclose()
 
     async def chat(self, messages: list[dict], tools: list[dict] | None = None,
                    max_tokens: int | None = None, model: str = "") -> dict:
@@ -91,14 +128,18 @@ class LLMClient:
         body: dict = {}
         last_exc: Exception | None = None
         for attempt in range(6):
+            client, chan_model = self._cur()
             try:
-                r = await self._client.post("/chat/completions", json=payload)
+                r = await client.post("/chat/completions", json={
+                    **payload, "model": model or chan_model})
                 if r.status_code == 400:
                     # 请求非法（上下文超长/结构错误）：重试无意义，带响应体快速失败
                     raise RuntimeError(f"LLM 400: {r.text[:300]}")
                 if r.status_code in (401, 403):
                     raise RuntimeError(f"LLM 鉴权失败 {r.status_code}: {r.text[:200]}")
                 if r.status_code in (429, 500, 502, 503, 504):
+                    last_exc = RuntimeError(f"LLM {r.status_code}")
+                    self._note_channel_failure()
                     wait = min(60, 2 ** attempt * 3)
                     log.warning("LLM %s, %.1fs 后重试 (%d/6)", r.status_code, wait, attempt + 1)
                     await asyncio.sleep(wait)
@@ -106,7 +147,13 @@ class LLMClient:
                 r.raise_for_status()
                 body = r.json()
                 break
-            except (httpx.TransportError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
+            except (httpx.TransportError, httpx.TimeoutException) as e:
+                last_exc = e
+                self._note_channel_failure()
+                wait = min(60, 2 ** attempt * 3)
+                log.warning("LLM 调用异常 %s, %.1fs 后重试 (%d/6)", e, wait, attempt + 1)
+                await asyncio.sleep(wait)
+            except httpx.HTTPStatusError as e:
                 last_exc = e
                 wait = min(60, 2 ** attempt * 3)
                 log.warning("LLM 调用异常 %s, %.1fs 后重试 (%d/6)", e, wait, attempt + 1)
@@ -114,6 +161,7 @@ class LLMClient:
         else:
             raise RuntimeError(f"LLM 调用连续失败: {last_exc}")
 
+        self._note_channel_success()
         self.calls += 1
         usage = body.get("usage") or {}
         self.total_input_tokens += usage.get("prompt_tokens", 0)
@@ -130,6 +178,24 @@ class LLMClient:
                 "out": usage.get("completion_tokens", 0),
             },
         }
+
+    def _note_channel_failure(self):
+        """网络/5xx 失败计数：连续 3 次且备用可用 → 切备用。"""
+        self._fallback_ok_streak = 0
+        self._fail_streak += 1
+        if (self._fail_streak >= 3 and self._active == "main"
+                and self._fallback_client is not None):
+            self._switch("fallback")
+
+    def _note_channel_success(self):
+        """成功计数：备用通道连续 5 次成功 → 切回主（主通道通常更快/更便宜）。"""
+        if self._active == "main":
+            self._fail_streak = 0
+            return
+        self._fail_streak = 0
+        self._fallback_ok_streak += 1
+        if self._fallback_ok_streak >= 5:
+            self._switch("main")
 
     def stats(self) -> str:
         return f"calls={self.calls} in={self.total_input_tokens:,} out={self.total_output_tokens:,}"

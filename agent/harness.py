@@ -34,6 +34,7 @@ class HarnessResult:
         self.collected = ""     # 事件流全部文本（含 bash 输出，复盘落盘用）
         self.events = 0
         self.total_tokens = 0   # assistant 步级 usage 累计（token 熔断用）
+        self.session_id = ""    # claude 会话 id（--resume 断点续会话用）
 
     def digest(self) -> str:
         return self.collected[-6000:]
@@ -119,6 +120,11 @@ def _parse_jsonl(line: str, res: HarnessResult, on_text=None):
     except json.JSONDecodeError:
         return  # 非 JSON 行（zsh 噪音等）直接丢
     res.events += 1
+    # 会话 id（init/system 与 result 事件都带）：断点续会话（--resume）的关键——
+    # 超时被杀/提前退出后 resume 同一会话，上下文零丢失（文件重建降级为兜底）
+    sid = ev.get("session_id")
+    if sid:
+        res.session_id = sid
     # token 熔断统计：只累计 assistant 事件的步级 usage（result 事件是总量，重复计入会翻倍）。
     # 按成本加权：cache_read 是缓存命中重读，价格约 input 的 1/10——全额计入会虚高 5 倍
     # 误杀正常题（run 9228 复盘：a-07 正常题 1.9 分钟被 300 万熔断误杀，cache_read 占 97%）。
@@ -146,23 +152,10 @@ def _parse_jsonl(line: str, res: HarnessResult, on_text=None):
             log.exception("harness on_text 回调异常")
 
 
-async def run_harness(cfg, prompt: str, cwd: str, timeout_s: int,
-                      on_text=None, token_budget: int = 0, model: str = "",
-                      effort: str = "", stop_event: asyncio.Event | None = None) -> HarnessResult:
-    """spawn 外部 agent CLI 跑一次攻坚。backend 支持：
-    - "claude"：内置后端（ClawGod 版 claude code）
-    - 其他值：当作可执行脚本路径（测试/自定义后端用），参数只有 cwd。
-    流式逐行读 stdout（原 communicate 一次性读完）：支持 token 熔断——
-    assistant 步级 usage 累计超 token_budget 就 kill（run 9054 复盘 b-02 单会话 920 万 token）。
-    model：非空时覆盖该会话的 ANTHROPIC_MODEL（多模型分工：hard 题用更强模型）。
-    effort：非空时加 --effort（hard 题 max 思考预算，Claude Code 2.1.231+ 支持）。
-    stop_event：外部完成信号（本题 flag 已全部入账）——置位即杀进程组提前收工。
-    单主进程 + Task 子 agent 架构下槽位时间是稀缺资源，flag 拿齐后不等模型
-    自己收尾/超时（旧多线架构靠 _cancel_loser_workers 做同等事，重构后一度丢失）。"""
-    if cfg.harness_backend == "claude":
-        env, cmd = _claude_env(cfg, model), _claude_cmd(cfg, effort, model)
-    else:
-        env, cmd = dict(os.environ), [cfg.harness_backend]
+async def _run_proc(cmd: list[str], env: dict, prompt: str, cwd: str, timeout_s: int,
+                    on_text=None, token_budget: int = 0,
+                    stop_event: asyncio.Event | None = None) -> HarnessResult:
+    """spawn 一次 claude 进程并读完输出流（run_harness 的执行体）。"""
     res = HarnessResult()
     # 完整命令行入日志（12464 复盘：只打 cmd[0] 时无法事后判断 effort 是否被传上——
     # 全轮 reasoning=0 却查不出哪环丢了 --effort）
@@ -238,4 +231,38 @@ async def run_harness(cfg, prompt: str, cwd: str, timeout_s: int,
         if proc.returncode is None:
             _kill_proc(proc)
     log.info("[harness] 结束 rc=%s events=%d tokens=%d", proc.returncode, res.events, res.total_tokens)
+    return res
+
+
+async def run_harness(cfg, prompt: str, cwd: str, timeout_s: int,
+                      on_text=None, token_budget: int = 0, model: str = "",
+                      effort: str = "", stop_event: asyncio.Event | None = None,
+                      resume_session_id: str = "") -> HarnessResult:
+    """spawn 外部 agent CLI 跑一次攻坚。backend 支持：
+    - "claude"：内置后端（ClawGod 版 claude code）
+    - 其他值：当作可执行脚本路径（测试/自定义后端用），参数只有 cwd。
+    流式逐行读 stdout（原 communicate 一次性读完）：支持 token 熔断——
+    assistant 步级 usage 累计超 token_budget 就 kill（run 9054 复盘 b-02 单会话 920 万 token）。
+    model：非空时覆盖该会话的 ANTHROPIC_MODEL（多模型分工：hard 题用更强模型）。
+    effort：非空时加 --effort（hard 题 max 思考预算，Claude Code 2.1.231+ 支持）。
+    stop_event：外部完成信号（本题 flag 已全部入账）——置位即杀进程组提前收工。
+    单主进程 + Task 子 agent 架构下槽位时间是稀缺资源，flag 拿齐后不等模型
+    自己收尾/超时（旧多线架构靠 _cancel_loser_workers 做同等事，重构后一度丢失）。
+    resume_session_id：非空时 claude --resume 续上一会话——断点重跑/retry 轮
+    上下文零丢失（NOTES/RELAY 文件重建从主要手段降级为兜底）。resume 无输出
+    （session 丢失/ClawGod 版不支持）时自动去掉 --resume 原样重跑，零风险。"""
+    if cfg.harness_backend == "claude":
+        env, base_cmd = _claude_env(cfg, model), _claude_cmd(cfg, effort, model)
+    else:
+        env, base_cmd = dict(os.environ), [cfg.harness_backend]
+    cmd = base_cmd
+    if resume_session_id:
+        cmd = [base_cmd[0], "--resume", resume_session_id] + base_cmd[1:]
+    res = await _run_proc(cmd, env, prompt, cwd, timeout_s,
+                          on_text, token_budget, stop_event)
+    if resume_session_id and res.events == 0:
+        log.warning("[harness] --resume %s… 无输出（session 丢失或版本不支持），去掉 resume 重跑",
+                    resume_session_id[:16])
+        res = await _run_proc(base_cmd, env, prompt, cwd, timeout_s,
+                              on_text, token_budget, stop_event)
     return res

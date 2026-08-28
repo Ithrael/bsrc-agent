@@ -51,6 +51,27 @@ def _challenge_completed(ch: Challenge) -> bool:
     )
 
 
+def _read_resource() -> tuple[float | None, int | None]:
+    """读 loadavg(1min) 与 MemAvailable(MB)。非 Linux（本地 macOS 调试）读不到
+    /proc 返回 (None, None)——看门狗不干预，资源约束只在托管 Linux 沙箱生效。"""
+    load: float | None = None
+    mem: int | None = None
+    try:
+        with open("/proc/loadavg") as f:
+            load = float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        with open("/proc/meminfo") as f:
+            for ln in f:
+                if ln.startswith("MemAvailable:"):
+                    mem = int(ln.split()[1]) // 1024
+                    break
+    except (OSError, ValueError, IndexError):
+        pass
+    return load, mem
+
+
 def _aggregate_events(events: list[dict]) -> dict[str, dict]:
     """events.jsonl 行聚合成每题统计：attempts / completed / p50（完整解出耗时
     中位数，只统计解出的 attempt）/ solve_prob。"""
@@ -105,7 +126,7 @@ def _load_cross_run_events(run_dir: str, lookback: int = 5) -> dict[str, dict]:
     if not _RUN_DIR_TS_RE.match(os.path.basename(os.path.normpath(run_dir))):
         return _aggregate_events(events)
     cur = os.path.abspath(os.path.join(run_dir, "events.jsonl"))
-    parent = os.path.dirname(cur)
+    parent = os.path.dirname(os.path.dirname(cur))   # cur 的父目录是 run 目录，再上一层才是 runs/
     try:
         siblings = sorted(
             (p for p in glob.glob(os.path.join(parent, "*", "events.jsonl"))
@@ -219,6 +240,13 @@ class Scheduler:
         # 重置计时；零 flag 零新 FACTS 持续 ≥2×boost 窗口的 attempt 被 cancel 轮转
         self._stagnate_sample: dict[str, tuple[float, int, int]] = {}
         self._last_preempt_ts = 0.0          # 抢占频率上限（10min 一个，防连环误杀）
+        # 卡面催线（T1）：多 flag 题进度停在 0<N<T 的停滞计时 code -> (N, 首停时刻)
+        self._surface_stuck: dict[str, tuple[int, float]] = {}
+        self._refanout_ts: dict[str, float] = {}
+        # 资源看门狗（T1）：load/mem 连续 2 次超阈 → 紧张态（不配双主、催减线）
+        self._res_high_streak = 0
+        self._res_normal_streak = 0
+        self._res_watchdog_stop = False
 
     def _in_endgame(self) -> bool:
         """是否进入收尾段：开跑超过「名义窗口 - ENDGAME_MIN」分钟。
@@ -304,6 +332,9 @@ class Scheduler:
         attempt cancel 轮转（断点已落盘，retry 续跑）；有任何新事实/新 flag 的
         窗口不动（12641 复盘：一次性窗口打穿的收益，不误杀健康窗口）。"""
         if self.cfg.stagnate_boost_min <= 0:
+            # 掉速插队/抢占关闭，但卡面催线（独立的温和干预）照常
+            self._sample_active_workers(time.monotonic())
+            self._refanout_stuck_surfaces(time.monotonic())
             return
         try:
             challenges = await self._refresh()
@@ -316,6 +347,7 @@ class Scheduler:
             self._last_progress_ts = now
         # 抢占采样与全局是否掉速无关（有变化就重置基线）
         self._sample_active_workers(now)
+        self._refanout_stuck_surfaces(now)
         if now - self._last_progress_ts < self.cfg.stagnate_boost_min * 60:
             return
         if now - self._last_boost_ts < 1200:
@@ -384,6 +416,89 @@ class Scheduler:
                         "（断点已落盘，retry 续跑，槽位让给插队题）",
                         code, stall_s // 60)
             t.cancel()
+
+    def _refanout_stuck_surfaces(self, now: float):
+        """卡面催线（T1）：多 flag 题进度停在 0<N<T 连续 15min 且 attempt 在跑时，
+        向该题 RELAY.md 追加加线指令——比停滞抢占温和：不杀进程，催主控对卡住
+        的面换角度加派 2 条子 agent 线（主控/子 agent 都会读 RELAY 接力块）。
+        20min 冷却防重复注入；进度有推进即重置计时。"""
+        for code, workers in list(getattr(self, "active_workers", {}).items()):
+            try:
+                w = workers[0]
+                cc = w.submitter.correct_count
+                total = w.submitter.expected_flags
+            except Exception:
+                self._surface_stuck.pop(code, None)
+                continue
+            if not (0 < cc < total):
+                self._surface_stuck.pop(code, None)
+                continue
+            prev = self._surface_stuck.get(code)
+            if prev and prev[0] == cc:
+                if (now - prev[1] >= 15 * 60
+                        and now - self._refanout_ts.get(code, 0) >= 20 * 60):
+                    self._refanout_ts[code] = now
+                    try:
+                        with open(os.path.join(self.run_dir, code, "RELAY.md"), "a") as f:
+                            f.write(
+                                f"\n[系统 {time.strftime('%H:%M')}] flag 进度停在 {cc}/{total} 已 15 分钟。\n"
+                                "对卡住的面立即换角度加派 2 条子 agent 线"
+                                "（不同攻击面/不同主机/不同凭据，角度参考分类作战手册），"
+                                "不要守着同一方向反复试；已排除方向见 STATE.md 的 ## ELIMINATED。\n")
+                        log.warning("[refanout] %s 进度停在 %d/%d 已 15min，RELAY.md 注入加线指令",
+                                    code, cc, total)
+                    except OSError:
+                        pass
+            else:
+                self._surface_stuck[code] = (cc, now)
+
+    async def _resource_watchdog(self):
+        """资源看门狗（30s 采样）：双主/多子 agent 模式的安全带（12231 复盘：
+        24 个 claude 进程吃爆 8核16G、后半程秒退空转）。检测逻辑在
+        _resource_tick（可测），这里只做周期调度。
+        非 Linux（本地调试）读不到 /proc 时静默不干预。"""
+        if not self.cfg.resource_watchdog:
+            return
+        while not self._res_watchdog_stop:
+            await asyncio.sleep(30)
+            self._resource_tick(*_read_resource())
+
+    def _resource_tick(self, load: float | None, mem: int | None):
+        """单次采样状态机：load>6 或可用内存<2GB 连续 2 次 → 紧张态
+        （大题不配双主、在跑题 STATE.md 注入「子 agent ≤3」）；
+        恢复正常连续 2 次解除。load/mem 双 None（非 Linux）不动作。"""
+        if load is None and mem is None:
+            return
+        tight = (load is not None and load > 6.0) or (mem is not None and mem < 2048)
+        if tight:
+            self._res_high_streak += 1
+            self._res_normal_streak = 0
+            if self._res_high_streak >= 2 and not self.cfg.resource_tight:
+                self.cfg.resource_tight = True
+                log.warning("[resource] 紧张（load=%s, memAvail=%sMB）：新题不配双主，"
+                            "在跑题注入「子 agent ≤3」", load, mem)
+                self._notify_resource_state(True)
+        else:
+            self._res_normal_streak += 1
+            self._res_high_streak = 0
+            if self._res_normal_streak >= 2 and self.cfg.resource_tight:
+                self.cfg.resource_tight = False
+                log.info("[resource] 恢复正常（load=%s, memAvail=%sMB）：解除并行限制", load, mem)
+                self._notify_resource_state(False)
+
+    def _notify_resource_state(self, tight: bool):
+        """资源态变化时向所有在跑题的 STATE.md 注入一行（主控/子 agent 按 prompt
+        约定读 FACTS 即见——与 watchdog 容器轮换同一注入通道）。"""
+        line = ("- [系统] 资源紧张：整机 load/内存超阈，子 agent 数量控制在 3 以内，"
+                "暂缓新一轮并行派发，串行推进当前最有希望的方向"
+                if tight else
+                "- [系统] 资源已恢复：可恢复正常并行派发")
+        for code, workers in list(getattr(self, "active_workers", {}).items()):
+            try:
+                with open(workers[0].state_path, "a") as f:
+                    f.write("## FACTS\n" + line + "\n")
+            except (OSError, AttributeError):
+                pass
 
     async def _start_throttled(self, code: str) -> list[str]:
         """start 接口限速（相邻调用 ≥0.6s）：平台文档上限 3 题并发，
@@ -541,6 +656,9 @@ class Scheduler:
                     return
                 if self._should_pair(ch):
                     await self._run_paired(ch, addrs, ws, budget_cap_min)
+                    return
+                if self._should_second_brain(ch):
+                    await self._run_claude_with_brain(ch, addrs, ws, attempt, budget_cap_min)
                     return
                 worker = Worker(self.cfg, self.llm, self.api, ch, addrs, ws, self.deadline,
                                 attempt=attempt, agent_semaphore=self._agent_sem,
@@ -708,29 +826,45 @@ class Scheduler:
         await self._finish(ch, merged)
 
     def _should_pair(self, ch: Challenge) -> bool:
-        """大题双 worker：总分高、flag 多、无完整解法可复现时，两条思考线共享一个容器。
+        """大题双 worker：两条思考线共享一个容器。
 
-        复盘：b-02/b-03（1200 分大题）单线 60min 首轮封顶吃满仍只拿 2/6、3/6，
-        内网链/多阶段题需要并行探路；有 completed 解法的题直接复现更快，不配。
+        claude 模式（T2 分区双主）：flag≥4 且无完整解法的大题（1200+ 分或
+        attempt≥1 的二轮起）配两个主进程分区攻坚——A 主带 Web 入口方向组、
+        B 主带内网横向方向组，各自进程内再派 Task 子 agent。单主进程协调
+        6-8 条线时的上下文膨胀与派发间隔是隐性串行点，分区后协调开销也并行；
+        复盘 b-02/b-03（1200 分）单主 60min 封顶只拿 2/6、3/6。
+        资源紧张态不配（看门狗），复现题不配（直接复现更快）。
+        裸 LLM 模式保留原逻辑（总分≥1000 且 flag≥3）。
         """
         if not self.cfg.pair_workers:
             return False
-        if self.cfg.claude_worker:
-            return False  # claude 直接解题模式：每题一个 claude code 进程已够，双 worker 是裸 LLM 概念
+        if getattr(self.cfg, "resource_tight", False):
+            return False  # 资源看门狗紧张态：降为单主，防 12231 式爆机
         if self.cfg.round_num == 1:
             return False  # ROUND=1 覆盖优先：双 worker 是攻坚武器，留给第 2 轮
-        if ch.total_score < 1000 or ch.flag_count < 3:
-            return False
         if _LIB.get(ch.unique_code, {}).get("completed"):
+            return False
+        if self.cfg.claude_worker:
+            return (ch.flag_count >= 4
+                    and (ch.total_score >= 1200
+                         or self._attempts.get(ch.unique_code, 0) >= 1))
+        if ch.total_score < 1000 or ch.flag_count < 3:
             return False
         return True
 
     async def _run_paired(self, ch: Challenge, addrs: list[str], ws: str,
                           budget_cap_min: float = 0):
-        """同一容器跑 2 个 worker：共享 FlagSubmitter（进度/completed 判定）与 NOTES.md，
-        工作区隔离（worker-A / worker-B），A 主攻入口面、B 主攻内网/横向。"""
+        """同一容器跑 2 个 worker：共享 FlagSubmitter（进度/completed 判定）与
+        NOTES/STATE/RELAY/HOSTS，工作区隔离（worker-A / worker-B）。
+
+        claude 模式（T2 分区双主）：A/B 各是一个 claude 主进程，进程内再派 Task
+        子 agent——A 主只带 Web 入口方向组、B 主只带内网横向方向组（role_extra
+        约束 + 共享台账防撞面），任一主拿全 flag completion_event 双杀。
+        裸 LLM 模式：两条独立思考线原语义。"""
         code = ch.unique_code
-        log.info("[%s] 双 worker 并行（%d 分 %d flags）", code, ch.total_score, ch.flag_count)
+        log.info("[%s] 双 worker 并行（%s，%d 分 %d flags）",
+                 code, "claude 分区双主" if self.cfg.claude_worker else "裸 LLM",
+                 ch.total_score, ch.flag_count)
         submitter = FlagSubmitter(code, ch.flag_count, ch.correct_flag_count,
                                    wrong_cap=self.cfg.wrong_submit_cap)
         completion_event = asyncio.Event()
@@ -738,16 +872,35 @@ class Scheduler:
         if not os.path.exists(notes_path):
             with open(notes_path, "w") as f:
                 f.write(f"# {code} 笔记（双 worker 共享）\n\n目标: {', '.join(addrs)}\n\n")
-        role_a = ("\n## 并行协作\n"
-                  "本题同时有另一个 worker 在解同一目标（共享 ../NOTES.md、../STATE.md 与 flag 进度）。"
-                  "你主攻：Web 入口面、认证、已知 CVE、本机 flag 直读。"
-                  "关键发现（端点/凭据/payload）用短行 echo 追加进 ../NOTES.md "
-                  "（长内容 write_file 到独立文件），开新方向前先读 ../STATE.md 的 FACTS/ELIMINATED 避免重复。")
-        role_b = ("\n## 并行协作\n"
-                  "本题同时有另一个 worker 在解同一目标（共享 ../NOTES.md、../STATE.md 与 flag 进度）。"
-                  "你主攻：内网/横向移动/非 Web 端口/多阶段链后续阶段。"
-                  "先 read_file ../STATE.md 与 ../NOTES.md 了解对方进展，只做对方没做的事；"
-                  "你的发现同样用短行 echo 追加进 ../NOTES.md，放弃的方向登记进 ../STATE.md 的 ## ELIMINATED。")
+        if self.cfg.claude_worker:
+            shared = ("共享 ../NOTES.md、../STATE.md、../RELAY.md、../HOSTS.md 与 flag 提交通道；"
+                      "进度以 STATE.md 的 FACTS 为准，拿全所有 flag 才收工。")
+            # [ZONE:...] 机器标记：worker._run_claude 据此裁剪本主的 Task 线组
+            # （A 主 ADE 三线 / B 主 BCFGH 五线），正文拼进 prompt
+            role_a = ("[ZONE:web]\n## 分区双主（你是 A 主：入口与 Web 面方向组）\n"
+                      "本题同时有 B 主进程在打内网/横向面（" + shared + "）\n"
+                      "你的 Task 子 agent 只做 Web 入口方向：已知 CVE 直打/业务逻辑/注入类/"
+                      "认证与越权/文件与路径/信息泄露；子 agent 工作目录用 line_A1、line_A2… 前缀。\n"
+                      "发现内网线索（主机/凭据/隧道原语）只写 NOTES.md 标注「交接 B 主」，不自己深入。\n")
+            role_b = ("[ZONE:intranet]\n## 分区双主（你是 B 主：内网与横向面方向组）\n"
+                      "本题同时有 A 主进程在打 Web 入口面（" + shared + "）\n"
+                      "你的 Task 子 agent 只做内网方向：拓扑绘制/内网扫描/凭证重放/提权与容器逃逸/"
+                      "云元数据/flag_sweep 收尾直读；子 agent 工作目录用 line_B1、line_B2… 前缀。\n"
+                      "开打前先读 HOSTS.md 资产台账与 RELAY.md 接力块；A 主的 Web 突破线索在 NOTES.md。\n"
+                      "渐进派发（13397 复盘）：RELAY.md 尚无入口原语（RCE/shell/SSH/任意文件读）时，"
+                      "先派独立线（拓扑绘制/凭证重放/云元数据），等原语出现再派依赖线"
+                      "（内网扫描/提权与逃逸/flag_sweep 收尾直读），别让依赖线在无入口时空等。\n")
+        else:
+            role_a = ("\n## 并行协作\n"
+                      "本题同时有另一个 worker 在解同一目标（共享 ../NOTES.md、../STATE.md 与 flag 进度）。"
+                      "你主攻：Web 入口面、认证、已知 CVE、本机 flag 直读。"
+                      "关键发现（端点/凭据/payload）用短行 echo 追加进 ../NOTES.md "
+                      "（长内容 write_file 到独立文件），开新方向前先读 ../STATE.md 的 FACTS/ELIMINATED 避免重复。")
+            role_b = ("\n## 并行协作\n"
+                      "本题同时有另一个 worker 在解同一目标（共享 ../NOTES.md、../STATE.md 与 flag 进度）。"
+                      "你主攻：内网/横向移动/非 Web 端口/多阶段链后续阶段。"
+                      "先 read_file ../STATE.md 与 ../NOTES.md 了解对方进展，只做对方没做的事；"
+                      "你的发现同样用短行 echo 追加进 ../NOTES.md，放弃的方向登记进 ../STATE.md 的 ## ELIMINATED。")
         state_path = os.path.join(ws, "STATE.md")
         state_lock = threading.Lock()
         both_transcripts = [os.path.join(ws, "worker-A", "transcript.jsonl"),
@@ -759,7 +912,8 @@ class Scheduler:
                      state_lock=state_lock, role_extra=role_a,
                      transcripts=both_transcripts, agent_semaphore=self._agent_sem,
                      completion_event=completion_event,
-                     budget_cap_min=budget_cap_min)
+                     budget_cap_min=budget_cap_min,
+                     shared_ws=ws)
         w_b = Worker(self.cfg, self.llm, self.api, ch, addrs,
                      os.path.join(ws, "worker-B"), self.deadline,
                      submitter=submitter,
@@ -768,7 +922,8 @@ class Scheduler:
                      transcripts=both_transcripts,
                      write_notes_injection=False, agent_semaphore=self._agent_sem,
                      completion_event=completion_event,
-                     budget_cap_min=budget_cap_min)  # 解法注入只由 A 写共享笔记
+                     budget_cap_min=budget_cap_min,
+                     shared_ws=ws)  # 解法注入只由 A 写共享笔记
         self.active_workers[code] = [w_a, w_b]
         merged = WorkerResult()
         try:
@@ -818,6 +973,102 @@ class Scheduler:
                 }, f, ensure_ascii=False, indent=2)
         except OSError:
             pass
+        await self._finish(ch, merged)
+
+    def _should_second_brain(self, ch: Challenge) -> bool:
+        """裸 LLM 副线（T3）：claude 主线同题并行一条廉价思考线。非复现的
+        hard/多 flag 题才配——easy/medium 单 flag flash 主线足够，副线纯烧
+        token；双主题不配（已两线，再叠会踩共享文件）。"""
+        if not self.cfg.claude_worker or not self.cfg.second_brain:
+            return False
+        if getattr(self.cfg, "resource_tight", False):
+            return False
+        if _LIB.get(ch.unique_code, {}).get("completed"):
+            return False
+        return ch.difficulty == "hard" or ch.flag_count >= 2
+
+    async def _run_claude_with_brain(self, ch: Challenge, addrs: list[str], ws: str,
+                                     attempt: int, budget_cap_min: float = 0):
+        """claude 主线 + 裸 LLM 副线并发（T3）：副线共享 STATE/NOTES/submitter，
+        预算封顶 SECOND_BRAIN_MIN 到期自退；任一线拿全 flag completion_event
+        杀两边。价值：claude 网关抖动/健康度降级期间解题不断线（裸循环走
+        OpenAI 兼容端点，与 claude 的 Anthropic 通道互为冗余）+ 廉价视角撞 flag。"""
+        code = ch.unique_code
+        log.info("[%s] claude 主线 + 裸 LLM 副线（副线预算 %dmin）",
+                 code, self.cfg.second_brain_min)
+        submitter = FlagSubmitter(code, ch.flag_count, ch.correct_flag_count,
+                                   wrong_cap=self.cfg.wrong_submit_cap)
+        completion_event = asyncio.Event()
+        notes_path = os.path.join(ws, "NOTES.md")
+        state_path = os.path.join(ws, "STATE.md")
+        if not os.path.exists(notes_path):
+            with open(notes_path, "w") as f:
+                f.write(f"# {code} 笔记\n\n目标: {', '.join(addrs)}\n\n")
+        if not os.path.exists(state_path):
+            with open(state_path, "w") as f:
+                f.write("# 结构化状态（FACTS 由代码自动维护；INTENTS/ELIMINATED 由你按约定登记）\n\n"
+                        "## FACTS\n"
+                        f"- flag 进度: 0/{ch.flag_count}\n")
+        main_w = Worker(self.cfg, self.llm, self.api, ch, addrs, ws, self.deadline,
+                        attempt=attempt, submitter=submitter,
+                        notes_path=notes_path, state_path=state_path,
+                        completion_event=completion_event,
+                        agent_semaphore=self._agent_sem,
+                        budget_cap_min=budget_cap_min,
+                        shared_ws=ws)
+        brain_role = ("\n## 副线（第二大脑）\n"
+                      "本题另有一条更强的主线在并行解题（共享 NOTES.md/STATE.md 与提交通道）。"
+                      "你是快速助攻，不要求拿全：\n"
+                      "1. 优先试主线可能忽略的冷门角度（非 Web 端口/协议服务/云元数据/备份与源码文件/"
+                      "历史 CVE 的旧组件），每步小而快，单条命令 ≤60s；\n"
+                      "2. 开打前先读 STATE.md 的 FACTS/ELIMINATED——已排除方向不要重复；\n"
+                      "3. 发现（端点/凭据/payload）用短行 echo 追加进 ../NOTES.md 标注 [副线]，"
+                      "长内容写独立文件；\n"
+                      "4. 拿到 flag 立即用 submit_flag 工具提交；\n"
+                      "5. 时间预算很短：没进展就 finish 让位，把 token 留给主线。")
+        brain_w = Worker(self.cfg, self.llm, self.api, ch, addrs,
+                         os.path.join(ws, "brain"), self.deadline,
+                         submitter=submitter,
+                         notes_path=notes_path, state_path=state_path,
+                         role_extra=brain_role, completion_event=completion_event,
+                         budget_cap_min=float(self.cfg.second_brain_min),
+                         force_raw_llm=True)
+        self.active_workers[code] = [main_w, brain_w]
+        merged = WorkerResult()
+        try:
+            tasks = [asyncio.create_task(main_w.run()), asyncio.create_task(brain_w.run())]
+
+            async def _cancel_on_complete():
+                await completion_event.wait()
+                if submitter.completed:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+
+            stopper = asyncio.create_task(_cancel_on_complete())
+            try:
+                res_main, res_brain = await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                stopper.cancel()
+            merged.completed = submitter.completed or any(
+                r.completed for r in (res_main, res_brain) if isinstance(r, WorkerResult))
+            merged.score = submitter.score
+            merged.flags = sorted(submitter.correct)
+            merged.elapsed_min = max(
+                (r.elapsed_min for r in (res_main, res_brain) if isinstance(r, WorkerResult)),
+                default=0.0)
+            reasons = []
+            for tag, r in (("main", res_main), ("brain", res_brain)):
+                reasons.append(f"{tag}: {r.reason}" if isinstance(r, WorkerResult)
+                               else f"{tag}: crash {type(r).__name__}")
+            merged.reason = " / ".join(reasons)
+            merged.meta = {"model": f"claude+brain:{self.cfg.llm_model}",
+                           "fan_out": 2,
+                           "tokens": sum((r.meta or {}).get("tokens", 0)
+                                         if isinstance(r, WorkerResult) else 0
+                                         for r in (res_main, res_brain))}
+        finally:
+            self.active_workers.pop(code, None)
         await self._finish(ch, merged)
 
     def _record_event(self, ch: Challenge, res: WorkerResult):
@@ -979,6 +1230,7 @@ class Scheduler:
                  len(challenges) - len(todo), already, len(todo))
         self.pending = sorted(todo, key=lambda c: _priority(c, self.cfg.round_num, getattr(self, "_events", {})))
         wd = asyncio.create_task(self._watchdog())
+        rw = asyncio.create_task(self._resource_watchdog())
 
         tasks: set[asyncio.Task] = set()
         while True:
@@ -1031,10 +1283,18 @@ class Scheduler:
                         # 节流回查平台（60s）把可回挖的题带回补空槽（P0）——
                         # 此前回查只在「无任何在跑任务」时触发，长窗口期间的
                         # 空槽要等窗口自然结束，最长 45min 纯空转。
+                        # 节流只在「带回题/平台全解开」时消耗：空手（未解题全在跑）
+                        # 不消耗，否则刚派发完的那次空查会把之后任务结束的
+                        # 关键补位窗口整个节流掉。
                         now_mono = time.monotonic()
-                        if now_mono - self._last_idle_recheck_ts >= 60:
+                        if now_mono - self._last_idle_recheck_ts < 60:
+                            break   # 节流窗口内：等下一 tick
+                        brought = await self._platform_recheck(exclude_running=True)
+                        if self.pending:
                             self._last_idle_recheck_ts = now_mono
-                            await self._platform_recheck(exclude_running=True)
+                            continue    # 回查带回可回挖题：立即派发补空槽，不等下一 tick
+                        if not brought:
+                            self._last_idle_recheck_ts = now_mono  # 平台已无未解题
                         break
                 ch = self.pending.pop(0)
                 wait_until = self._start_backoff.get(ch.unique_code, 0)
@@ -1077,6 +1337,8 @@ class Scheduler:
                     tasks.discard(task)
                     self.running.pop(_code, None)
                     self._stagnate_sample.pop(_code, None)
+                    self._surface_stuck.pop(_code, None)
+                    self._refanout_ts.pop(_code, None)
 
                 t.add_done_callback(_task_done)
                 time_left = self.deadline - time.monotonic()
@@ -1102,7 +1364,9 @@ class Scheduler:
 
         # 总结
         self._watchdog_stop = True
+        self._res_watchdog_stop = True
         wd.cancel()
+        rw.cancel()
         solved = [k for k, v in self.done.items() if v.get("completed")]
         total_score = sum(v.get("score", 0) for v in self.done.values())
         log.info("=" * 50)

@@ -449,8 +449,11 @@ def _zero_score_history(ws: str, code: str) -> int:
 class Worker:
     # 动态升级门槛：跑满 4 分钟且 12 步无新 flag 才升级 harness（测试可调小）
     harness_upgrade_after_s = 240
-    # flag 兜底提交周期（秒）：drain 通道轮询事件流捕获的 flag；测试可调小
-    _drain_interval_s = 20
+    # flag 兜底提交周期（秒）：drain 通道轮询事件流捕获的 flag；测试可调小。
+    # 20→5（T1）：完成早停链路（STATE 进度行→drain→杀进程组）的感知延迟直接
+    # 决定「最后一面 flag 到手→槽位释放」的间隔，每轮几十次轮转累计省分钟级；
+    # 代价只是每 5s 读两个本地文件 + 偶尔几次提交 API
+    _drain_interval_s = 5
 
     def __init__(self, cfg: Config, llm: LLMClient, api: TsecClient,
                  challenge: Challenge, addrs: list[str], workspace: str,
@@ -464,7 +467,9 @@ class Worker:
                  write_notes_injection: bool = True,
                  agent_semaphore: asyncio.Semaphore | None = None,
                  completion_event: asyncio.Event | None = None,
-                 budget_cap_min: float = 0):
+                 budget_cap_min: float = 0,
+                 shared_ws: str = "",
+                 force_raw_llm: bool = False):
         self.cfg = cfg
         self.llm = llm
         self.api = api
@@ -482,6 +487,12 @@ class Worker:
         # 单次预算硬封顶（分钟，0=不封顶）：scheduler endgame 快赢耗尽后放行
         # 最优候选时设置——剩余尾段窗口装不下满预算，cap 到装得下为止
         self.budget_cap_min = budget_cap_min
+        # 共享工作区根（双主/副线模式）：RELAY/HOSTS/submit_flag.sh/line 软链的
+        # 落点。单主时空串=self.ws（行为不变）；pair 时双主共用一份提交脚本与
+        # 锁文件（.flag_lock/.flag_tried），防双主各自为政重复提交
+        self.shared_ws = shared_ws
+        # 强制裸 LLM 循环（副线用）：cfg.claude_worker 全局开时按 worker 级覆盖
+        self.force_raw_llm = force_raw_llm
         self.started = time.monotonic()
         self.result = WorkerResult()
         # 双 worker 模式：submitter/notes_path/state_path 共享，role_extra 分工提示
@@ -831,20 +842,23 @@ class Worker:
             return ""
         if self.ch.flag_count >= 2:
             prompt = (
-                "把这次未解出的渗透会话蒸馏成接力块，只输出六行，每行一句、可直接执行：\n"
+                "把这次未解出的渗透会话蒸馏成接力块，只输出七行，每行一句、可直接执行：\n"
                 "已达成原语: <本次真拿到的胜利态：任意读/RCE/已破口令/已建隧道，没有就写'无'>\n"
                 "内网拓扑: <已确认的主机/IP/端口/网段清单，没有就写'无'>\n"
                 "已拿主机与凭据: <已攻破主机 + 可用凭据，没有就写'无'>\n"
                 "已证死路: <试过走不通的，附一句为什么>\n"
                 "可复用文件: <工作区里可直接复用的脚本/输出文件路径（如 scripts/x.py、.tmp/fscan.out），没有就写'无'>\n"
-                "下一步: <紧接原语的下一个目标主机/具体命令/payload>\n\n"
+                "下一步: <紧接原语的下一个目标主机/具体命令/payload>\n"
+                "跨题方法论: <本次过程中发现的、对其他题也通用的一句话技巧"
+                "（通用工具用法/平台机制/组件指纹/默认凭证类），没有就写'无'>\n\n"
                 f"会话摘要（事件流尾部）：\n{digest[-6000:]}")
         else:
             prompt = (
-                "把这次未解出的渗透会话蒸馏成接力块，只输出三行，每行一句、可直接执行：\n"
+                "把这次未解出的渗透会话蒸馏成接力块，只输出四行，每行一句、可直接执行：\n"
                 "已达成原语: <本次真拿到的胜利态：任意读/RCE/已破口令/已建隧道，没有就写'无'>\n"
                 "已证死路: <试过走不通的，附一句为什么>\n"
-                "下一步: <紧接原语的具体命令/payload>\n\n"
+                "下一步: <紧接原语的具体命令/payload>\n"
+                "跨题方法论: <本次过程中发现的、对其他题也通用的一句话技巧，没有就写'无'>\n\n"
                 f"会话摘要（事件流尾部）：\n{digest[-6000:]}")
         try:
             # 15s 超时保险：蒸馏是收尾增强项，网关卡住不能阻塞轮转 300s
@@ -879,7 +893,24 @@ class Worker:
         except OSError:
             pass
         log.info("[%s] 接力块蒸馏落盘（%d 字符）", self.ch.unique_code, len(text))
+        self._distill_intel(text)
         return text
+
+    def _distill_intel(self, relay_text: str):
+        """跨题方法论回写（T4）：从蒸馏输出解析「跨题方法论:」行，追加 JSONL 进
+        intel.json.new——下题启动 read_intel() 自动注入（解一题惠全题的自动闭环，
+        此前只靠 claude 自觉写）。占位「无」/过短内容不写。"""
+        m = re.search(r"跨题方法论[:：]\s*(.+)", relay_text or "")
+        tip = (m.group(1).strip() if m else "").strip("'\" ")
+        if not tip or tip == "无" or len(tip) < 8:
+            return
+        try:
+            key = f"实测-{self.ch.unique_code}-{time.strftime('%m%d-%H%M')}"[:60]
+            with open(intel_lib_path() + ".new", "a") as f:
+                f.write(json.dumps({key: tip[:300]}, ensure_ascii=False) + "\n")
+            log.info("[%s] 跨题方法论已回写 intel（%d 字符）", self.ch.unique_code, len(tip))
+        except OSError:
+            pass
 
     def _rotation_notice(self) -> str:
         """容器轮换检测（对标 Heimdall 的 instance_rotated/prev_addrs 元数据）：
@@ -1444,6 +1475,30 @@ class Worker:
             n += 1
         return n
 
+    def _line_stats(self) -> dict[str, int]:
+        """STATE.md「## 线效」节：`- [X] flag:N` 行 → {X: N}。主控收尾按 prompt
+        约定登记（T4 per-line 归因）——跨题聚合后可统计各攻击角度的实测胜率，
+        优化撒网侧重。同线多行累加（断点重跑会追加新块）。"""
+        try:
+            with open(self.state_path) as f:
+                lines = f.read().splitlines()
+        except OSError:
+            return {}
+        out: dict[str, int] = {}
+        cur = False
+        for ln in lines:
+            if ln.startswith("## 线效"):
+                cur = True
+                continue
+            if ln.startswith("## "):
+                cur = False    # 其他节关闭采集但不终止——断点重跑会追加新线效块
+                continue
+            if cur:
+                m = re.match(r"-\s*\[(\w+)\]\s*flag[:：]\s*(\d+)", ln.strip())
+                if m:
+                    out[m.group(1)] = out.get(m.group(1), 0) + int(m.group(2))
+        return out
+
     def _run_meta(self) -> dict:
         """事件统计元数据（scheduler events.jsonl 实测数据排序用，fix 6）：
         模型/fan-out/token/首 flag 相对秒数/已达成原语数。"""
@@ -1453,6 +1508,7 @@ class Worker:
             "tokens": getattr(self, "_tokens_used", 0),
             "first_flag_s": self._first_flag_offset(),
             "primitives": self._relay_primitives(),
+            "lines": self._line_stats(),
         }
 
     async def _sync_state_progress(self):
@@ -1498,6 +1554,29 @@ class Worker:
             await asyncio.sleep(self._drain_interval_s)
             await self._submit_harness_flags()
             await self._sync_state_progress()
+
+    # ---- claude 会话持久化（--resume 断点续会话）----
+
+    def _session_file(self) -> str:
+        return os.path.join(self.ws, "claude-session.json")
+
+    def _save_session_id(self, sid: str):
+        """记录最近一次 claude 会话 id（分区双主/副线各有独立 ws，天然不串）。"""
+        if not sid:
+            return
+        try:
+            with open(self._session_file(), "w") as f:
+                json.dump({"session_id": sid, "ts": time.strftime("%H:%M:%S"),
+                           "attempt": self.attempt}, f)
+        except OSError:
+            pass
+
+    def _load_session_id(self) -> str:
+        try:
+            with open(self._session_file()) as f:
+                return (json.load(f) or {}).get("session_id", "")
+        except (OSError, ValueError):
+            return ""
 
     async def _run_harness_with_drain(self, prompt: str, timeout_s: int, **kw):
         """带实时 flag 提交与完成早停的 harness 包装。
@@ -1605,6 +1684,15 @@ class Worker:
         return (res.output_text or res.digest())[-4000:]
 
     # ---- claude code 直接解题（CLAUDE_WORKER=1）----
+
+    @property
+    def _zone_role_text(self) -> str:
+        """role_extra 去掉 [ZONE:...] 机器标记后的正文（拼进 claude prompt 用；
+        裸 LLM 循环的 system 注入不受影响，仍用原 role_extra）。"""
+        t = self.role_extra or ""
+        if t.startswith("[ZONE:"):
+            t = t.split("]", 1)[1] if "]" in t else ""
+        return t
 
     def _port_hints(self) -> list[str]:
         """目标端口 → 已知攻击面/CVE 线索（P2：代码化知识注入，claude 不用自己回忆端口含义）。"""
@@ -1791,20 +1879,23 @@ class Worker:
             with open(self.state_path, "w") as f:
                 f.write("# 结构化状态（FACTS/INTENTS/ELIMINATED，跨轮复用）\n\n## FACTS\n"
                         f"- flag 进度: 0/{ch.flag_count}\n")
+        # 共享工作区根（双主/副线：RELAY/HOSTS/submit 脚本/line 软链都落在共享根，
+        # 双主共用一份提交脚本与 .flag_lock/.flag_tried 锁文件）；单主=自身 ws
+        base = getattr(self, "shared_ws", "") or self.ws
         # RELAY.md（接力块）：分治各线软链依赖其存在；提前建好空文件
-        relay_path = os.path.join(self.ws, "RELAY.md")
+        relay_path = os.path.join(base, "RELAY.md")
         if not os.path.exists(relay_path):
             with open(relay_path, "w") as f:
                 f.write("# 接力块（已达成原语/已证死路/下一步，跨线共享）\n")
-        hosts_path = os.path.join(self.ws, "HOSTS.md")
+        hosts_path = os.path.join(base, "HOSTS.md")
         if not os.path.exists(hosts_path):
             with open(hosts_path, "w") as f:
                 f.write("# 资产台账（追加行：- 主机 | 端口/服务 | 凭据(已试/命中) | flag 状态）\n")
         # 显式提交通道：claude 用 bash 跑脚本获得提交反馈闭环（输出捕获通道兜底）
-        submit_sh = os.path.join(self.ws, "submit_flag.sh")
+        submit_sh = os.path.join(base, "submit_flag.sh")
         if not os.path.exists(submit_sh):
             with open(submit_sh, "w") as f:
-                f.write(_submit_flag_script(ch, self.ws))
+                f.write(_submit_flag_script(ch, base))
             os.chmod(submit_sh, 0o755)
 
         # 解法库 / 专家复盘 / CVE 线索
@@ -1877,6 +1968,13 @@ class Worker:
             advisor_text = await self._advisor_brief(hint_text)
         # 容器轮换检测（本次尝试只算一次，注入全部线路 prompt）
         self._rotation_text = self._rotation_notice()
+        # 断点续会话（方案1）：retry 轮 resume 上次会话——上下文零丢失，
+        # 文件重建降级为兜底；resume 失败 harness 自动去 --resume 原样重跑
+        resume_sid = ""
+        if self.cfg.claude_resume and self.attempt >= 1:
+            resume_sid = self._load_session_id()
+            if resume_sid:
+                log.info("[%s] resume 上次 claude 会话（%s…）", ch.unique_code, resume_sid[:12])
 
         self._harness_flags = []
         # P0: 分治——每题 1 个主 claude 进程 + Task 工具并行派发子 agent（2026-08-24 架构改造：
@@ -1914,8 +2012,18 @@ class Worker:
                              "补其他线漏掉的面。"),
         }
         master_role = ""  # 主控角色指令（多 flag/hard 题启用；断点重跑复用同一角色）
+        # 分区标记（T2 双主）：scheduler 的 role_extra 以 [ZONE:web]/[ZONE:intranet]
+        # 开头时按分区裁剪线组——A 主只带 Web 入口方向组、B 主只带内网横向方向组，
+        # 两个主进程各 3-5 条 Task 线，协调开销也并行（单主 8 线的上下文膨胀是隐性串行点）
+        zone = ""
+        if self.role_extra.startswith("[ZONE:"):
+            zone = self.role_extra[len("[ZONE:"):].split("]", 1)[0]
         if not has_completed_sol and (ch.flag_count >= 2 or ch.difficulty in ("hard", "medium")):
-            if ch.flag_count >= 5:
+            if zone == "web":
+                line_keys = "ADE"       # A 主分区：入口面/CVE 专攻/独立侦察（Web 面）
+            elif zone == "intranet":
+                line_keys = "BCFGH"     # B 主分区：内网横向/提权/云逃逸/凭证重放/收尾直读
+            elif ch.flag_count >= 5:
                 line_keys = "ABCDEFGH"   # b-02 级 6 flags 大题：8 线方向分工
             elif ch.flag_count >= 3:
                 line_keys = "ABCDEF"     # b-01/b-03 级 4 flags：6 线方向分工
@@ -1933,6 +2041,14 @@ class Worker:
                     f"- [{key}线] {_ROLES[key][0]}：{_ROLES[key][1]}" for key in line_keys)
                 role_head = f"方向互不重叠：\n{subtask_table}\n"
                 handoff_line = "   - 发现其它方向攻击面的线索：写进 NOTES.md 交接（注明给哪条线），不要自己深入\n"
+                model_directive = ("   每个 Task 的 model 参数指定为 deepseek-v4-flash（子 agent 打宽用 flash，"
+                                   "主控统筹思考用 pro——12641 复盘：尾段 24 个 pro 会话空烧 1.5h 零产出，成本错配）\n")
+                # 渐进式 fan-out（13397 复盘）：分波派发——先派不依赖入口的线（独立侦察/
+                # 云逃逸/CVE 检索/凭证收集），等 RELAY.md 出现原语（RCE/shell/SSH/任意文件读）
+                # 再派依赖入口的线（内网横向/提权收尾/收尾直读），别让依赖线在无入口时空等烧 token
+                progressive = ("   （分波派发：先派不依赖入口的线——独立侦察/云逃逸/CVE 检索/凭证收集；"
+                               "等 RELAY.md 出现原语 RCE/shell/SSH/任意文件读 后再派依赖入口的线——"
+                               "内网横向/提权收尾/收尾直读，别让依赖线在无入口时空等）\n")
             else:
                 # 单 flag 题：独立攻克（每条线全权解这道题，角度不同，谁先解出谁提交）
                 subtask_table = "\n".join(
@@ -1941,14 +2057,21 @@ class Worker:
                     f"各线从不同角度独立攻克同一目标（角度互不重叠，但每个子 agent 都全权"
                     f"负责解出这道题、拿到 flag 就提交）：\n{subtask_table}\n")
                 handoff_line = "   - 发现其它角度的线索：写进 NOTES.md 交接（注明给哪条线），不要自己深入\n"
+                # 模型分层（T3）：探路线 flash 打宽，A 线（CVE 检索）/H 线（综合深挖）
+                # 吃知识深度用 pro——分层只涨 2/8 线成本
+                _pro = self.cfg.llm_model_hard or self.cfg.llm_model
+                model_directive = (f"   每个 Task 的 model 参数分层指定：探路线用 {self.cfg.llm_model}（打宽）；"
+                                   f"[A线]（CVE 检索）与 [H线]（综合深挖）两条用 {_pro}"
+                                   "（检索/深挖吃知识深度，flash 检索命中率低——分层成本最优）\n")
+                progressive = ""   # 单 flag 题：各线独立攻克，无「依赖入口」的先后之分
             master_role = (
                 f"## 你的角色（主控 agent，用 Task 工具并行派发子 agent 攻坚）\n"
                 f"本题共 {ch.flag_count} 面 flag，你负责统筹全局，不亲自做侦察细节：\n"
                 f"1. 先读 NOTES.md、STATE.md、RELAY.md、HOSTS.md（资产台账）：已拿到的 flag 与已排除方向不要重复攻。\n"
                 f"2. 用 Task 工具**一次性并行派发 {len(line_keys)} 个子 agent**，各自独立上下文分头攻坚，"
                 f"{role_head}"
-                "   每个 Task 的 model 参数指定为 deepseek-v4-flash（子 agent 打宽用 flash，"
-                "主控统筹思考用 pro——12641 复盘：尾段 24 个 pro 会话空烧 1.5h 零产出，成本错配）\n"
+                f"{model_directive}"
+                f"{progressive}"
                 "3. 每个子 agent 的指令里必须包含（防互相踩）：\n"
                 "   - 独立工作目录 line_{线号}/：所有脚本/输出/临时文件只写在这里，"
                 "禁止写工作目录之外的任何文件（共享文件除外）；"
@@ -1966,12 +2089,17 @@ class Worker:
                 "   - 结束前返回三行总结：已达成原语 / 已证死路 / 下一步\n"
                 "4. 子 agent 全部返回后：读它们的总结与 NOTES.md 新增，判断还缺哪几面 flag，"
                 "针对缺口再派新一轮子 agent（换攻击面/换主机/换凭证），直到全部拿齐或时间不足。\n"
-                "5. 意图节流（ATX 吸收）：若所有方向都已试过且无新线索可派，"
-                "不要为派而派——直接结束会话，调度器会按工作区断点续跑，空转派发纯烧 token。\n"
+                "5. 意图节流（ATX 吸收，13397 复盘修正）：**多 flag 题拿 1-2 面但还剩 ≥2 面时，"
+                "不算『无新线索』**——必须换攻击面/换主机/换凭证再派一轮（除非确实穷尽了 HOSTS.md "
+                "里所有已发现主机）；只有剩余 <2 面、或单 flag 题确认穷尽时，才允许按『无新线索』"
+                "结束会话，空转派发纯烧 token。\n"
                 "6. 拿到 flag 的判定以 STATE.md 的 FACTS 为准（系统自动更新），不要凭子 agent 口头汇报。\n"
                 "7. 拿全即收工：每拿到一面新 flag 就检查 STATE.md 的 FACTS 进度，若已全部入账，"
                 "立即结束本回合（无需等待剩余子 agent 返回），调度器会按拿全状态收工——"
-                "子 agent 的无效等待是纯时间浪费。")
+                "子 agent 的无效等待是纯时间浪费。\n"
+                "8. 收尾时把各线战果追加进 STATE.md 的 `## 线效` 节，每行格式"
+                "`- [线号] flag:N`（N=该线实际拿到的 flag 数，0 也要记）——用于跨题统计"
+                "各攻击角度的实测胜率，优化后续撒网策略。")
             if ch.flag_count >= 3:
                 # 多 flag 题专项清单（run 12019 复盘：b-01 1/4、b-02 2/6、b-03 1/4——
                 # 首面能拿后续纵深乏力；9489 曾靠 flagN 直读+容器逃逸+横向拿全 b-01 4/4，
@@ -2006,7 +2134,7 @@ class Worker:
                 line_dir = os.path.join(self.ws, f"line_{key}")
                 os.makedirs(line_dir, exist_ok=True)
                 for name in ("NOTES.md", "STATE.md", "RELAY.md", "HOSTS.md", "submit_flag.sh"):
-                    src, dst = os.path.join(self.ws, name), os.path.join(line_dir, name)
+                    src, dst = os.path.join(base, name), os.path.join(line_dir, name)
                     if os.path.exists(src) and not os.path.lexists(dst):
                         os.symlink(src, dst)
             # 子 agent 派发上下文内联（ATX 吸收：任务创建即历史事实注入——b 系列
@@ -2020,7 +2148,7 @@ class Worker:
                     f"{facts_inline or '(无已确认事实)'}\n"
                     f"{hosts_inline or '(无资产台账)'}")
             prompt = self._build_claude_prompt(ch, sol, notes, has_completed_sol, desc_hints,
-                                               recon_report, master_role)
+                                               recon_report, master_role + self._zone_role_text)
             if self.attempt >= 1:
                 prompt += await self._workspace_digest()
             prompt += hint_text + advisor_text
@@ -2028,10 +2156,13 @@ class Worker:
                      ch.unique_code, len(line_keys), timeout_s, token_budget)
             res = await self._run_harness_with_drain(prompt, timeout_s,
                                     on_text=self._harness_on_text, token_budget=token_budget,
-                                    model=hard_model, effort=hard_effort)
+                                    model=hard_model, effort=hard_effort,
+                                    resume_session_id=resume_sid)
+            self._save_session_id(res.session_id)
             self._tokens_used += res.total_tokens
         else:
-            prompt = self._build_claude_prompt(ch, sol, notes, has_completed_sol, desc_hints, recon_report, "")
+            prompt = self._build_claude_prompt(ch, sol, notes, has_completed_sol, desc_hints,
+                                               recon_report, self._zone_role_text)
             if self.attempt >= 1:
                 prompt += await self._workspace_digest()
             prompt += hint_text + advisor_text
@@ -2039,7 +2170,9 @@ class Worker:
                      ch.unique_code, timeout_s, token_budget)
             res = await self._run_harness_with_drain(prompt, timeout_s,
                                     on_text=self._harness_on_text, token_budget=token_budget,
-                                    model=hard_model, effort=hard_effort)
+                                    model=hard_model, effort=hard_effort,
+                                    resume_session_id=resume_sid)
+            self._save_session_id(res.session_id)
             self._tokens_used += res.total_tokens
         # 收尾统一记账（输出捕获 + STATE.md 登记行兜底：submit_flag.sh 显式通道
         # 走平台直连，Python 侧 submitter 只能靠这两条路径感知完成）
@@ -2057,16 +2190,20 @@ class Worker:
                 # 尾段封顶轮的断点重跑同步收紧，总时长不超预算 1.5 倍
                 retry_s = min(retry_s, max(120, int(timeout_s * 0.5)))
             log.info("[%s] claude 提前退出未拿全 flag，断点重跑一次（%ds）", ch.unique_code, retry_s)
-            retry_prompt = self._build_claude_prompt(ch, sol, notes, has_completed_sol, desc_hints, recon_report, master_role)
+            retry_prompt = self._build_claude_prompt(ch, sol, notes, has_completed_sol, desc_hints,
+                                                     recon_report, master_role + self._zone_role_text)
             retry_prompt += ("\n\n## 断点续跑（第二次尝试）\n"
                              "上次运行已结束但 flag 未拿全。先读 RELAY.md（接力块：原语/死路/下一步）、HOSTS.md（资产台账）、"
                              "NOTES.md 与 STATE.md 了解已有进展与已排除方向，从断点继续，"
                              "禁止重复已排除方向；全部 flag 拿齐前不要停止。")
             # 首轮内断点重跑兜底拉 hint（attempt=0 时上面没拉过）：已花完一轮时间，指引方向
             retry_prompt += (hint_text or await self._auto_hint()) + advisor_text
+            # 同 attempt 内断点重跑：resume 刚结束的会话（上下文最完整）；新会话兜底
             res2 = await self._run_harness_with_drain(retry_prompt, retry_s,
                                      on_text=self._harness_on_text, token_budget=token_budget,
-                                     model=hard_model, effort=hard_effort)
+                                     model=hard_model, effort=hard_effort,
+                                     resume_session_id=res.session_id if self.cfg.claude_resume else "")
+            self._save_session_id(res2.session_id or res.session_id)
             res.output_text = (res.output_text or "") + "\n===== 断点重跑 =====\n" + (res2.output_text or "")
             res.collected += "\n===== 断点重跑 =====\n" + res2.digest()
             res.events += res2.events
@@ -2159,7 +2296,7 @@ class Worker:
     # ---- 主循环 ----
 
     async def run(self) -> WorkerResult:
-        if self.cfg.claude_worker:
+        if self.cfg.claude_worker and not getattr(self, "force_raw_llm", False):
             return await self._run_claude()
         ch = self.ch
         box = ToolBox(self.ws, submit_cb=self._submit_cb, hint_cb=self._hint_cb,
@@ -2168,7 +2305,7 @@ class Worker:
             ch.unique_code, ch.description or "", self.addrs,
             ch.flag_count, ch.correct_flag_count, ch.total_score, ch.difficulty)
         if self.role_extra:
-            system += self.role_extra
+            system += self._zone_role_text
         self._system_prompt = system
         messages: list[dict] = [
             {"role": "system", "content": system},

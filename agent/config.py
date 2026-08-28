@@ -116,7 +116,8 @@ class Config:
     # claude code 直接解题（2026-08-14）：每道题 spawn 一个 claude code（ClawGod 版）完整解题，
     # bsrc-agent 只做调度/3并发/flag 提交/解法库。裸 LLM 循环保留（CLAUDE_WORKER=0 回退，本地调试用）。
     # 容器镜像默认开（Dockerfile ENV），本地 run-local.sh 不设（本地无 claude 二进制）。
-    # 该模式下双 worker（pair_workers）自动禁用、harness 升级逻辑不再触发（claude 就是主体）。
+    # 该模式下大题启用分区双主（flag≥4 且 1200+ 分/二轮起：A 主 Web 入口组 + B 主内网横向组，
+    # 各自进程内再派 Task 子 agent）；harness 升级逻辑不再触发（claude 就是主体）。
     claude_worker: bool = field(default_factory=lambda: os.environ.get("CLAUDE_WORKER", "0") != "0")
     harness_timeout_min: int = field(default_factory=lambda: _int("HARNESS_TIMEOUT_MIN", 15))
     # claude 单题 token 熔断（P1，run 9054 复盘 b-02 单会话烧 920 万 token 仍 0 解）：
@@ -158,6 +159,28 @@ class Config:
     # 收尾段时长（分钟）：开跑满 GLOBAL_BUDGET_MIN-ENDGAME_MIN 后调度器只放行快赢题
     # （12464 复盘：收卷前 25min 还在第三轮攻 f2-05，尾段槽位全烧在零转化题上）
     endgame_min: int = field(default_factory=lambda: _int("ENDGAME_MIN", 45))
+
+    # 资源看门狗（T1）：沙箱 8核16G，双主/多子 agent 模式的安全带（12231 复盘：
+    # 24 个 claude 进程吃爆整机）。30s 采样 load/MemAvailable，连续 2 次超阈
+    # （load>6 或可用内存<2GB）进入紧张态：大题不再配双主、在跑题注入
+    # 「子 agent ≤3」；恢复连续 2 次解除。非 Linux 读不到 /proc 时静默不干预。
+    resource_watchdog: bool = field(default_factory=lambda: os.environ.get("RESOURCE_WATCHDOG", "1") != "0")
+    # 裸 LLM 副线（T3）：claude 主线同题并行一条裸 LLM 思考线（共享 STATE/NOTES/
+    # submitter，预算封顶 SECOND_BRAIN_MIN）——claude 网关抖动降级期间解题不断线
+    # + 廉价视角撞 flag；hard/多 flag 非复现题才配，双主题不配（已两线）。
+    second_brain: bool = field(default_factory=lambda: os.environ.get("SECOND_BRAIN", "1") != "0")
+    second_brain_min: int = field(default_factory=lambda: _int("SECOND_BRAIN_MIN", 10))
+    # 断点续会话（方案1）：记录 claude session_id，断点重跑/retry 轮 --resume 续上
+    # 原会话——上下文零丢失，NOTES/RELAY 文件重建降级为兜底。resume 无输出
+    # （session 丢失/ClawGod 版不支持）自动去掉 --resume 原样重跑，零风险。
+    claude_resume: bool = field(default_factory=lambda: os.environ.get("CLAUDE_RESUME", "1") != "0")
+    # LLM 网关双通道（方案4）：主网关连续 3 次网络/5xx 失败切备用，备用连续 5 次
+    # 成功切回主。key/model 缺省沿用主配置。
+    llm_base_url_fallback: str = field(default_factory=lambda: os.environ.get("LLM_BASE_URL_FALLBACK", ""))
+    llm_api_key_fallback: str = field(default_factory=lambda: os.environ.get("LLM_API_KEY_FALLBACK", ""))
+    llm_model_fallback: str = field(default_factory=lambda: os.environ.get("LLM_MODEL_FALLBACK", ""))
+    # 运行时态（非 env）：scheduler 资源看门狗维护，Worker 同一 cfg 实例引用实时读
+    resource_tight: bool = False
 
     # 上下文预算：按估算 token 计（CJK 1 字符≈1 token，其余 4 字符≈1 token）。
     # 150k 字符的全中文上下文会逼近 128k token 上限触发 LLM 400（历史 b-02 踩过），
