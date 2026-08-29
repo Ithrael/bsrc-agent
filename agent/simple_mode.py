@@ -178,18 +178,28 @@ class SimpleScheduler:
 
         facts = self._snapshot(code)
         hint_facts = [f for f in facts if f.startswith("[官方提示]")]
-        other_facts = [f for f in facts if not f.startswith("[官方提示]")]
-        facts_block = "\n".join(f"- {f}" for f in other_facts[-24:]) or "(无)"
-        # 官方提示单独置顶（次轮继承首轮的 hint，优先按此验证，别重复拉）
+        clue_facts = [f for f in facts if f.startswith("[自动-")]   # 凭证/主机/CVE/端点
+        explore_facts = [f for f in facts if not f.startswith("[官方提示]")
+                         and not f.startswith("[自动-")]
+        # 官方提示置顶（次轮继承首轮 hint，优先按此验证）
         hint_section = ""
         if hint_facts:
             hint_section = ("\n\n## 官方提示（已获取，免费复用——优先按此验证）\n"
                             + "\n".join(f"- {f[len('[官方提示] '):]}" for f in hint_facts))
+        # 关键线索（凭证/主机/CVE/端点）次轮直接复用，别重新探测
+        clue_section = ""
+        if clue_facts:
+            clue_section = ("\n\n## 已确认线索（凭证/主机/CVE/端点，直接复用，别重新探测）\n"
+                            + "\n".join(f"- {f}" for f in clue_facts[-16:]))
+        # 探索记录靠后，避免重复已排除方向
+        explore_section = ""
+        if explore_facts:
+            explore_section = ("\n\n## 已探索方向（别重复已排除的）\n"
+                               + "\n".join(f"- {f}" for f in explore_facts[-16:]))
 
         messages = [
             {"role": "system", "content": SIMPLE_SYSTEM.replace("{direction}", direction)
-             + hint_section
-             + f"\n\n## 已确认事实（别的 step 已知/已排除，别重复）\n{facts_block}"},
+             + hint_section + clue_section + explore_section},
             {"role": "user", "content": (
                 f"题目：{code}\n描述：{ch.description or '(无)'}\n"
                 f"目标地址：{', '.join(addrs) or '(start 未返回)'}\n"
@@ -295,11 +305,13 @@ class SimpleScheduler:
     async def _plan_directions(self, ch: Challenge, addrs: list[str], facts: list[str], n: int) -> list[str]:
         facts_block = "\n".join(f"- {f}" for f in facts[-24:]) or "(无)"
         prompt = (
-            f"你是一名渗透测试调度员。题目 {ch.unique_code}：{ch.description or '(无)'}\n"
-            f"难度 {ch.difficulty}，{ch.flag_count} 面 flag，目标 {', '.join(addrs) or '(未知)'}。\n\n"
+            f"你是渗透测试调度员，根据题目信息精准规划探索方向。\n\n"
+            f"题目：{ch.unique_code}\n描述：{ch.description or '(无)'}\n"
+            f"难度：{ch.difficulty}，{ch.flag_count} 面 flag，目标：{', '.join(addrs) or '(未知)'}\n\n"
             f"已确认事实（之前探索的结论，别重复已排除的）：\n{facts_block}\n\n"
-            f"规划下一步 {n} 个探索方向，每个方向一句话、具体可执行、互不重叠、"
-            f"别重复已排除方向。输出格式：每行一个，以「- 」开头，不要其他内容。"
+            f"先判断题型（Web 漏洞 / 二进制逆向 / 云 misconfig / 多阶段渗透 / 开源 CVE 复现），"
+            f"再针对性规划 {n} 个方向。每个方向必须具体可执行（含目标端口/组件名/CVE 编号/参数），"
+            f"禁止泛泛的「侦察」「探测」。互不重叠。输出格式：每行一个，以「- 」开头，不要其他内容。"
         )
         try:
             msg = await self.llm.chat([{"role": "user", "content": prompt}], max_tokens=1200)

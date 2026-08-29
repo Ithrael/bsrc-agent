@@ -111,8 +111,8 @@ class Config:
     # SIMPLE_MODE=1 走 simple_mode.SimpleScheduler，跳过重调度层（scheduler/worker/harness）。
     simple_mode: bool = field(default_factory=lambda: os.environ.get("SIMPLE_MODE", "0") != "0")
     simple_steps_per_round: int = field(default_factory=lambda: _int("SIMPLE_STEPS_PER_ROUND", 8))
-    simple_attempts: int = field(default_factory=lambda: _int("SIMPLE_ATTEMPTS", 2))
-    simple_first_timeout_min: int = field(default_factory=lambda: _int("SIMPLE_FIRST_TIMEOUT_MIN", 5))
+    simple_attempts: int = field(default_factory=lambda: _int("SIMPLE_ATTEMPTS", 3))
+    simple_first_timeout_min: int = field(default_factory=lambda: _int("SIMPLE_FIRST_TIMEOUT_MIN", 10))
     simple_step_timeout_min: int = field(default_factory=lambda: _int("SIMPLE_STEP_TIMEOUT_MIN", 8))
     simple_max_steps: int = field(default_factory=lambda: _int("SIMPLE_MAX_STEPS", 15))
     simple_budget_min: int = field(default_factory=lambda: _int("SIMPLE_BUDGET_MIN", 345))
