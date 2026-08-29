@@ -98,12 +98,24 @@ class Config:
     # 8 = 3 主进程 + 断点重跑/蒸馏等辅助调用的余量（run 12396 实测峰值 9 并发
     # 沙箱稳定，6 升 8 让辅助通道不再挤占主进程额度）。
     max_agent_concurrent: int = field(default_factory=lambda: _int("MAX_AGENT_CONCURRENT", 8))
+    # 优先跑指定题（本地定点验证用）：FOCUS_CODES=<题号1>,<题号2> 逗号分隔，
+    # scheduler 选题时这些题永远排队首（rank 置负），用于验证某几题的修复效果。
+    focus_codes: list[str] = field(default_factory=lambda: [c.strip().lower() for c in os.environ.get("FOCUS_CODES", "").split(",") if c.strip()])
     # 双 worker 并行：总分≥1000 且 flag≥3 且无完整解法的大题，1 容器 2 条思考线
     # （共享 NOTES.md 与 flag 进度，worker-A 主攻入口面 / worker-B 主攻内网横向）
     pair_workers: bool = field(default_factory=lambda: os.environ.get("PAIR_WORKERS", "1") != "0")
     # 轮次模式：ROUND=1 覆盖优先（短时过手并留断点、不配双 worker）；
     # ROUND=2 收割（按完整解题数/墙钟时间 + 解法库 + 双线/三线攻坚）。
     round_num: int = field(default_factory=lambda: _int("ROUND", 2))
+    # 极简模式（2026-08-29 前五名实测：短会话+高并行+facts 收束，全 flash）：
+    # SIMPLE_MODE=1 走 simple_mode.SimpleScheduler，跳过重调度层（scheduler/worker/harness）。
+    simple_mode: bool = field(default_factory=lambda: os.environ.get("SIMPLE_MODE", "0") != "0")
+    simple_steps_per_round: int = field(default_factory=lambda: _int("SIMPLE_STEPS_PER_ROUND", 8))
+    simple_attempts: int = field(default_factory=lambda: _int("SIMPLE_ATTEMPTS", 2))
+    simple_first_timeout_min: int = field(default_factory=lambda: _int("SIMPLE_FIRST_TIMEOUT_MIN", 5))
+    simple_step_timeout_min: int = field(default_factory=lambda: _int("SIMPLE_STEP_TIMEOUT_MIN", 8))
+    simple_max_steps: int = field(default_factory=lambda: _int("SIMPLE_MAX_STEPS", 15))
+    simple_budget_min: int = field(default_factory=lambda: _int("SIMPLE_BUDGET_MIN", 345))
 
     # harness 攻坚：外部 agent CLI（claude code + ClawGod patch）接手难题。
     # 静态：第 2 轮 partial 未解题/hard 无解法题直接 harness；
@@ -120,7 +132,7 @@ class Config:
     # 各自进程内再派 Task 子 agent）；harness 升级逻辑不再触发（claude 就是主体）。
     claude_worker: bool = field(default_factory=lambda: os.environ.get("CLAUDE_WORKER", "0") != "0")
     harness_timeout_min: int = field(default_factory=lambda: _int("HARNESS_TIMEOUT_MIN", 15))
-    # claude 单题 token 熔断（P1，run 9054 复盘 b-02 单会话烧 920 万 token 仍 0 解）：
+    # claude 单题 token 熔断（P1，run 9054 复盘 多 flag 渗透题 单会话烧 920 万 token 仍 0 解）：
     # 0 = 按难度分层自动；>0 = 固定值；<0 = 禁用。6 小时最大解题数量模式默认不熔断。
     # 注意：熔断只统计主进程事件流 usage，Task 子 agent 消耗不计入（低估）；
     # 启用前先实测（详见 Worker._claude_token_budget）。
@@ -148,8 +160,8 @@ class Config:
     explore_segment_min: int = field(default_factory=lambda: _int("EXPLORE_SEGMENT_MIN", 5))
     stagnate_segments_hint: int = field(default_factory=lambda: _int("STAGNATE_SEGMENTS_HINT", 2))
     stagnate_segments_quit: int = field(default_factory=lambda: _int("STAGNATE_SEGMENTS_QUIT", 3))
-    # 全局掉速检测（run 12396 复盘：19:56 b-01/b-03 拿一面后 36 分钟仅 +90 分，
-    # 资源全在难啃单 flag 题上，b-02 等 6 面大题无一条线在打）：连续 N 分钟无
+    # 全局掉速检测（run 12396 复盘：19:56 多 flag 渗透题/多 flag 渗透题 拿一面后 36 分钟仅 +90 分，
+    # 资源全在难啃单 flag 题上，多 flag 渗透题 等 6 面大题无一条线在打）：连续 N 分钟无
     # 新 flag 入账 → 把最高价值的多 flag 未解题强制插队（启动即自动 Task 分治）。
     # 0 = 关闭。
     stagnate_boost_min: int = field(default_factory=lambda: _int("STAGNATE_BOOST_MIN", 12))
@@ -157,7 +169,7 @@ class Config:
     # auto 通道（正则捕获）累计错提 ≥ 此值后关闭；显式 submit_flag 不受限。
     wrong_submit_cap: int = field(default_factory=lambda: _int("WRONG_SUBMIT_CAP", 10))
     # 收尾段时长（分钟）：开跑满 GLOBAL_BUDGET_MIN-ENDGAME_MIN 后调度器只放行快赢题
-    # （12464 复盘：收卷前 25min 还在第三轮攻 f2-05，尾段槽位全烧在零转化题上）
+    # （12464 复盘：收卷前 25min 还在第三轮攻 二进制题，尾段槽位全烧在零转化题上）
     endgame_min: int = field(default_factory=lambda: _int("ENDGAME_MIN", 45))
 
     # 资源看门狗（T1）：沙箱 8核16G，双主/多子 agent 模式的安全带（12231 复盘：
@@ -183,7 +195,7 @@ class Config:
     resource_tight: bool = False
 
     # 上下文预算：按估算 token 计（CJK 1 字符≈1 token，其余 4 字符≈1 token）。
-    # 150k 字符的全中文上下文会逼近 128k token 上限触发 LLM 400（历史 b-02 踩过），
+    # 150k 字符的全中文上下文会逼近 128k token 上限触发 LLM 400（历史 多 flag 渗透题 踩过），
     # 降到 90k 并改用 token 感知估算；仍超限由 worker 的激进降级重试兜底。
     context_char_budget: int = field(default_factory=lambda: _int("CONTEXT_CHAR_BUDGET", 90_000))
 

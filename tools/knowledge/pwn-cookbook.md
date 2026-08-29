@@ -68,6 +68,36 @@ payload = fmtstr_payload(6, {elf.got['exit']: elf.sym['main']})   # 例：exit �
 - 常见弱自研加密：XOR 固定 key（key 在 strings 里）/ 查表替换（表在 .rodata）/ TEA 变体（delta=0x9E3779B9 认出来）
 - 协议题（nc 服务）：先发超长/非法定位解析器；长度字段 4 字节小端大数触发溢出
 
+## 5.1 授权校验类（license/key/serial 校验，flag = 正确授权码）
+目标不是拿 shell，是「算出或绕过正确授权码」。按序试 A→B→C→D：
+
+**A. 定位校验函数**：
+```bash
+strings -n 6 ./pwn | grep -iE 'invalid|expired|serial|key|license|wrong|denied'
+objdump -d -M intel ./pwn | grep -E 'call.*strcmp|call.*memcmp'   # 找比较调用点
+```
+
+**B. 动态抓期望值（最快，先试这个）**：
+```bash
+# gdb 断在比较函数入口，直接读两个待比较串
+gdb ./pwn -q -ex 'b strcmp' -ex run -ex 'x/s $rdi' -ex 'x/s $rsi' -ex quit
+# 期望值（正确授权码）就是 $rsi/$rdi 里那串；自研校验函数断调用点同理
+```
+
+**C. patch 绕过（不用算算法，改一个字节）**：
+```bash
+# 找到校验分支的条件跳转（je/jne/jz/jnz），翻转条件即可：74(je)→75(jne)
+cp ./pwn ./pwn_patched
+printf '\x75' | dd of=./pwn_patched bs=1 seek=0x1234 conv=notrunc   # 0x1234 = je 的文件偏移
+./pwn_patched   # 任意输入直接过校验拿 flag
+```
+
+**D. 授权算法逆向（C 不行才做）**：
+- XOR 固定 key：key 在 .rodata/strings，`xor(key)` 还原
+- CRC32：常见校验，逆推或爆破
+- TEA/XTEA：delta=0x9E3779B9 认出，套解密
+- **纪律**：授权码必须来自二进制/内存读出的确凿值，禁止猜（瞎猜授权码 = 必错请求）
+
 ## 6. 远程 vs 本地
 - 本地调通再打远程（脚本改 remote 一行）
 - 远程 libc 不同：题目常给 libc.so.6（下载/工作区找到就 ELF 加载）；没有就按泄露的

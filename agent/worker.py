@@ -186,8 +186,8 @@ _PORT_SURFACE = {
 }
 
 # 端口 → 组件/CVE 精确线索（P2，claude 模式 prompt 注入；与 _PORT_SURFACE 的泛化关键词互补）。
-# 来源：平台题面端口分布实测（c-02=8188 ComfyUI、c-04=5005 JDWP、c-05/08=7860 Gradio、
-# c-07=23 telnet、c-03=3000 Node、c-09=8443 等），claude 从端口就能联想到 CVE，省逆向时间。
+# 来源：平台题面端口分布实测（CVE 题=8188 ComfyUI、CVE 题=5005 JDWP、CVE 题/08=7860 Gradio、
+# CVE 题=23 telnet、CVE 题=3000 Node、CVE 题=8443 等），claude 从端口就能联想到 CVE，省逆向时间。
 _PORT_CVE_HINTS = {
     8188: "ComfyUI → CVE-2025-67303（config 改 weak + reboot）/ 27065（install 注入）",
     5005: "JDWP 远程调试 → jdwp-shellifier 直接 RCE",
@@ -333,6 +333,10 @@ def _submit_flag_script(ch, ws: str) -> str:
         "# 用法: ./submit_flag.sh <flag> '<RAW EVIDENCE：该 flag 从哪条工具输出读到>'\n"
         "FLAG=\"$1\"; EVID=\"$2\"\n"
         "[ -z \"$FLAG\" ] && { echo 'usage: ./submit_flag.sh <flag> \"<RAW EVIDENCE 来源>\"'; exit 1; }\n"
+        "# flag 归一化：strip 首尾空白/引号（同秒连发多为旧 flag 的空白/引号\n"
+        "# 变体，grep -Fxq 精确匹配拦不住——归一化后再去重才有效）\n"
+        "FLAG=\"$(printf '%s' \"$FLAG\" | xargs)\"\n"
+        "FLAG=\"${FLAG#\\\"}\"; FLAG=\"${FLAG%\\\"}\"; FLAG=\"${FLAG#\\'}\"; FLAG=\"${FLAG%\\'}\"\n"
         "# CLAIM/EVIDENCE 闸门（对标 hxbai 69 flag 仅 4 错提）：第 1 次提交起就要声明证据来源。\n"
         "# 证据 = 亲眼读到的工具输出（cat /flag、数据库查询、env 等）；推断/拼接/猜测不算。\n"
         "# 已在 NOTES.md 记录过该 flag 来源的（来源闸门产物）视为已声明，免重复。\n"
@@ -352,17 +356,16 @@ def _submit_flag_script(ch, ws: str) -> str:
         "  flock -x 9\n"
         "  LOCKED=1\n"
         "fi\n"
-        "# .flag_tried 去重（13174 实测：b-02 三轮 00:18:41 同一秒 5 连发、3 个是\n"
+        "# .flag_tried 去重（历史实测：多 flag 题三轮同一秒 5 连发、3 个是\n"
         "# 旧 flag 重提——显式通道直连平台，不过 Python tried 去重，脚本层自己拦）。\n"
         f"if grep -Fxq \"$FLAG\" {ws}/.flag_tried 2>/dev/null; then\n"
         "  echo '重复提交拒绝：该 flag 此前已提交过（正确/错误都记录），不再烧平台请求'\n"
         "  exit 1\n"
         "fi\n"
-        "# 连错干预（防盲猜空转：run 12019 f2-05 连错 10 次复盘）：连续错 5 次后强提醒\n"
+        "# 连错干预（防盲猜空转：历史二进制题连错 10 次盲猜复盘）：连续错 5 次后强提醒\n"
         f"WRONG=$(cat {ws}/.flag_wrong 2>/dev/null || echo 0)\n"
         "if [ \"$WRONG\" -ge 5 ]; then\n"
-        "  echo \"⚠️ 本题已连续猜错 $WRONG 次：停止提交无证据的 flag！回到侦察（在**目标环境** find / -maxdepth 3 -name 'flag*' 2>/dev/null、数据库、env——不是自己的解题容器），或拉官方提示（先确认其他线是否已拉过：grep -i 'hint' NOTES.md RELAY.md 2>/dev/null；重复拉会重复扣分）：\"\n"
-        f"  echo \"curl -s -m 15 \\\"$BENCHMARK_BASE_URL/openapi/v1/challenges/hint?unique_code={ch.unique_code}\\\" -H \\\"BENCHMARK_TOKEN: $BENCHMARK_TOKEN\\\"\"\n"
+        "  echo \"⚠️ 本题已连续猜错 $WRONG 次：停止提交无证据的 flag！回到侦察（在**目标环境** find / -maxdepth 3 -name 'flag*' 2>/dev/null、数据库、env——不是自己的解题容器）。要官方提示请用 get_hint 工具（内置去重，已拉过不会重复扣分；禁止直接 curl hint 接口重复拉）\"\n"
         "fi\n"
         "# 来源闸门（对抗校验：连错 ≥3 次后，提交前 NOTES.md 必须已记录该 flag 的来源，"
         "# 防脚本循环盲猜——循环脚本不会写 NOTES，连续猜 3 次后全被挡）\n"
@@ -374,6 +377,9 @@ def _submit_flag_script(ch, ws: str) -> str:
         "    exit 1\n"
         "  fi\n"
         "fi\n"
+        "# 提交限频（12082/13174 复盘遗留：flock 只串行化不限制频，bash for 循环并发提交\n"
+        "# 同一秒 5-10 连发打爆平台——sleep 1 摊开，≥1s/次；重复 flag 已在上面 .flag_tried 拦掉）\n"
+        "sleep 1\n"
         "RESP=$(curl -s -m 15 --retry 3 --retry-delay 2 --retry-all-errors -X POST \"$BENCHMARK_BASE_URL/openapi/v1/challenges/submit\" \\\n"
         "  -H \"BENCHMARK_TOKEN: $BENCHMARK_TOKEN\" \\\n"
         "  -H \"Content-Type: application/json\" \\\n"
@@ -438,7 +444,7 @@ def _run_event_stats(ws: str) -> dict[str, dict]:
 def _zero_score_history(ws: str, code: str) -> int:
     """events.jsonl 里该题「≥2 次 attempt 且全零分」的 attempt 数（0 = 无零分历史）。
 
-    13174 实测：b-02 三轮 125min 0 分硬攻（同面重复打、槽位时间打水漂）——
+    13174 实测：多 flag 渗透题 三轮 125min 0 分硬攻（同面重复打、槽位时间打水漂）——
     零分历史是「换打法/削减预算」的最强信号。"""
     st = _run_event_stats(ws).get(code)
     if not st or st.get("attempts", 0) < 2 or st.get("solve_prob", 0) > 0:
@@ -588,7 +594,7 @@ class Worker:
             return (f"✅ 正确！+{res.awarded} 分。本题进度 {res.correct_flag_count}/{res.total_flag_count}"
                     f"（matched index={res.matched_flag_index}）")
         log.info("[%s] flag 错误: %s", self.ch.unique_code, flag[:80])
-        # 连错分级干预（run 12019 复盘：f2-05 连错 10 次盲猜 0 分——无证据猜测
+        # 连错分级干预（run 12019 复盘：二进制题 连错 10 次盲猜 0 分——无证据猜测
         # 提交必错还烧请求；3-4 次警告、≥5 次强干预引导回侦察/hint）。
         streak = self.submitter.wrong_streak
         if streak >= 5:
@@ -651,7 +657,7 @@ class Worker:
                 f"{max(1, self.ch.total_score // 10)} 分；未解出则不扣分）：\n{hint or '(无提示内容)'}")
 
     async def _auto_hint(self) -> str:
-        """代码自动注入 hint（run 8900 复盘：LLM 靠 stuck 策略自觉请求太晚——b-01 63 分钟才 hint）。
+        """代码自动注入 hint（run 8900 复盘：LLM 靠 stuck 策略自觉请求太晚——多 flag 渗透题 63 分钟才 hint）。
         不走 stuck 时间门，直接取官方 hint 写入 notes.json，返回注入文本。"""
         if self._hint_used or self._hint_auto:
             return ""
@@ -699,9 +705,9 @@ class Worker:
         """首轮（attempt=0）是否直接带官方 hint 开工。
 
         多 flag 大题保留（渗透链方向指引值 10%）；hard 单 flag 首轮硬解——
-        run 12610 复盘：upfront 让 hard 单 flag 题全面 -10%（a-01 500→450 等
+        run 12610 复盘：upfront 让 hard 单 flag 题全面 -10%（Web 题 500→450 等
         7 题）且无速度收益。
-        easy + retry 轮（attempt≥1）：12936 复盘 c-03/c-09 首轮 12min 打不透、
+        easy + retry 轮（attempt≥1）：12936 复盘 CVE 题/CVE 题 首轮 12min 打不透、
         retry 再空转——100 分题花 10 分买方向值得；250 分 e 系列首轮仍硬解保满分。"""
         return (self.cfg.hint_policy == "free" and self.ch.flag_count >= 2) or (
             self.cfg.hint_policy == "free" and self.attempt >= 1
@@ -1006,7 +1012,7 @@ class Worker:
 
         信号取 RELAY.md（行动纪律强制即时落盘，最可靠）与 NOTES.md 的
         solver 发现 bullet；NOTES 头部的「目标:」行和 STATE 的 flag 进度行
-        不算进展（每次创建都有）。run 12464 复盘：f2-05/a-18 三轮满预算
+        不算进展（每次创建都有）。run 12464 复盘：二进制题/Web 题 三轮满预算
         重攻零产出（213min 打水漂）——无断点的轮转不该再拿满预算。
         """
         # getattr 防御：__new__ 构造的测试实例/paired worker 无 ws 属性
@@ -1034,7 +1040,7 @@ class Worker:
         多 Agent 已经把同题探索宽度换成并行度；这里限制单次尝试长度，
         只给有断点/有新进展的 retry 轮适度延长时间。
         预算分级（run 12464 复盘）：retry 轮有断点给满（run 12231 曾因碎片化
-        短预算丢 c-02/a-14/c-08 共 -860 分，不能一刀切）；无断点降为快验轮
+        短预算丢 CVE 题/Web 题/CVE 题 共 -860 分，不能一刀切）；无断点降为快验轮
         （hint+advisor 双注入的定向验证，不配满预算原样重试）。
         """
         prog = self._has_progress() if self.attempt >= 1 else True
@@ -1049,14 +1055,14 @@ class Worker:
                 minutes = 45
             else:
                 # 无断点 retry 15min（12936 复盘：快验 12min 对二进制题不够，
-                # c 系列 PoC 检索需时间；a-03/a-16/c-04/c-05/c-08 全靠多轮 retry 解出）
+                # c 系列 PoC 检索需时间；Web 题/Web 题/CVE 题/CVE 题/CVE 题 全靠多轮 retry 解出）
                 minutes = 25 if self.attempt <= 0 else ((35 if self.attempt == 1 else 40) if prog else 15)
         elif self.ch.difficulty == "medium":
             # 首轮 12min（AePis 复盘：easy/medium 全扫 <2h，3.3min/flag），
             # retry 有断点 25min 给足续跑；无断点 15min（12936 复盘：无断点
-            # 快验 8min 太短漏掉慢热题——c-03/c-09 首轮 8min 窗口塞不进
+            # 快验 8min 太短漏掉慢热题——CVE 题/CVE 题 首轮 8min 窗口塞不进
             # PoC 检索，二轮 8min 快验同样不够）。
-            # 多 flag 大题例外（13174 实测：b-01/b-03 首轮 12min 只拿 0/1 面，
+            # 多 flag 大题例外（13174 实测：多 flag 渗透题/多 flag 渗透题 首轮 12min 只拿 0/1 面，
             # 渗透链没起就被轮转切走；12464 的 b 系列 +2550 靠一次性窗口打穿）：
             # flag≥3 首轮给 20min，够摸入口 + 起链。
             if self.attempt <= 0 and self.ch.flag_count >= 3:
@@ -1065,11 +1071,11 @@ class Worker:
                 minutes = 12 if self.attempt <= 0 else (25 if prog else 15)
         else:
             # easy：首轮 12min（12936 复盘：8min 塞不进指纹+PoC检索+利用链，
-            # c-03/c-09 两轮 0 分被误判死），retry 有断点 20min、无断点 15min
+            # CVE 题/CVE 题 两轮 0 分被误判死），retry 有断点 20min、无断点 15min
             minutes = 12 if self.attempt <= 0 else (20 if prog else 15)
         if self.cfg.round_num == 1 and not has_completed_sol:
             minutes = min(minutes, 30 if self.ch.difficulty == "hard" else 20)
-        # 零分历史预算封顶（13174 实测：b-02 三轮 125min 0 分硬攻，槽位时间
+        # 零分历史预算封顶（13174 实测：多 flag 渗透题 三轮 125min 0 分硬攻，槽位时间
         # 打水漂）：本题 ≥2 次 attempt 仍零分时，单次预算封顶 20min 试水轮，
         # 省下的时间给有转化率的题。events.jsonl 轮内有效（跨轮沙箱销毁）。
         if self.attempt >= 2 and _zero_score_history(getattr(self, "ws", ""), self.ch.unique_code) >= 2:
@@ -1088,7 +1094,7 @@ class Worker:
     @staticmethod
     def _est_tokens(msg: dict) -> int:
         """消息 token 估算：CJK 字符 1 字符≈1 token，其余 4 字符≈1 token。
-        历史教训：150k 字符的全中文上下文按 4 字符/token 估算会差 4 倍，直接触发 LLM 400（b-02 踩过）。"""
+        历史教训：150k 字符的全中文上下文按 4 字符/token 估算会差 4 倍，直接触发 LLM 400（多 flag 渗透题 踩过）。"""
         s = json.dumps(msg, ensure_ascii=False)
         cjk = sum(1 for ch in s if ord(ch) >= 0x2E80)
         return cjk + (len(s) - cjk) // 4 + 8  # +8 覆盖 JSON 骨架开销
@@ -1265,7 +1271,7 @@ class Worker:
 
     def _build_truncate_notice(self, tail: list[dict]) -> dict:
         """上下文截断时的自动状态摘要：代码层直接从消息流提取最近命令 + flag 进度，
-        比让 LLM 自己 read_file 恢复记忆更快更可靠（长上下文题 b-02 类的高频场景）。"""
+        比让 LLM 自己 read_file 恢复记忆更快更可靠（长上下文题 多 flag 渗透题 类的高频场景）。"""
         cmds: list[str] = []
         for m in tail:
             if m.get("role") != "assistant":
@@ -1546,7 +1552,7 @@ class Worker:
         显式通道写入）。
 
         on_text 是同步回调只能收集不能 await；harness 长跑（hard 双线 30min）时若等到
-        结束才提交，flag 早已在事件流里出现过却白等——10585 复盘 e3-04 超时后挖出的
+        结束才提交，flag 早已在事件流里出现过却白等——10585 复盘 对抗题 超时后挖出的
         flag 是 duplicate。drain 每 _drain_interval_s 提交一轮，flag 一到手立刻入账。
         同时 _sync_state_progress 兜住显式通道：子 agent 提交最后一面 → STATE.md
         更新 → 完成事件置位杀主进程，主进程/其他子 agent 不再空烧。"""
@@ -1712,7 +1718,7 @@ class Worker:
         return hints[:12]
 
     def _claude_token_budget(self) -> int:
-        """单题 claude token 熔断阈值：0 走难度分层（run 9054 复盘 b-02 单会话 920 万 token 仍 0 解），
+        """单题 claude token 熔断阈值：0 走难度分层（run 9054 复盘 多 flag 渗透题 单会话 920 万 token 仍 0 解），
         >0 用配置值，<0 禁用。
 
         统计口径：stream-json --verbose 会输出 sidechain（Task 子 agent）的 assistant
@@ -1743,6 +1749,14 @@ class Worker:
                  f"## 题目\n- 编号: {ch.unique_code}\n- 描述: {ch.description or '(无)'}\n"
                  f"- 目标地址: {', '.join(self.addrs)}\n- flag 数量: {ch.flag_count}（已正确提交 {ch.correct_flag_count}）\n"
                  f"- 难度: {ch.difficulty} / 分值: {ch.total_score}"]
+        if ch.flag_count >= 2 and ch.correct_flag_count > 0:
+            # 多面题已拿部分面（历史实测多 flag 题拿部分面后反复重提旧面零新增）：
+            # 明确「只找新面、禁重提旧面」，把火力导向内网横向而非旧面反复确认
+            parts.append(
+                f"## ⚠️ 多面题继续攻坚（已拿 {ch.correct_flag_count}/{ch.flag_count} 面）\n"
+                "已正确提交的 flag 都是**旧面**，禁止重复提交旧 flag（平台判 duplicate/错提，"
+                "纯烧请求）。唯一目标是找**剩余新面**：先读 RELAY.md 的「已拿主机与凭据/内网"
+                "拓扑」，从已突破的主机/服务沿内网横向，打下一台主机、下一个服务、下一处凭证。")
         rot = getattr(self, "_rotation_text", "")
         if rot:
             parts.append(rot)
@@ -1756,7 +1770,7 @@ class Worker:
         if desc_hints:
             parts.append("## CVE 线索（题目描述命中，优先查公开 PoC）\n" + "\n".join(f"- {h}" for h in desc_hints))
         # 零分历史警告（events.jsonl 轮内实测）：≥2 次 attempt 全零分时强制换打法
-        # （13174 实测 b-02 三轮硬攻同面、错提风暴——重复已失败的路是纯烧 token）
+        # （13174 实测 多 flag 渗透题 三轮硬攻同面、错提风暴——重复已失败的路是纯烧 token）
         z = _zero_score_history(getattr(self, "ws", ""), ch.unique_code)
         if z >= 2:
             parts.append(
@@ -1926,7 +1940,7 @@ class Worker:
 
         timeout_s = self._scaled_timeout_s(has_completed_sol)
         if has_completed_sol:
-            # 复现题止损（10585 复盘：a-07 复现烧 600 万 token 两轮熔断、c-08 easy 复现
+            # 复现题止损（10585 复盘：Web 题 复现烧 600 万 token 两轮熔断、CVE 题 easy 复现
             # 100 万熔断翻车）：正常复现 0.4-0.7min 即过，翻车题 5-10min 止损轮转，
             # 时间留给 hard retry 轮（失败进断点重跑/retry 队列）。
             timeout_s = min(timeout_s, 5 * 60 if ch.flag_count <= 1 else 10 * 60)
@@ -1934,24 +1948,18 @@ class Worker:
         if has_completed_sol:
             # 复现题 token 熔断同步收紧：正常复现 10 万内解决，50 万足够兜底
             token_budget = min(token_budget, 500_000)
-        # 多模型分工（LLM_MODEL_HARD=deepseek-v4-pro）触发条件（用户决策 2026-08-16）：
-        # - hard 题：全程 pro（首轮就是硬仗，flash 试水纯浪费时间）
-        # - easy/medium：首轮 flash 试水（历史大部分能解），一轮没解决（attempt≥1）
-        #   换 pro 攻坚——run 10048 复盘 bctf-02/22/26 medium、bctf-07 easy 卡满预算 0 分
-        # - 复现题（有完整解法）不上 pro：flash 走短时复现通道即可（10585 复盘 e3-04
-        #   复现题 pro 双线烧满 30min 超时，事后挖出 flag 却是 duplicate，纯浪费）
-        use_hard_model = (ch.difficulty == "hard" or self.attempt >= 1) and not has_completed_sol
+        # 多模型分工（2026-08-28 修正：LLM_MODEL_HARD=deepseek-v4-pro 全量参与）：
+        # 非复现题（easy/medium/hard）首轮即用 pro——13434 实测 easy/medium 首轮
+        # flash 快扫对钉子题 CVE 题/CVE 题 打不透（首轮 13min 白费，pro 要等 retry 才上）。
+        # 复现题（有完整解法）不上 pro：flash 走短时复现通道即可（10585 复盘 对抗题
+        # 复现题 pro 双线烧满 30min 超时，事后挖出 flag 却是 duplicate，纯浪费）。
+        use_hard_model = not has_completed_sol
         hard_model = self.cfg.llm_model_hard if use_hard_model else ""
         self._used_model = hard_model or self.cfg.llm_model
-        # effort 分级（run 12464 复盘：pro 全场 reasoning=0——探测超时被降级导致
-        # 思考预算全丢，只买到知识没买到思考）：
-        # - medium/hard：全程 effort max（攻坚深度优先）
-        # - easy：首轮不开（快扫吞吐优先——hxbai 零思考 4h23m 拿 92.57 的效率证据），
-        #   一轮没解决说明不是秒解题，retry 轮（attempt≥1）开 max 深挖
-        if self.ch.difficulty == "easy" and self.attempt <= 0:
-            hard_effort = ""
-        else:
-            hard_effort = self.cfg.claude_hard_effort
+        # effort（12464 复盘：pro 无 effort = reasoning 0，只买知识没买思考）：
+        # 非复现题全 pro + 复现题 flash 均开 max——放弃 easy 首轮快扫（快扫省下的
+        # 时间被钉子题首轮 flash 打不透白费 13min 抵消，见 13434 实测 CVE 题/CVE 题）。
+        hard_effort = self.cfg.claude_hard_effort
         # claude 模式 hint（P1，run 10048 复盘进阶 hard 单线瞎转）：retry 轮（attempt≥1）
         # 自动注入官方提示，落盘 notes.json 下轮复现免扣分。首轮内断点重跑处兜底再拉。
         # Cairn_X 复盘（官方榜 94.61）：148 次 hint 换 71 flag——卡住就买方向是最便宜的得分。
@@ -2024,9 +2032,9 @@ class Worker:
             elif zone == "intranet":
                 line_keys = "BCFGH"     # B 主分区：内网横向/提权/云逃逸/凭证重放/收尾直读
             elif ch.flag_count >= 5:
-                line_keys = "ABCDEFGH"   # b-02 级 6 flags 大题：8 线方向分工
+                line_keys = "ABCDEFGH"   # 6 flags 大题：8 线方向分工
             elif ch.flag_count >= 3:
-                line_keys = "ABCDEF"     # b-01/b-03 级 4 flags：6 线方向分工
+                line_keys = "ABCDEF"     # 4 flags 大题：6 线方向分工
             elif ch.flag_count >= 2:
                 line_keys = "ADEF"       # 2 面 medium：4 线分工
             elif ch.difficulty == "hard":
@@ -2086,7 +2094,12 @@ class Worker:
                 "该 flag 从哪条工具输出读到>'` 提交——证据参数是强制闸门（脚本会拒绝"
                 "无证据提交，如 `./submit_flag.sh flag{...} 'cat /challenge/flag.txt 输出'`）\n"
                 f"{handoff_line}"
-                "   - 结束前返回三行总结：已达成原语 / 已证死路 / 下一步\n"
+                "   - **结束前无条件以一条事实收束（不许不了了之）**：无论有没有结果，都先把"
+                "『做了什么 / 发现了什么 / 依据』作为一条事实落盘，shell 追加"
+                "`echo '- [X线] <做了什么:发现了什么:依据>' >> STATE.md`（追加进 FACTS 段）；"
+                "没结果就照实写『试了 X，观察到 Y，无进展』——这本身就是有效结论，"
+                "供其他线/下一轮复用，不许空着或只口头汇报\n"
+                "   - 返回三行总结给主控：已达成原语 / 已证死路 / 下一步\n"
                 "4. 子 agent 全部返回后：读它们的总结与 NOTES.md 新增，判断还缺哪几面 flag，"
                 "针对缺口再派新一轮子 agent（换攻击面/换主机/换凭证），直到全部拿齐或时间不足。\n"
                 "5. 意图节流（ATX 吸收，13397 复盘修正）：**多 flag 题拿 1-2 面但还剩 ≥2 面时，"
@@ -2101,8 +2114,8 @@ class Worker:
                 "`- [线号] flag:N`（N=该线实际拿到的 flag 数，0 也要记）——用于跨题统计"
                 "各攻击角度的实测胜率，优化后续撒网策略。")
             if ch.flag_count >= 3:
-                # 多 flag 题专项清单（run 12019 复盘：b-01 1/4、b-02 2/6、b-03 1/4——
-                # 首面能拿后续纵深乏力；9489 曾靠 flagN 直读+容器逃逸+横向拿全 b-01 4/4，
+                # 多 flag 题专项清单（run 12019 复盘：多 flag 渗透题 1/4、多 flag 渗透题 2/6、多 flag 渗透题 1/4——
+                # 首面能拿后续纵深乏力；9489 曾靠 flagN 直读+容器逃逸+横向拿全 多 flag 渗透题 4/4，
                 # 把实测有效的优先级固化进公共指令）
                 master_role += (
                     "\n\n## 多 flag 题专项清单（派发子 agent 时按需注入对应方向）\n"
@@ -2138,7 +2151,7 @@ class Worker:
                     if os.path.exists(src) and not os.path.lexists(dst):
                         os.symlink(src, dst)
             # 子 agent 派发上下文内联（ATX 吸收：任务创建即历史事实注入——b 系列
-            # 分治线不读共享文件就重复打面（13174 实测 b-02 三轮同面硬攻），
+            # 分治线不读共享文件就重复打面（13174 实测 多 flag 渗透题 三轮同面硬攻），
             # 事实/台账直接塞进派发指令，不依赖子 agent 自觉读文件）
             facts_inline = self._facts_tail()
             hosts_inline = self._hosts_tail()
@@ -2179,7 +2192,7 @@ class Worker:
         await self._settle_claude_flags()
 
         # 快速重跑（run 9234 复盘）：claude 提前退出（非超时/熔断）且 flag 没拿全——
-        # e1-03 2.8min 就退、a-05 12.7min 退，9054 里都能解出。当场断点重跑一次，
+        # 对抗题 2.8min 就退、Web 题 12.7min 退，9054 里都能解出。当场断点重跑一次，
         # 不等 retry 队列（排队到最后浪费空窗期）。
         if (not self.submitter.completed
                 and (res.output_text or res.events)
@@ -2222,7 +2235,7 @@ class Worker:
         self.result.reason = ("all flags captured" if self.result.completed
                               else "claude done" if (res.output_text or res.events)
                               else "claude no output (timeout?)")
-        # 零进展退出轮转（run 12464 复盘：f2-05 第三轮收卷前 25min 还在盲猜）：
+        # 零进展退出轮转（run 12464 复盘：二进制题 第三轮收卷前 25min 还在盲猜）：
         # attempt≥2 且无 flag 且无断点 → 标记 no_progress，scheduler 不再入
         # 常规 retry 队列；队列耗尽后的平台回查轮（NEVER_STOP）仍会回挖这些题。
         if (not self.result.completed and self.attempt >= 2
@@ -2378,7 +2391,7 @@ class Worker:
         timeout_s = self._scaled_timeout_s(has_completed_sol)
         if has_completed_sol:
             # 复现题快速失败：解法验证通常 ≤10 分钟，失败说明环境变了，
-            # 把时间留给新题而不是耗满 20-30min 超时（历史教训：a-05 复现失败白耗 20min）。
+            # 把时间留给新题而不是耗满 20-30min 超时（历史教训：Web 题 复现失败白耗 20min）。
             # 复现题止损：5/10min 足够验证记录，失败就把槽位让给新题。
             timeout_s = min(timeout_s, 5 * 60 if ch.flag_count <= 1 else 10 * 60)
 
@@ -2441,7 +2454,7 @@ class Worker:
                 # 段边界：强制段收尾（已确认发现写 NOTES/STATE，对标 Cairn conclude 语义）+
                 # 无进展检测（新 flag / 新 FACTS 皆无 = 无进展段）。
                 # 连续 hint 阈值段 → 代码自动注入官方 hint；连续 quit 阈值段 → 提前放弃轮转，
-                # 不再死磕 30 分钟 0 分（历史：a-03/a-07/a-14/c-05 各浪费 30 分钟）。
+                # 不再死磕 30 分钟 0 分（历史：Web 题/Web 题/Web 题/CVE 题 各浪费 30 分钟）。
                 seg_secs = self.cfg.explore_segment_min * 60
                 seg_no = int(elapsed // seg_secs)
                 if seg_no > self._segment_no:

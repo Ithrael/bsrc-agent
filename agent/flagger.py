@@ -48,8 +48,8 @@ def _default_wrong_cap(unique_code: str, base_cap: int) -> int:
     """按题型调 auto 通道错提熔断阈值。
 
     二进制题（f 系列）flag 是 leetspeak 形态（FLAG{g0_1t4b_...}），格式闸门
-    plausible_flag 对「合法 leetspeak 瞎猜」形同虚设——13397 实测 f2-05 错 11 次、
-    f2-01 错 10 次（纯盲猜烧请求，且都是最终未解的死题）。f 系列减半（≥3），
+    plausible_flag 对「合法 leetspeak 瞎猜」形同虚设——13397 实测 二进制题 错 11 次、
+    二进制题 错 10 次（纯盲猜烧请求，且都是最终未解的死题）。f 系列减半（≥3），
     让 auto 通道（正则捕获）更早停，显式通道（submit_flag.sh）不受影响。"""
     if (unique_code or "").startswith("f"):
         return max(3, base_cap // 2)
@@ -83,9 +83,9 @@ class FlagSubmitter:
     flag 值本身不可从平台反查，不能只依赖本地 ``correct`` 集合判断完成。
 
     错提熔断（run 12464 复盘：145 次错提全部绕过 submit_flag.sh 闸门——
-    输出捕获通道直接调 API，f2-05 盲猜 75 次、c-02 答对了还错 23 次）：
+    输出捕获通道直接调 API，二进制题 盲猜 75 次、CVE 题 答对了还错 23 次）：
     ``auto=True`` 的自动通道（正则捕获）累计错提 ≥ wrong_cap 次后关闭；
-    显式通道（LLM 的 submit_flag 工具调用）不熔断——c-02 错 23 次仍解出，
+    显式通道（LLM 的 submit_flag 工具调用）不熔断——CVE 题 错 23 次仍解出，
     说明正确 flag 可能出现在多次错误之后，不能一刀切。
     """
 
@@ -97,7 +97,7 @@ class FlagSubmitter:
         self.correct: set[str] = set()
         self.score = 0
         self.correct_count = max(0, min(expected_flags, initial_correct_count))
-        self.wrong_streak = 0  # 连续提交错误计数（run 12019 复盘：f2-05 连错 10 次盲猜）
+        self.wrong_streak = 0  # 连续提交错误计数（run 12019 复盘：二进制题 连错 10 次盲猜）
         self.wrong_total = 0   # 累计错提（auto 通道熔断用，不因正确提交清零）
         self.wrong_cap = _default_wrong_cap(unique_code, wrong_cap)
 

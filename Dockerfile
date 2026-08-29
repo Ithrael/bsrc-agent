@@ -2,7 +2,7 @@
 # 构建:  docker build --platform=linux/amd64 -t bsrc-agent:latest .
 # 导出:  docker save bsrc-agent:latest | gzip > bsrc-agent.tar.gz
 # 基础：小型 Kali（kalilinux/kali-last-release）——对标榜首 Cairn/hxbai 的 Kali 环境，
-# 渗透工具链完整（openssh-client/chisel/searchsploit 等），避免 b-02 类「无 ssh 现写 paramiko」卡壳。
+# 渗透工具链完整（openssh-client/chisel/searchsploit 等），避免 多 flag 渗透题 类「无 ssh 现写 paramiko」卡壳。
 FROM kalilinux/kali-last-release
 
 ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 PYTHONUNBUFFERED=1
@@ -112,7 +112,7 @@ RUN (curl -fsSL https://github.com/jpillora/chisel/releases/download/v1.10.1/chi
 #    间歇性 TLS 失败（且 release 资产名是 x64 非 amd64，旧远程下载脚本双重失效）
 COPY tools/bin/fscan /usr/local/bin/fscan
 RUN chmod +x /usr/local/bin/fscan
-# 4) 本地漏洞库（Cairn 拆解：c-02 ComfyUI 题 Cairn 用本地 PoC 检索 5 分钟秒解、
+# 4) 本地漏洞库（Cairn 拆解：CVE 题 ComfyUI 题 Cairn 用本地 PoC 检索 5 分钟秒解、
 #    我们现场回忆 CVE 310 分钟分治才解——vulhub 全套 PoC + nuclei 模板是
 #    通用公开漏洞库，无题目先验，合规；宿主机经 gh-proxy 预下载）
 COPY tools/pocs/vulhub /opt/pocs/vulhub

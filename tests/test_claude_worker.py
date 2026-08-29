@@ -254,7 +254,7 @@ def test_medium_retry_no_progress_degrades():
 
 @pytest.mark.asyncio
 async def test_medium_round2_uses_hard_model(tmp_path, monkeypatch):
-    """effort 分级：medium/hard 全程 max；easy 首轮不开（快扫）、二轮开（12464 pro reasoning=0 教训）。"""
+    """模型分工：非复现题（easy/medium/hard）首轮即 pro + effort max；复现题 flash。"""
     import agent.harness as harness_mod
 
     srv = make_server()
@@ -295,11 +295,11 @@ async def test_medium_round2_uses_hard_model(tmp_path, monkeypatch):
     cfg.recon_boot = False
     cfg.record_solutions = False
 
-    # 首轮（attempt=0）：flash 模型、effort max 全量生效
+    # 首轮（attempt=0）：非复现题直接 pro（13434 修正：easy/medium 首轮也上 pro）
     w = Worker(cfg, object(), api, ch, addrs, str(tmp_path / "ws1"),
                deadline=time.monotonic() + 600, attempt=0)
     await w._run_claude()
-    assert calls[0]["model"] == ""
+    assert calls[0]["model"] == "deepseek-v4-pro"
     assert calls[0]["effort"] == "max"
 
     # 二轮（attempt=1）：pro + effort max
@@ -320,12 +320,12 @@ async def test_medium_round2_uses_hard_model(tmp_path, monkeypatch):
     await w3._run_claude()
     assert calls[-1]["model"] == "deepseek-v4-pro"
     assert calls[-1]["effort"] == "max"
-    # easy 首轮：flash 且不开 effort（快扫吞吐优先）；二轮才开 max 深挖
+    # easy 首轮：非复现题同样 pro + effort max（13434 修正：钉子题首轮 flash 打不透）
     w4 = Worker(cfg, object(), api, ch_easy, addrs, str(tmp_path / "ws4"),
                 deadline=time.monotonic() + 600, attempt=0)
     await w4._run_claude()
-    assert calls[-1]["model"] == ""
-    assert calls[-1]["effort"] == ""
+    assert calls[-1]["model"] == "deepseek-v4-pro"
+    assert calls[-1]["effort"] == "max"
     await api.close()
 
 

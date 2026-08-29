@@ -52,7 +52,7 @@ _SENSITIVE_PATHS = ("/", "/robots.txt", "/.git/HEAD", "/.env", "/admin", "/api",
 # 指纹端点：这些路径返回的 body 里含组件名/版本（ComfyUI 的 /system_stats 返回 JSON
 # 含 comfyui_version、Ollama 的 /v1/models 含模型列表、Spring 的 /actuator/health 含
 # 服务元数据）——必须取内容而非只取状态码，否则 _COMPONENT_RE 抓不到 AI 基础设施
-# 指纹，CVE 线索喂不进 prompt（13397 c-02 ComfyUI 预侦察没识别出指纹、31min 0 分翻车）。
+# 指纹，CVE 线索喂不进 prompt（13397 CVE 题 ComfyUI 预侦察没识别出指纹、31min 0 分翻车）。
 _FINGERPRINT_PATHS = ("/system_stats", "/v1/models", "/actuator/health")
 
 

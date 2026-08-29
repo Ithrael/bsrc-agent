@@ -1,7 +1,7 @@
 """Harness worker：spawn 外部 agent CLI（claude code + ClawGod patch）对单题攻坚。
 
 背景：裸 LLM 循环在"复现失败重探索"和"多阶段大题"上能力密度不足
-（b-02 内网链 587 步白跑、c-06 JDWP 现场写 exploit 烧光步数）。
+（多 flag 渗透题 内网链 587 步白跑、CVE 题 JDWP 现场写 exploit 烧光步数）。
 接入外部 harness 作为攻坚大脑：成熟的计划-执行-反思循环 + 长上下文管理。
 
 后端（2026-08-14）：
@@ -127,7 +127,7 @@ def _parse_jsonl(line: str, res: HarnessResult, on_text=None):
         res.session_id = sid
     # token 熔断统计：只累计 assistant 事件的步级 usage（result 事件是总量，重复计入会翻倍）。
     # 按成本加权：cache_read 是缓存命中重读，价格约 input 的 1/10——全额计入会虚高 5 倍
-    # 误杀正常题（run 9228 复盘：a-07 正常题 1.9 分钟被 300 万熔断误杀，cache_read 占 97%）。
+    # 误杀正常题（run 9228 复盘：Web 题 正常题 1.9 分钟被 300 万熔断误杀，cache_read 占 97%）。
     if ev.get("type") == "assistant":
         u = (ev.get("message") or {}).get("usage") or ev.get("usage") or {}
         # reasoning/thinking tokens 计入 output 类（effort max 下思考暴涨，防熔断统计失真）
@@ -242,7 +242,7 @@ async def run_harness(cfg, prompt: str, cwd: str, timeout_s: int,
     - "claude"：内置后端（ClawGod 版 claude code）
     - 其他值：当作可执行脚本路径（测试/自定义后端用），参数只有 cwd。
     流式逐行读 stdout（原 communicate 一次性读完）：支持 token 熔断——
-    assistant 步级 usage 累计超 token_budget 就 kill（run 9054 复盘 b-02 单会话 920 万 token）。
+    assistant 步级 usage 累计超 token_budget 就 kill（run 9054 复盘 多 flag 渗透题 单会话 920 万 token）。
     model：非空时覆盖该会话的 ANTHROPIC_MODEL（多模型分工：hard 题用更强模型）。
     effort：非空时加 --effort（hard 题 max 思考预算，Claude Code 2.1.231+ 支持）。
     stop_event：外部完成信号（本题 flag 已全部入账）——置位即杀进程组提前收工。

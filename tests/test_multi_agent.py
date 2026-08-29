@@ -102,7 +102,7 @@ class _StuckWorker:
 
 
 def test_refanout_injects_relay_on_stuck_surface(tmp_path):
-    """进度停在 2/4 超 15min → RELAY.md 注入加线指令；20min 冷却内不重复。"""
+    """进度停在 2/4 超 5min → RELAY.md 注入横向专班指令；8min 冷却内不重复。"""
     cfg = Config()
     sched = Scheduler(cfg, FakeLLM(), _NoopApi(), str(tmp_path))
     ws = tmp_path / "b-02"
@@ -110,19 +110,19 @@ def test_refanout_injects_relay_on_stuck_surface(tmp_path):
     (ws / "RELAY.md").write_text("# 接力块\n")
     sched.active_workers = {"b-02": [_StuckWorker(2, 4)]}
     now = time.monotonic()
-    # 首次采样：记录基线（2, now），未到 15min 不注入
-    sched._refanout_stuck_surfaces(now - 16 * 60 + 60)   # 基线比这更晚即可
-    sched._surface_stuck["b-02"] = (2, now - 16 * 60)    # 直接预置停 16min
+    # 首次采样：记录基线（2, now），未到 5min 不注入
+    sched._refanout_stuck_surfaces(now - 6 * 60 + 60)   # 基线比这更晚即可
+    sched._surface_stuck["b-02"] = (2, now - 6 * 60)    # 直接预置停 6min
     sched._refanout_stuck_surfaces(now)
     relay = (ws / "RELAY.md").read_text()
-    assert "换角度加派 2 条子 agent 线" in relay, "卡面 15min 应注入加线指令"
+    assert "横向专班" in relay, "卡面 5min 应注入横向专班指令"
     # 冷却内再触发：不重复注入
     sched._refanout_stuck_surfaces(now + 60)
-    assert (ws / "RELAY.md").read_text().count("换角度加派") == 1
+    assert (ws / "RELAY.md").read_text().count("横向专班") == 1
     # 进度推进到全拿：不再催
     sched.active_workers = {"b-02": [_StuckWorker(4, 4)]}
     sched._refanout_stuck_surfaces(now + 1200)
-    assert (ws / "RELAY.md").read_text().count("换角度加派") == 1
+    assert (ws / "RELAY.md").read_text().count("横向专班") == 1
 
 
 # ---- T1：drain 间隔 ----

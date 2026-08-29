@@ -139,6 +139,11 @@ def _load_cross_run_events(run_dir: str, lookback: int = 5) -> dict[str, dict]:
     return _aggregate_events(events)
 
 
+# 优先跑指定题（FOCUS_CODES 环境变量）：本地定点验证某几题的修复效果时，
+# 这些题 rank 置负永远排队首。scheduler.__init__ 里按 cfg.focus_codes 设置。
+_FOCUS_CODES: set[str] = set()
+
+
 def _priority(ch: Challenge, round_num: int = 2,
               stats: dict[str, dict] | None = None) -> float:
     """按「完整解出题目数 / 墙钟时间」排序，而不是按分值排序。
@@ -148,6 +153,8 @@ def _priority(ch: Challenge, round_num: int = 2,
     stats（events.jsonl 实测聚合）：P50 完整解出耗时替代难度估算；
     高解出率剩一面题提到断点档；多轮实测零解的题降权。
     """
+    if ch.unique_code in _FOCUS_CODES:
+        return -1.0   # focus 题永远排队首
     info = _LIB.get(ch.unique_code) or {}
     difficulty_rank = {"easy": 0, "medium": 1, "hard": 2}.get(ch.difficulty, 3)
     est = _EST_MIN.get(ch.difficulty, 12)
@@ -165,7 +172,7 @@ def _priority(ch: Challenge, round_num: int = 2,
         rank = 5 + difficulty_rank      # 有断点但仍多面
     else:
         # 全新多 flag 题最后处理；但高分大题（≥1000 分，b 系列 1200-1800）提前
-        # 到与 partial 多面同级（run 12396 复盘：b-02 1800 分从头到尾没启动，
+        # 到与 partial 多面同级（run 12396 复盘：多 flag 渗透题 1800 分从头到尾没启动，
         # 槽位被单 flag 题反复占满，子 agent 无题可派，整段无分治低效期）。
         rank = (5 if ch.total_score >= 1000 else 8) + difficulty_rank
 
@@ -194,6 +201,8 @@ class Scheduler:
         self.llm = llm
         self.api = api
         self.run_dir = run_dir
+        global _FOCUS_CODES
+        _FOCUS_CODES = set(cfg.focus_codes)
         # 永不停止模式下无全局截止（deadline=∞，worker 永不触发 global deadline），
         # 有界模式退回原语义：GLOBAL_BUDGET_MIN 分钟后收尾。
         self.deadline = float("inf") if cfg.never_stop else time.monotonic() + cfg.global_budget_min * 60
@@ -220,6 +229,7 @@ class Scheduler:
         # 并发写死 3（平台同时最多 3 题）：409 不降级，题轮转队尾等槽位（run 10048
         # 复盘：409 收敛只降不升致后半程单线程，吞吐损失 2/3——宁可轮转不可塌缩）
         self._start_backoff: dict[str, float] = {}  # 409 轮转的题 -> 可重试时间戳
+        self._platform_full_until = 0.0  # 平台 3 槽位满的全局闸门：409 后停止派发至该时刻
         # 钉子题（hint 已看 + 多轮 0 flag）判死集合：不进常规 retry、不参与常规回查；
         # 只剩钉子题未解时回查轮仍会回挖（其他题全解了，打死题零机会成本）
         self._dead: set[str] = set()
@@ -435,17 +445,18 @@ class Scheduler:
                 continue
             prev = self._surface_stuck.get(code)
             if prev and prev[0] == cc:
-                if (now - prev[1] >= 15 * 60
-                        and now - self._refanout_ts.get(code, 0) >= 20 * 60):
+                if (now - prev[1] >= 5 * 60
+                        and now - self._refanout_ts.get(code, 0) >= 8 * 60):
                     self._refanout_ts[code] = now
                     try:
                         with open(os.path.join(self.run_dir, code, "RELAY.md"), "a") as f:
                             f.write(
-                                f"\n[系统 {time.strftime('%H:%M')}] flag 进度停在 {cc}/{total} 已 15 分钟。\n"
-                                "对卡住的面立即换角度加派 2 条子 agent 线"
-                                "（不同攻击面/不同主机/不同凭据，角度参考分类作战手册），"
-                                "不要守着同一方向反复试；已排除方向见 STATE.md 的 ## ELIMINATED。\n")
-                        log.warning("[refanout] %s 进度停在 %d/%d 已 15min，RELAY.md 注入加线指令",
+                                f"\n[系统 {time.strftime('%H:%M')}] flag 进度停在 {cc}/{total} 已 5 分钟。\n"
+                                "立即切「横向专班」：已正确提交的 flag 是旧面，禁止重提；唯一目标是找剩余新面——\n"
+                                "(1) 读 RELAY.md 的「已拿主机与凭据/内网拓扑」，从已突破主机沿内网横向打下一台；\n"
+                                "(2) 优先 ssh/凭据复用/redis 未授权/fscan 扫段，别守着入口 Web 面反复试；\n"
+                                "(3) 已排除方向见 STATE.md 的 ## ELIMINATED。\n")
+                        log.warning("[refanout] %s 进度停在 %d/%d 已 5min，RELAY.md 注入横向专班指令",
                                     code, cc, total)
                     except OSError:
                         pass
@@ -603,6 +614,9 @@ class Scheduler:
                     # 题轮转队尾 + 冷却重试，槽位空出后立即补位。
                     log.warning("[%s] start 409（平台实例满，3 槽位），题轮转队尾", code)
                     self._start_backoff[code] = time.monotonic() + self.start_backoff_s
+                    # 全局闸门：平台 3 槽位满时，本 tick 停止派发（防遍历 pending 打
+                    # 无效 start 空转风暴——云题 槽位泄漏后 17s 打 30+ 次全 409）。
+                    self._platform_full_until = time.monotonic() + self.start_backoff_s
                     self.pending.append(ch)
                     return [], True
                 log.error("[%s] start 失败: %s", code, e)
@@ -665,7 +679,16 @@ class Scheduler:
                                 budget_cap_min=budget_cap_min)
                 self.active_workers[code] = [worker]
                 try:
-                    res = await worker.run()
+                    try:
+                        # 兜底超时：worker 内部超时（≤45min）只在循环开头检查，循环体
+                        # 若卡死（shell/LLM/提交挂起）检查永远不执行——云题 卡 50min
+                        # 泄漏槽位、后续全 409 即此。65min 兜底强制释放，覆盖正常最长
+                        # （45min 预算 + 一轮收尾）。
+                        res = await asyncio.wait_for(worker.run(), timeout=3900)
+                    except asyncio.TimeoutError:
+                        log.error("[%s] worker 卡死（65min 兜底超时），强制释放槽位", code)
+                        res = worker.result
+                        res.reason = "worker stuck (guard timeout)"
                 except Exception as e:
                     log.exception("[%s] worker 崩溃", code)
                     res = worker.result
@@ -692,6 +715,17 @@ class Scheduler:
                     res.reason = "preempted (stagnate)"
                 self.active_workers.pop(code, None)
                 await self._finish(ch, res)
+            except Exception as e:
+                # 派发路径（harness/paired/second_brain）内部异常：兜底关闭容器防
+                # 平台槽位泄漏（云题 卡 50min 未 close → 3 槽位满 → 后续全 409）。
+                # 普通 worker 崩溃已在 worker.run 的 except 内捕获并走到 _finish，
+                # 不会落这里；落这里的只有三个分支路径在 _finish 前抛出的异常。
+                log.exception("[%s] 派发路径异常，兜底关闭容器防槽位泄漏", code)
+                await self._close_safely(code)
+                self.done[code] = {"completed": False, "score": 0,
+                                   "reason": f"dispatch: {type(e).__name__}"}
+                self._start_backoff[code] = time.monotonic() + self.start_backoff_s
+                self.pending.append(ch)
 
     def _should_use_harness(self, ch: Challenge) -> bool:
         """第 2 轮攻坚题直接 harness：第 1 轮没解出的（partial）或无解法的 hard 题。
@@ -832,7 +866,7 @@ class Scheduler:
         attempt≥1 的二轮起）配两个主进程分区攻坚——A 主带 Web 入口方向组、
         B 主带内网横向方向组，各自进程内再派 Task 子 agent。单主进程协调
         6-8 条线时的上下文膨胀与派发间隔是隐性串行点，分区后协调开销也并行；
-        复盘 b-02/b-03（1200 分）单主 60min 封顶只拿 2/6、3/6。
+        复盘 多 flag 渗透题/多 flag 渗透题（1200 分）单主 60min 封顶只拿 2/6、3/6。
         资源紧张态不配（看门狗），复现题不配（直接复现更快）。
         裸 LLM 模式保留原逻辑（总分≥1000 且 flag≥3）。
         """
@@ -1297,6 +1331,11 @@ class Scheduler:
                             self._last_idle_recheck_ts = now_mono  # 平台已无未解题
                         break
                 ch = self.pending.pop(0)
+                # 409 全局闸门：平台槽位满冷却期内不再派发任何题（避免 17s 遍历
+                # pending 打 30+ 次无效 start），等 30s 冷却到期或槽位释放再试。
+                if time.monotonic() < self._platform_full_until:
+                    self.pending.append(ch)
+                    break
                 wait_until = self._start_backoff.get(ch.unique_code, 0)
                 if time.monotonic() < wait_until:
                     self.pending.append(ch)  # 409/失败冷却中，轮转到队尾
@@ -1304,7 +1343,7 @@ class Scheduler:
                     if skipped >= len(self.pending):
                         break  # 所有待选题都在冷却，等下一轮 15s 循环
                     continue
-                # endgame 收尾纪律（12464 复盘：收卷前 25min 还在第三轮攻 f2-05）：
+                # endgame 收尾纪律（12464 复盘：收卷前 25min 还在第三轮攻 二进制题）：
                 # 名义窗口只剩 ENDGAME_MIN 时只放行快赢题（只剩一面/有完整解法可复现），
                 # 不再开新 hard/多 flag 大题——尾段时间全部给确定性得分。
                 # 快赢耗尽后不空槽（P0）：放行最优的一道，预算封顶在尾段剩余

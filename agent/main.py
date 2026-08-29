@@ -121,6 +121,10 @@ async def _amain() -> int:
         except Exception as e:
             log.error("LLM 连通失败（托管模式是否已走 .tsecbench.gw 网关？）: %s", e)
             return 4
+        if cfg.simple_mode:
+            # 极简模式：跳过 claude worker（直接 LLM 直连全 flash），不依赖 ClawGod/Anthropic 通道
+            cfg.claude_worker = False
+            cfg.harness_enabled = False
         if cfg.claude_worker:
             # 多模型分工未配置时提示（run 10282 复盘：pro 全程只被调用 1 次——
             # hard 题全靠 flash 单模型，与榜首 2-4 模型分工差距的直接原因）
@@ -199,7 +203,11 @@ async def _amain() -> int:
             log.info("dry-run 完成，退出。")
             return 0
 
-        sched = Scheduler(cfg, llm, api, run_dir)
+        if cfg.simple_mode:
+            from .simple_mode import SimpleScheduler
+            sched = SimpleScheduler(cfg, llm, api, run_dir)
+        else:
+            sched = Scheduler(cfg, llm, api, run_dir)
         await sched.run()
         return 0
     finally:
