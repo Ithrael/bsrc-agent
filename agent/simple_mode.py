@@ -115,7 +115,8 @@ class SimpleScheduler:
         if r.correct:
             log.info("[%s] FLAG 正确 +%d (%d/%d)", ch.unique_code, r.awarded,
                      r.correct_flag_count, r.total_flag_count)
-        return r
+            return (f"✅ 正确！+{r.awarded} 分，进度 {r.correct_flag_count}/{r.total_flag_count}")
+        return f"❌ 错误，进度 {r.correct_flag_count}/{r.total_flag_count}"
 
     async def _hint(self, ch: Challenge, attempt: int):
         code = ch.unique_code
@@ -204,6 +205,7 @@ class SimpleScheduler:
                     except json.JSONDecodeError:
                         args = {}
                     out = await dispatch_tool(box, name, args)
+                    out = out if isinstance(out, str) else str(out)  # 防御：工具输出必须是字符串
                     for fl in extract_flags(out):
                         if submitter.should_try(fl, auto=True):
                             await self._submit(ch, submitter, fl)
