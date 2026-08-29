@@ -110,7 +110,11 @@ class SimpleScheduler:
 
     # ---- 平台动作 ----
     async def _submit(self, ch: Challenge, submitter: FlagSubmitter, flag: str):
-        r = await self.api.submit_flag(ch.unique_code, flag)
+        try:
+            r = await self.api.submit_flag(ch.unique_code, flag)
+        except Exception as e:
+            log.warning("[%s] submit 网络异常: %s", ch.unique_code, e)
+            return f"❌ 提交失败（网络/平台异常）: {e}"
         submitter.record(flag, r.correct, r.awarded, r.correct_flag_count)
         if r.correct:
             log.info("[%s] FLAG 正确 +%d (%d/%d)", ch.unique_code, r.awarded,
@@ -128,7 +132,12 @@ class SimpleScheduler:
         if self.cfg.hint_policy == "never":
             return "[hint 已禁用]"
         self._hint_pulled.add(code)
-        hint = await self.api.get_hint(code)
+        try:
+            hint = await self.api.get_hint(code)
+        except Exception as e:
+            log.warning("[%s] hint 网络异常: %s", code, e)
+            self._hint_pulled.discard(code)
+            return "[hint 获取失败]"
         if hint:
             # hint 作为一条 fact 落盘，跨 step/attempt 复用
             await self._append_fact(code, f"[官方提示] {hint}")
@@ -311,7 +320,10 @@ class SimpleScheduler:
         log.info("[%s] attempt %d 完成，flag %d/%d",
                  code, attempt + 1, submitter.correct_count, ch.flag_count)
 
-        await self.api.close_challenge(code)
+        try:
+            await self.api.close_challenge(code)
+        except Exception as e:
+            log.warning("[%s] close 失败（忽略，不影响解题）: %s", code, e)
         return {"code": code, "ch": ch, "attempt": attempt,
                 "completed": submitter.completed, "score": submitter.score,
                 "flags": sorted(submitter.correct)}
@@ -355,7 +367,11 @@ class SimpleScheduler:
             done, _ = await asyncio.wait(active.keys(), return_when=asyncio.FIRST_COMPLETED)
             for t in done:
                 code, attempt = active.pop(t)
-                r = t.result()
+                try:
+                    r = t.result()
+                except Exception as e:
+                    log.error("[%s] 解题异常（忽略，继续调度）: %s", code, e)
+                    continue
                 if r["completed"]:
                     solved.add(code)
                     log.info("解出 %s（+%d 分，attempt %d）", code, r["score"], attempt + 1)
