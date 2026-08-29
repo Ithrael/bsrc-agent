@@ -144,13 +144,28 @@ class SimpleScheduler:
         return hint or "(无提示)"
 
     async def _addrs(self, ch: Challenge) -> list[str]:
+        code = ch.unique_code
         if ch.container_status == "available" and ch.container_addr:
             return ch.container_addr
-        try:
-            return await self.api.start_challenge(ch.unique_code)
-        except Exception as e:
-            log.warning("[%s] start 失败: %s", ch.unique_code, e)
-            return ch.container_addr
+        # start 失败重试：网络抖动/响应超时是瞬时的（13506 实测 3 题同秒 start 全 network 失败），
+        # 重试 + 每次重试后查平台快照（start 可能实际成功但响应超时，容器已 available）
+        for attempt in range(3):
+            try:
+                addrs = await self.api.start_challenge(code)
+                if addrs:
+                    return addrs
+            except Exception as e:
+                log.warning("[%s] start 失败（第 %d 次）: %s", code, attempt + 1, e)
+            await asyncio.sleep(5)
+            try:
+                fresh = {c.unique_code: c for c in await self.api.list_challenges()}
+                c = fresh.get(code)
+                if c and c.container_status == "available" and c.container_addr:
+                    log.info("[%s] start 响应超时但容器已就绪，复用 addr", code)
+                    return c.container_addr
+            except Exception:
+                pass
+        return []
 
     # ---- 单 step 短会话 ----
     async def _run_step(self, ch: Challenge, addrs: list[str], submitter: FlagSubmitter,
@@ -300,6 +315,11 @@ class SimpleScheduler:
     async def _solve_one(self, ch: Challenge, attempt: int) -> dict:
         code = ch.unique_code
         addrs = await self._addrs(ch)
+        if not addrs:
+            # start 失败：跳过本轮（不拿空 addr 瞎跑），重排后下次重试 start
+            log.warning("[%s] start 失败，跳过本轮（重排后重试）", code)
+            return {"code": code, "ch": ch, "attempt": attempt,
+                    "completed": False, "score": 0, "flags": []}
         submitter = FlagSubmitter(code, ch.flag_count, ch.correct_flag_count,
                                   wrong_cap=self.cfg.wrong_submit_cap)
         hint_cb = lambda: self._hint(ch, attempt)
