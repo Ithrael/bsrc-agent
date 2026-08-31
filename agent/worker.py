@@ -139,9 +139,12 @@ def _extract_cve_hints(text: str) -> list[str]:
     for pat, hint in _CVE_HINTS:
         if pat.search(text or "") and hint not in found:
             found.append(hint)
-    # 裸 CVE 编号（如 nuclei 输出 [CVE-2024-36401]）：组件名不在 _CVE_HINTS 也能提示优先查 PoC
-    for cve in set(re.findall(r"\bCVE-\d{4}-\d{4,}\b", text or "")):
-        hint = f"{cve} → 已确认存在，优先查该 CVE 公开 PoC 直接利用"
+    # 只认 nuclei 命中格式 [CVE-xxxx]（方括号 = nuclei -silent 真实命中标记）。
+    # 裸 CVE（grep 漏洞库/poc-index 会 dump 几百个）不能标「已确认存在」——
+    # 本地有 PoC ≠ 目标有漏洞，全量提取会把 facts 图刷爆、误导 LLM 去试
+    # 不存在的漏洞（13842 实测 a-05/d-01 中招，token 爆炸）。
+    for cve in set(re.findall(r"\[(CVE-\d{4}-\d{4,})\]", text or "")):
+        hint = f"{cve} → nuclei 命中，优先查该 CVE 公开 PoC 直接利用"
         if hint not in found:
             found.append(hint)
     return found

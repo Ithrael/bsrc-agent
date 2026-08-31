@@ -1,11 +1,14 @@
 """启动预侦察：worker 开跑前并行收集目标指纹，把报告直接交给 LLM。
 
 目标：省掉 LLM 每题的 3-5 轮侦察往返（每轮 shell 15-30s + LLM 思考 10-20s）。
-预算 ≤75s/题，两阶段（2026-08-27 修复，此前路径字符串带逗号全部探测错、
+预算 ≤300s/题，两阶段（2026-08-27 修复，此前路径字符串带逗号全部探测错、
 443/8443 用 http、nmap 开放端口不回灌 HTTP 探测）：
   阶段 1：并发 TCP 扫描（nmap top 端口 / socket 兜底）→ 解析真实开放端口；
   阶段 2：对开放端口并发识别 HTTP/HTTPS（按端口选 scheme，失败换另一 scheme），
           再跑敏感路径/CVE（nuclei）探测与本地漏洞库索引精查。
+子步骤超时已调长（nmap 45→90、socket 60→90、probe 40→60、nuclei 50→120），
+阶段 wait_for 用 max(预算比例, 子步骤最坏时间) 兜底，杜绝「预算 < 子步骤超时」
+导致的预侦察整条失效（13536 复盘：Web 18 题全 0 分即根源于此）。
 已知解法（solutions.json completed）的题不调用本模块，直接复现更快。
 """
 from __future__ import annotations
@@ -151,7 +154,7 @@ async def _scan_ports(cwd: str, host: str) -> str:
     if which.strip() == "yes":
         out = await _run_cmd(
             f"nmap -Pn -sT -T4 --min-rate 3000 -p {','.join(map(str, _TOP_PORTS))} {host} 2>/dev/null | grep -E '^[0-9]+/tcp.*open'",
-            cwd, 45,
+            cwd, 90,
         )
         if out.strip() and "(超时)" not in out and "(失败" not in out:
             return out.strip()
@@ -169,7 +172,7 @@ async def _scan_ports(cwd: str, host: str) -> str:
         f"print('open:', open_ports)\n"
         f"EOF"
     )
-    return (await _run_cmd(script, cwd, 60)).strip()
+    return (await _run_cmd(script, cwd, 90)).strip()
 
 
 async def _http_probe(cwd: str, host: str, port: int) -> str:
@@ -196,7 +199,7 @@ async def _probe_scheme(cwd: str, host: str, port: int, scheme: str) -> str:
         f"for p in {fp_paths}; do "
         f"echo \"== $p ==\"; curl {extra}-s -m 4 {base}$p 2>/dev/null | head -15; done"
     )
-    out = await _run_cmd(cmd, cwd, 40)
+    out = await _run_cmd(cmd, cwd, 60)
     if not out or "(超时)" in out or "(失败" in out:
         return ""
     # 全部连接失败（端口未开/非 HTTP）的探测没有信息量，直接丢弃（触发换 scheme/换端口）
@@ -272,32 +275,38 @@ async def _nuclei_scan(cwd: str, host: str, ports: list[int]) -> str:
         f"nuclei -duc {uflag} -t {_NUCLEI_TEMPLATES} "
         f"-tags rce,sqli,lfi,ssti,ssrf,deserialization,xxe -timeout 5 -rl 150 -c 20 "
         f"-silent -no-color -no-interactsh 2>/dev/null",
-        cwd, 50,
+        cwd, 120,
     )
     if not out or "(超时)" in out or "(失败" in out:
         return ""
     return f"[nuclei] {out.strip()}"
 
 
-async def recon_targets(addrs: list[str], workspace: str, budget_s: int = 75) -> str:
+async def recon_targets(addrs: list[str], workspace: str, budget_s: int = 300) -> str:
     """对目标地址做两阶段预侦察，返回供 LLM 阅读的报告文本（空串=无信息）。
 
     阶段 1：并发 TCP 扫描 → 解析真实开放端口；
     阶段 2：对开放端口（题目显式端口优先）并发识别 HTTP/HTTPS + 敏感路径 +
-            nuclei CVE 探测 + 漏洞库索引精查（组件名/CVE → 本地 PoC 路径）。"""
+            nuclei CVE 探测 + 漏洞库索引精查（组件名/CVE → 本地 PoC 路径）。
+
+    阶段 wait_for 用 max(预算比例, 子步骤最坏时间) 兜底：此前 0.55×75≈41s 的
+    阶段 1 预算比 nmap(45s)/socket(60s) 还短，扫描没跑完就被 wait_for 掐断，
+    阶段 2 的指纹/CVE 检索因此从未执行（13536 复盘：所有题「端口扫描无输出」）。
+    """
     hosts = _parse_hosts(addrs)
     if not hosts:
         return ""
     hosts = hosts[:_MAX_HOSTS]
     os.makedirs(workspace, exist_ok=True)
     try:
-        # 阶段 1：并发 TCP 扫描，解析开放端口（nmap 结果回灌给阶段 2）
+        # 阶段 1：并发 TCP 扫描，解析开放端口（nmap 结果回灌给阶段 2）。
+        # 单 host 最坏 = which(10) + nmap(90) + socket 兜底(90) ≈ 190s，兜底 240。
         scan_results: list = []
         try:
             scan_results = await asyncio.wait_for(
                 asyncio.gather(*[_scan_ports(workspace, h) for h in hosts],
                                return_exceptions=True),
-                budget_s * 0.55)
+                max(budget_s * 0.55, 240))
         except asyncio.TimeoutError:
             scan_results = ["(预侦察超时)" for _ in hosts]
         open_map: dict[str, list[int]] = {}
@@ -313,7 +322,8 @@ async def recon_targets(addrs: list[str], workspace: str, budget_s: int = 75) ->
             tasks.append(_nuclei_scan(workspace, h, ports))
         try:
             results = await asyncio.wait_for(
-                asyncio.gather(*tasks, return_exceptions=True), budget_s * 0.65)
+                asyncio.gather(*tasks, return_exceptions=True),
+                max(budget_s * 0.65, 150))
         except asyncio.TimeoutError:
             results = ["(预侦察超时)" for _ in tasks]
 
@@ -321,13 +331,17 @@ async def recon_targets(addrs: list[str], workspace: str, budget_s: int = 75) ->
         for h, r in zip(hosts, scan_results):
             if isinstance(r, Exception):
                 r = f"(失败: {type(r).__name__})"
-            if str(r).strip() and "(失败" not in str(r) and "(超时)" not in str(r):
-                lines.append(f"### {h} 端口扫描\n{str(r).strip()}")
+            s = str(r).strip()
+            if s and "(失败" not in s and "(超时)" not in s and "(无输出)" not in s:
+                lines.append(f"### {h} 端口扫描\n{s}")
         for r in results:
             if isinstance(r, Exception):
                 continue
-            if str(r).strip() and "(失败" not in str(r):
-                lines.append(str(r).strip())
+            s = str(r).strip()
+            # 超时/无输出是废料，不进报告（否则「(预侦察超时)」被当有效信息
+            # 落成 fact，后续会话误以为已侦察过而不再重扫——13536 自锁闭环）
+            if s and "(失败" not in s and "(超时)" not in s and "(无输出)" not in s:
+                lines.append(s)
         # PoC 预检：指纹文本提取组件名/CVE → 查本地漏洞库索引（省 claude 检索轮次）
         joined = "\n".join(str(r) for r in results if isinstance(r, str))
         comps = sorted(set(_COMPONENT_RE.findall(joined)))

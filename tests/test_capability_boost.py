@@ -2,7 +2,7 @@
 
 - 方案1 resume：session_id 捕获、--resume 传参、resume 无输出自动回退、跨 attempt 持久化
 - 方案3 知识包：镜像 COPY + playbook 引用 + 文件清单
-- 方案4 fallback：主网关连续 3 次失败切备用、备用连续 5 次成功切回、400 不触发切换
+- 方案4 fallback：主网关连续 2 次失败切备用、备用连续 5 次成功切回、400 不触发切换
 """
 import json
 import time
@@ -171,9 +171,11 @@ class _FakeChan:
     def __init__(self, script):
         self.script = list(script)
         self.calls = 0
+        self.last_timeout = None
 
-    async def post(self, path, json=None):
+    async def post(self, path, json=None, **kw):
         self.calls += 1
+        self.last_timeout = kw.get("timeout")
         action = self.script.pop(0) if self.script else "ok"
         if isinstance(action, Exception):
             raise action
@@ -198,7 +200,7 @@ def _no_llm_backoff_sleep(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_llm_fallback_switch_and_return():
-    """主通道连续 3 次网络失败切备用；备用连续 5 次成功切回主。"""
+    """主通道连续 2 次网络失败切备用；备用连续 5 次成功切回主。"""
     c = LLMClient("http://main.local/v1", "k", "m", timeout_s=1,
                   fallback_base_url="http://fb.local/v1", fallback_model="fm")
     main_chan = _FakeChan([httpx.ConnectError("boom")] * 10)
@@ -207,17 +209,17 @@ async def test_llm_fallback_switch_and_return():
 
     msg = await c.chat([{"role": "user", "content": "x"}])
     assert msg["content"] == "hi"
-    assert c._active == "fallback", "主通道 3 连败应切换"
-    assert main_chan.calls == 3
+    assert c._active == "fallback", "主通道 2 连败应切换"
+    assert main_chan.calls == 2
 
     # 备用连续成功累计 5 次（首轮已 +1）→ 切回主通道
     for _ in range(4):
         await c.chat([{"role": "user", "content": "x"}])
     assert c._active == "main", "备用累计 5 次成功应切回主通道"
-    # 切回后再失败 3 次又能切备用（状态机复位）
+    # 切回后再失败 2 次又能切备用（状态机复位）
     await c.chat([{"role": "user", "content": "x"}])
     assert c._active == "fallback"
-    assert main_chan.calls == 6, "切回主后 3 连败再次切换"
+    assert main_chan.calls == 4, "切回主后 2 连败再次切换"
     await c.close()
 
 
@@ -225,10 +227,12 @@ async def test_llm_fallback_switch_and_return():
 async def test_llm_no_fallback_configured():
     """未配置备用通道：行为退回原语义（重试后抛错），不崩。"""
     c = LLMClient("http://main.local/v1", "k", "m", timeout_s=1)
-    c._client = _FakeChan([httpx.ConnectError("boom")] * 10)
+    chan = _FakeChan([httpx.ConnectError("boom")] * 10)
+    c._client = chan
     with pytest.raises(RuntimeError):
         await c.chat([{"role": "user", "content": "x"}])
     assert c._active == "main"
+    assert chan.calls == 3  # 1 + 最多再试 2 次
     await c.close()
 
 
@@ -241,4 +245,34 @@ async def test_llm_400_does_not_trigger_switch():
     for _ in range(5):
         c._note_channel_success()
     assert c._fail_streak == 0
+    await c.close()
+
+
+@pytest.mark.asyncio
+async def test_llm_retry_wait_capped_at_5s(monkeypatch):
+    """单次退避 ≤5s，总共最多 2 次等待（3 次尝试）。"""
+    import agent.llm as llm_mod
+    waits = []
+
+    async def rec_sleep(s):
+        waits.append(s)
+
+    monkeypatch.setattr(llm_mod.asyncio, "sleep", rec_sleep)
+    c = LLMClient("http://main.local/v1", "k", "m", timeout_s=1)
+    c._client = _FakeChan([httpx.ConnectError("boom")] * 10)
+    with pytest.raises(RuntimeError):
+        await c.chat([{"role": "user", "content": "x"}])
+    assert waits == [3, 5]
+    await c.close()
+
+
+@pytest.mark.asyncio
+async def test_llm_chat_timeout_s_passed_to_post():
+    """timeout_s 作为本次调用墙钟预算传给 httpx post。"""
+    c = LLMClient("http://main.local/v1", "k", "m", timeout_s=300)
+    chan = _FakeChan(["ok"])
+    c._client = chan
+    await c.chat([{"role": "user", "content": "x"}], timeout_s=12)
+    assert chan.last_timeout is not None
+    assert 11 <= chan.last_timeout <= 12
     await c.close()

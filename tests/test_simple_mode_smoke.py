@@ -88,6 +88,8 @@ def _mk_sched(api, tmp_path) -> SimpleScheduler:
     cfg = Config()
     cfg.simple_mode = True
     cfg.simple_steps_per_round = 3  # 减少 step 数，加速测试
+    cfg.record_solutions = False    # 防测试污染真实解法库
+    cfg.recon_boot = False          # 测试不起真实 nmap 侦察
     return SimpleScheduler(cfg, FakeLLM(), api, str(tmp_path))
 
 
@@ -115,6 +117,7 @@ async def test_solve_one_start_fail_skips(tmp_path):
     sched = _mk_sched(api, tmp_path)
     r = await sched._solve_one(_mk_ch(), 0)
     assert r["completed"] is False
+    assert r["started"] is False   # start 失败标记，run() 据此不消耗 attempt
     assert r["flags"] == []
     assert api.start_calls >= 3  # 重试过 3 次
 
@@ -126,7 +129,8 @@ async def test_submit_network_error_returns_string(tmp_path):
     sched = _mk_sched(api, tmp_path)
     ch = _mk_ch()
     sub = FlagSubmitter(ch.unique_code, ch.flag_count, 0, wrong_cap=10)
-    out = await sched._submit(ch, sub, "flag{test}")
+    # 用合法 UUID 形态 flag 走过 should_try 闸门，落到 submit_flag 抛异常路径
+    out = await sched._submit(ch, sub, "flag{aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa}")
     assert isinstance(out, str)  # 返回字符串，不是抛异常
     assert "失败" in out
 

@@ -25,16 +25,57 @@ main.py  入口：环境校验 → 连通性自检 → Scheduler
 
 设计要点（来自对榜首 Cairn_X 跑分数据的复盘 + 本地 12 轮实测复盘）：
 
+- **极简模式（SIMPLE_MODE=1，对齐 2026-08-29 前五名架构：短会话+高并行+facts 收束，全 flash）**：
+  外层 3 题并发动态补位，内层拆两类引擎：**链式题**（flag≥4 或 hard 多 flag）走
+  FGS-lite——持久 Step 图（graph.json）+ 增量 Decide（干净上下文重排，ADD/DROP
+  带原因）+ 并行短会话 Execute 各做一个 step，链跨 attempt/波次不断；**撒网题**
+  拆 8 方向 flash 短会话并行（方向 LLM 动态规划，失败按题型回退专属方向集）。
+  facts 图跨 step/attempt/跨方向注入收束（负结果「已排除」也是事实）；step 工作区
+  全题共享（exploit 脚本/凭证/笔记跨 step 累积复用，能力沉淀在文件不在上下文）。
+  一波跑完回查平台开下一波（NEVER_STOP 语义，attempt 按波重置）直至预算耗尽；
+  start 失败不消耗 attempt；链式大题提前占派发位 + 重排插队头（连续窗口，榜首
+  97.14 复盘：链式题留到最后 90 分钟 = 死在第 24 步）；hard/pwn/多 flag 题切
+  claude harness 攻坚（含 effort 探测），三道闸自检失败退化全 flash（此时 FGS-lite
+  即链式主引擎；claude 档 attempt 耗尽后链式题自动转 FGS-lite 续跑，不弃题）。
+  复眼补丁（榜首 run 日志复盘出的四个结构性缺陷的通用解法）：
+  ① 负事实回灌——错提立即落 `[负候选]` 图节点并注入全部会话（榜首 f2-05 的
+  8 次错提全是兄弟会话重复推导的近失）；② 工件登记——会话产出的 .py/.sh 落
+  `[自动-工件]` fact（共享工作区里「有什么现成脚本」必须进图，先跑再造）；
+  ③ Decide 事件驱动节流（首轮/无活/新线索≥2/停滞才重排，砍每轮全量重排的
+  串行税）+ 停滞强制换攻击面（一轮无新 flag 无新线索 → 下次 Decide 必须开
+  换面步骤，防单图兔子洞）+ 风险税排序（信封内动作优先，反向隧道/外部监听
+  排后——榜首 b-02 死因：图记得对、路选错）+ 强模型决策（LLM_MODEL_HARD
+  配了就给 Decide 用，flash 只管执行）；④ 差分注入——链式会话只看自己的
+  接力棒（前置步骤结论 + 并行兄弟概览 + 已废弃路径），不再全图硬塞。
+  架构终审修复：链式题无进展判定叠加图进展（done step 增量，深链只有结论型
+  note 不再被误杀断立足点）；并发链上限 2（第 3 条链等位，防 3 槽位被链钉死
+  ≥90min 饿死快分面）；claude 棒交接（facts 剪枝面/工件清单写共享 NOTES.md
+  引擎交接段 + claude 错提回灌负候选）；`CHAIN_PARALLEL` 每轮 Execute 并行数
+  配置化；剩余 <5min 不开新链棒（start 前拦截，不白烧容器启动）。
+  提速要点：claude 通道自检后台化（easy flash 立即开跑）；每题共享启动侦察
+  （≤75s 端口/组件/CVE 指纹后台采集，step 免去 8 份重复 nmap）；同轮多工具调用
+  并行执行（同 session 锁排队）；无新 flag 无新线索的 attempt 止损跳过；同 run 内
+  复现题最先派发且走 flash 复现通道（不 spawn claude）；free 策略下 flash 退化的
+  hard/多 flag 题首轮即拉 hint；收尾 ENDGAME_MIN 快赢排序（剩 1 面 > 低难度）；
+  retry 轮撒网方向减半（断点续跑不重新撒满）。
+  时间分配（通用规则，按题目属性不按系列）：链式题 attempt 预算下限 30min
+  （FGS 10min/轮 × 3 轮，薄窗口每轮刚热身就到点）且 attempt 间不 close 容器
+  （立足点 webshell/隧道/凭据会话存活，终态才关——close=重启=每棒重铺基建）；
+  全部链式题提前占前几个派发位（多条链并行连续推进 + 其余槽位快扫轮转）；
+  二进制类型 easy/medium 单 flag 先 flash 快试一轮、未解出再升级 claude
+  （全量 claude 会占掉 1/3~1/2 预算挤掉链式窗口）；插队头仅限链式题。
 - **错提不惩罚**：平台 duplicate 幂等只针对已正确 flag，错提返回 correct:false 无扣分。
   因此所有工具输出都过 flag 正则自动提交（榜首错提 388 次 / 正确 71 次）。
 - **hint 扣分**：`HINT_POLICY=free`（默认，6 小时冲刺优先解题数量）；`stuck` 卡住后放行，`never` 完全禁用。
   claude 直接解题模式下 retry 轮/断点重跑自动注入官方提示（扣分约 10%），
   已拿过的 hint 落盘 notes.json 下轮免费复用不重复扣分。
-- **解法库（solutions.json）**：
-  - 解出的题记录最后 15 条关键 shell 步骤（completed）→ 下轮注入后几分钟内复现锁分
-    （实测 a-03 0.7min、b-01 6.4min 拿满 1200 分）；
+- **解法库（solutions.json，合规红线内使用）**：
+  - **镜像不携带任何跨轮解法/笔记/情报**（.dockerignore + Dockerfile 双重防护，
+    有测试防回归）——把历史方案烤进镜像属恶意刷分，平台可举报。解法库只在
+    **单次 run 内**记录与复用：解出的题记录关键步骤 → 同 run 后续波次注入快速
+    复现释放槽位；赛后经 stdout SOLNOTE 复盘（分析用途，不回流镜像）。
   - 超时/步数耗尽的题记录部分进展（partial，不覆盖 completed）→ retry 轮从断点续跑，
-    不再从零开始（b-02 曾 587 步/150min 白跑）；
+    不再从零开始；
   - 注入时自动清洗旧轮次绝对路径（`cd <旧 run 路径> &&` 剥离、路径替换），并同步写入
     NOTES.md（上下文截断后仍可恢复）。
 - **超时分级**：按题数最大化快速轮转：hard 首轮/重试/后续为 25/35/40 分钟，medium 为
@@ -136,6 +177,14 @@ docker save bsrc-agent:latest | gzip > bsrc-agent.tar.gz   # ≤1GB
 | `MAX_CONCURRENT` | **平台题目槽位上限 3**。start 接口内置 0.6s 限速；409 invalid_state 不降级，题轮转队尾 30s 后重试 |
 | `MAX_AGENT_CONCURRENT` | 主 claude 进程全局上限，默认 8（3 题 = 3 主进程 + 断点重跑等辅助调用余量）；Task 子 agent 在主进程内并行，不占此额度 |
 | `CLAUDE_TOKEN_BUDGET` | `<0` 禁用 Claude 会话 token 熔断（默认 -1）；6 小时冲刺不因 token 额度提前停题。注意熔断只统计主进程流 usage，子 agent 消耗不计入 |
+| `SIMPLE_MODE` | 极简模式（默认 0，托管环境已开）：跳过重调度层——3 题并发动态补位 + 每题 8 方向 flash 短会话并行 + facts 图收束；hard/pwn/多 flag 题经 claude 攻坚，自检失败退化全 flash |
+| `SIMPLE_STEPS_PER_ROUND` | 每题并行方向 step 数，默认 8；方向由 LLM 读题+facts 动态规划，解析失败按题型回退方向集 |
+| `SIMPLE_ATTEMPTS` | flash 题每波 attempt 上限，默认 3；start 失败不消耗 attempt（波内连败 >3 弃到下一波） |
+| `SIMPLE_CLAUDE_ATTEMPTS` | claude 攻坚题每波 attempt 上限，默认 2（单次 attempt 贵） |
+| `SIMPLE_FIRST_TIMEOUT_MIN` | 首轮单 step 窗口（分钟），默认 10；按 flag 数（≥2 +3 / ≥4 +5）与难度（medium ×1.2 / hard ×1.5）乘算，受全局 deadline 封顶 |
+| `SIMPLE_STEP_TIMEOUT_MIN` | 次轮起单 step 窗口，默认 10（与首轮持平不倒挂，同样乘算） |
+| `SIMPLE_MAX_STEPS` | 单 step 会话最大 LLM 轮数，默认 15；上下文超 `CONTEXT_CHAR_BUDGET` 自动裁剪防 400 |
+| `SIMPLE_BUDGET_MIN` | 极简模式全局预算（分钟），默认 345；一波 attempt 跑完回查平台开下一波直至耗尽 |
 | 单题预算（非配置项） | 代码按难度/尝试次数决定：hard 25/35/40min、medium 12/25min、easy 8/15min；复现题单 flag 5min、多 flag 10min |
 | `GLOBAL_BUDGET_MIN` | 全局预算分钟数，默认 345（时限 360），仅 NEVER_STOP=0 时生效 |
 
@@ -145,7 +194,7 @@ docker save bsrc-agent:latest | gzip > bsrc-agent.tar.gz   # ≤1GB
 
 ```bash
 .venv/bin/pip install pytest pytest-asyncio
-.venv/bin/python -m pytest tests/ -q     # 72 个测试，含 mock 平台端到端
+.venv/bin/python -m pytest tests/ -q     # 248 个测试，含 mock 平台端到端、极简模式闭环/提速/FGS/复眼/终审修复回归与合规防回归
 python -m tests.mock_server 8899          # 单独起 mock 平台手动联调
 ```
 

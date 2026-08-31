@@ -133,12 +133,11 @@ RUN python3 /tmp/build_poc_index.py /opt/pocs /opt/nuclei-templates /opt/pocs/po
 
 COPY agent /app/agent
 COPY api-doc.txt /app/api-doc.txt
-# claude code 直接解题模式：镜像内默认开启（本地 run-local 不设此变量，走裸 LLM 循环调试）
-ENV CLAUDE_WORKER=1
-# 解法库（57 题已解 + 部分进展）：worker 启动时注入复现，没有它第一轮等于从零侦察
-COPY solutions.json /app/solutions.json
-# 专家复盘（人工高价值提示，独立存放不被自动记录覆盖）
-COPY notes.json /app/notes.json
+# 上场默认极简 FGS（全 flash）。不设 SIMPLE_MODE 会走旧 Scheduler+claude，P0/P1 全不上场。
+ENV SIMPLE_MODE=1
+ENV CLAUDE_WORKER=0
+# 合规红线：镜像不携带任何跨轮解法/笔记/情报（solutions/notes/intel 只在单次 run 内
+# 记录与复用，赛后经 stdout 复盘——把历史方案烤进镜像属恶意刷分，平台可举报）
 WORKDIR /app
 
 # 平台注入 BENCHMARK_BASE_URL / BENCHMARK_TOKEN；LLM_* 与策略参数在平台「动态环境变量」配置

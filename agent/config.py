@@ -110,12 +110,31 @@ class Config:
     # 极简模式（2026-08-29 前五名实测：短会话+高并行+facts 收束，全 flash）：
     # SIMPLE_MODE=1 走 simple_mode.SimpleScheduler，跳过重调度层（scheduler/worker/harness）。
     simple_mode: bool = field(default_factory=lambda: os.environ.get("SIMPLE_MODE", "0") != "0")
-    simple_steps_per_round: int = field(default_factory=lambda: _int("SIMPLE_STEPS_PER_ROUND", 8))
+    # 非链题 FGS 种子 Intent 数（题型方向集截断）。8 是旧撒网宽度，4 对齐
+    # 「短会话+少而准」；Decide 仍可 ADD 到最多 8 条 open（见 chain_parallel）。
+    simple_steps_per_round: int = field(default_factory=lambda: _int("SIMPLE_STEPS_PER_ROUND", 4))
+    # attempt 上限按「波」计：一波 = 题表全量过一遍 attempt；波间回查平台重置 attempt
+    # （NEVER_STOP 语义——预算没耗尽就继续回挖，不提前收工）
     simple_attempts: int = field(default_factory=lambda: _int("SIMPLE_ATTEMPTS", 3))
+    # claude harness 题的 attempt 上限（独立于 flash 的 simple_attempts）：
+    # claude 单次 attempt 贵（hard 25-45min），3 次 = 135min 占一个槽位太久；Worker
+    # 内部每次 attempt 已有断点重跑（一次 attempt 实为 2 次 claude 会话），2 次足够。
+    simple_claude_attempts: int = field(default_factory=lambda: _int("SIMPLE_CLAUDE_ATTEMPTS", 2))
     simple_first_timeout_min: int = field(default_factory=lambda: _int("SIMPLE_FIRST_TIMEOUT_MIN", 10))
-    simple_step_timeout_min: int = field(default_factory=lambda: _int("SIMPLE_STEP_TIMEOUT_MIN", 8))
-    simple_max_steps: int = field(default_factory=lambda: _int("SIMPLE_MAX_STEPS", 15))
+    # 次轮窗口与首轮持平（不倒挂）：次轮带 hint+facts+断点，是攻坚轮不是快验轮——
+    # 窗口反而更短会让「差一点就解出」的题永远差那两分钟（主架构语义也是 retry 更长）
+    simple_step_timeout_min: int = field(default_factory=lambda: _int("SIMPLE_STEP_TIMEOUT_MIN", 10))
+    # 单条 Execute 会话最大工具轮次。榜首 Explore p50=8 次调用；15 会在 5min
+    # 占用里把一条线跑成小长会话。
+    simple_max_steps: int = field(default_factory=lambda: _int("SIMPLE_MAX_STEPS", 8))
     simple_budget_min: int = field(default_factory=lambda: _int("SIMPLE_BUDGET_MIN", 345))
+    # 每题并行 Execute 路数。榜首 3 槽 × ~8 路 ≈ 24，峰值重叠会话 19。
+    # 再高（12×3=36）8 核沙箱会互抢，且兄弟会话重复推导（f2-05 8 次错提）。
+    chain_parallel: int = field(default_factory=lambda: _int("CHAIN_PARALLEL", 8))
+    # 开跑后多少分钟内不派链式题（3 槽全给单 flag 快扫）。榜首 12662 前 60 分钟
+    # 31 次 start / 20 flag，我们 13587 开场双链钉槽只 15 次 / 10 flag。
+    # 0 = 测试用，立刻允许链。
+    chain_quiet_min: int = field(default_factory=lambda: _int("CHAIN_QUIET_MIN", 90))
 
     # harness 攻坚：外部 agent CLI（claude code + ClawGod patch）接手难题。
     # 静态：第 2 轮 partial 未解题/hard 无解法题直接 harness；
@@ -170,6 +189,7 @@ class Config:
     wrong_submit_cap: int = field(default_factory=lambda: _int("WRONG_SUBMIT_CAP", 10))
     # 收尾段时长（分钟）：开跑满 GLOBAL_BUDGET_MIN-ENDGAME_MIN 后调度器只放行快赢题
     # （12464 复盘：收卷前 25min 还在第三轮攻 二进制题，尾段槽位全烧在零转化题上）
+    # 极简模式复用同一阈值：收尾段队列重排为「剩 1 面的多 flag > 低难度 > 高分」
     endgame_min: int = field(default_factory=lambda: _int("ENDGAME_MIN", 45))
 
     # 资源看门狗（T1）：沙箱 8核16G，双主/多子 agent 模式的安全带（12231 复盘：

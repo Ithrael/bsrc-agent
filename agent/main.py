@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import os
 import sys
@@ -65,6 +64,54 @@ async def _smoke_claude(cfg) -> bool:
     return False
 
 
+async def _probe_effort(cfg) -> None:
+    """claude --effort 支持探测（12464 复盘：探测超时被当失败降级→全轮 pro
+    reasoning=0，只买到知识没买到思考预算）。三分支判定：
+    - rc==0 → OK；- stderr 明确报 unknown/unrecognized/effort → 真不支持，降级；
+    - 超时/其他错误 → 网关慢，保留 effort（claude 对不支持的能力参数会秒退报错，
+      不会挂着超时——超时恰恰说明参数被接受了、只是推理慢）。
+    不支持时置空 cfg.claude_hard_effort（后续会话不再带 --effort）。
+    极简模式与 claude_worker 模式共用——两边的 claude 会话都带 effort，
+    哪边都不能跳过探测（否则网关不支持时攻坚会话全部秒败）。"""
+    import contextlib
+    from .harness import _claude_env
+    probe_model = cfg.llm_model_hard or cfg.llm_model
+    stderr_tail = b""
+    timed_out = False
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "claude", "-p", "回复 OK", "--effort", cfg.claude_hard_effort,
+            "--model", probe_model,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+            env=_claude_env(cfg, probe_model))
+        try:
+            _, stderr_tail = await asyncio.wait_for(proc.communicate(), timeout=90)
+            rc = proc.returncode
+        except asyncio.TimeoutError:
+            timed_out = True
+            rc = -1
+            with contextlib.suppress(ProcessLookupError, OSError):
+                proc.kill()
+    except Exception as e:
+        rc = -1
+        log.warning("effort 探测异常: %s", e)
+    low = (stderr_tail or b"").lower()[:300]
+    if rc == 0:
+        log.info("claude --effort %s 探测 OK（模型 %s）：全量会话（flash/pro）均带 effort",
+                 cfg.claude_hard_effort, probe_model)
+    elif timed_out:
+        log.warning("claude --effort %s 探测超时（90s，模型 %s）：按网关慢处理，"
+                    "保留 effort 不降级（12464 教训：超时≠不支持）",
+                    cfg.claude_hard_effort, probe_model)
+    elif any(k in low for k in (b"effort", b"unknown", b"unrecognized", b"invalid")):
+        log.warning("claude --effort %s 探测失败 rc=%s（stderr: %s）：真不支持，降级为无 effort",
+                    cfg.claude_hard_effort, rc, low[:120])
+        cfg.claude_hard_effort = ""
+    else:
+        log.warning("claude --effort %s 探测失败 rc=%s（stderr: %s）：非参数错误，保留 effort",
+                    cfg.claude_hard_effort, rc, low[:120] or "(空)")
+
+
 def _setup_logging(run_dir: str):
     os.makedirs(run_dir, exist_ok=True)
     fmt = "%(asctime)s %(levelname)-5s %(name)s: %(message)s"
@@ -103,6 +150,7 @@ async def _amain() -> int:
                     fallback_base_url=cfg.llm_base_url_fallback,
                     fallback_api_key=cfg.llm_api_key_fallback,
                     fallback_model=cfg.llm_model_fallback)
+    bg_claude_probe: asyncio.Task | None = None
     if cfg.llm_base_url_fallback:
         log.info("LLM 备用通道: %s（主通道连续 3 次网络/5xx 失败自动切换）",
                  cfg.llm_base_url_fallback)
@@ -122,9 +170,45 @@ async def _amain() -> int:
             log.error("LLM 连通失败（托管模式是否已走 .tsecbench.gw 网关？）: %s", e)
             return 4
         if cfg.simple_mode:
-            # 极简模式：跳过 claude worker（直接 LLM 直连全 flash），不依赖 ClawGod/Anthropic 通道
+            # 极简模式主循环走 flash 裸 LLM；hard/pwn/多 flag 题由 SimpleScheduler
+            # 判断切不切 claude harness（cfg.harness_enabled 是它的开关）。主架构
+            # claude_worker 仍不用，但要做 claude 可用性自检：ClawGod 缺失/Anthropic
+            # 通道不通时 harness_enabled 置 False，SimpleScheduler 退化全 flash
+            # （绝不带着坏 claude 空转，run 9030 教训）。
+            # 自检后台化（≤4min）：easy 题全走 flash 不依赖 claude，队列 easy 优先
+            # 意味着 claude 题排在队尾——探测后台跑，探测完成即翻 harness_enabled
+            # （派发时实时读），省掉开场的死区时间。
             cfg.claude_worker = False
             cfg.harness_enabled = False
+            if cfg.harness_backend == "claude":
+                import shutil
+                if not shutil.which("claude"):
+                    log.error("claude 二进制不存在（ClawGod 安装失败？），"
+                              "极简模式 hard/pwn/多 flag 题退化全 flash")
+                else:
+                    if not cfg.llm_model_hard:
+                        log.warning("LLM_MODEL_HARD 未设置：claude 攻坚会话将全程使用 %s 单模型。"
+                                    "建议配置更强模型（如 deepseek-v4-pro），否则 claude 与 flash 差距有限。",
+                                    cfg.llm_model)
+
+                    async def _bg_claude_probe():
+                        code, detail = await _probe_anthropic_channel(cfg)
+                        if not (200 <= code < 300):
+                            log.error("claude 通道自检失败（HTTP %s），极简模式退化全 flash", code)
+                            return
+                        if not await _smoke_claude(cfg):
+                            log.error("claude 冒烟失败（launcher/bun/patched CLI 链路断裂），"
+                                      "极简模式退化全 flash")
+                            return
+                        cfg.harness_enabled = True
+                        log.info("claude harness 通道就绪：hard/pwn/多 flag 题走 claude 攻坚")
+                        # effort 探测不可跳过：极简模式的 claude 会话同样带 --effort，
+                        # 网关不支持时全部攻坚会话秒败 ×2 attempts 判死（12464 同类教训）
+                        if cfg.claude_hard_effort:
+                            await _probe_effort(cfg)
+
+                    bg_claude_probe = asyncio.create_task(_bg_claude_probe())
+                    log.info("claude 通道自检后台进行中（≤4min）；easy flash 题立即开跑不等它")
         if cfg.claude_worker:
             # 多模型分工未配置时提示（run 10282 复盘：pro 全程只被调用 1 次——
             # hard 题全靠 flash 单模型，与榜首 2-4 模型分工差距的直接原因）
@@ -158,48 +242,10 @@ async def _amain() -> int:
                 cfg.claude_worker = False
                 cfg.harness_enabled = False
             if cfg.claude_worker and cfg.claude_hard_effort:
-                # effort 探测（run 12464 复盘：探测超时被当失败降级→全轮 pro reasoning=0，
-                # 只买到知识没买到思考预算）。三分支判定：
-                # - rc==0 → OK；- stderr 明确报 unknown/unrecognized/effort → 真不支持，降级；
-                # - 超时/其他错误 → 网关慢，保留 effort（claude 对不支持的能力参数会秒退报错，
-                #   不会挂着超时——超时恰恰说明参数被接受了、只是推理慢）。
-                from .harness import _claude_env
-                probe_model = cfg.llm_model_hard or cfg.llm_model
-                stderr_tail = b""
-                timed_out = False
-                try:
-                    proc = await asyncio.create_subprocess_exec(
-                        "claude", "-p", "回复 OK", "--effort", cfg.claude_hard_effort,
-                        "--model", probe_model,
-                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
-                        env=_claude_env(cfg, probe_model))
-                    try:
-                        _, stderr_tail = await asyncio.wait_for(proc.communicate(), timeout=90)
-                        rc = proc.returncode
-                    except asyncio.TimeoutError:
-                        timed_out = True
-                        rc = -1
-                        with contextlib.suppress(ProcessLookupError, OSError):
-                            proc.kill()
-                except Exception as e:
-                    rc = -1
-                    log.warning("effort 探测异常: %s", e)
-                low = (stderr_tail or b"").lower()[:300]
-                if rc == 0:
-                    log.info("claude --effort %s 探测 OK（模型 %s）：全量会话（flash/pro）均带 effort",
-                             cfg.claude_hard_effort, probe_model)
-                elif timed_out:
-                    log.warning("claude --effort %s 探测超时（90s，模型 %s）：按网关慢处理，"
-                                "保留 effort 不降级（12464 教训：超时≠不支持）",
-                                cfg.claude_hard_effort, probe_model)
-                elif any(k in low for k in (b"effort", b"unknown", b"unrecognized", b"invalid")):
-                    log.warning("claude --effort %s 探测失败 rc=%s（stderr: %s）：真不支持，降级为无 effort",
-                                cfg.claude_hard_effort, rc, low[:120])
-                    cfg.claude_hard_effort = ""
-                else:
-                    log.warning("claude --effort %s 探测失败 rc=%s（stderr: %s）：非参数错误，保留 effort",
-                                cfg.claude_hard_effort, rc, low[:120] or "(空)")
+                await _probe_effort(cfg)
         if cfg.dry_run or "--dry-run" in sys.argv:
+            if bg_claude_probe is not None:
+                await bg_claude_probe   # dry-run 等后台自检出完整结果再退出
             log.info("dry-run 完成，退出。")
             return 0
 
@@ -211,6 +257,12 @@ async def _amain() -> int:
         await sched.run()
         return 0
     finally:
+        if bg_claude_probe is not None and not bg_claude_probe.done():
+            bg_claude_probe.cancel()
+            try:
+                await bg_claude_probe
+            except (asyncio.CancelledError, Exception):
+                pass
         await api.close()
         await llm.close()
 

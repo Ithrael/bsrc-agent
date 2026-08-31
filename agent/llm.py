@@ -11,11 +11,19 @@ import asyncio
 import json
 import logging
 import os
+import time
 from urllib.parse import urlparse, urlunparse
 
 import httpx
 
 log = logging.getLogger("llm")
+
+# 1 次 + 最多再试 2 次；单次等待 ≤5s。旧值 6 次 × min(60, 2^n*3) ≈ 153s 退避，
+# 再加 300s 超时，一次 429 就能把 120s Execute 打成 0 轮 bash。
+_MAX_ATTEMPTS = 3
+_RETRY_WAIT_CAP_S = 5.0
+# 2 连败切备用，留给第 3 次走新通道（总共只有 3 次尝试）
+_SWITCH_AFTER = 2
 
 
 def rewrite_gateway_url(base_url: str) -> str:
@@ -54,7 +62,7 @@ def anthropic_gateway_url(base_url: str) -> str:
 
 
 class LLMClient:
-    """OpenAI 兼容客户端，支持双通道 fallback（方案4）：主网关连续 3 次网络/5xx
+    """OpenAI 兼容客户端，支持双通道 fallback（方案4）：主网关连续 2 次网络/5xx
     失败自动切备用网关（LLM_BASE_URL_FALLBACK），备用连续 5 次成功切回主。
     claude 通道已有「降级裸 LLM」保险，这里补上裸循环自身的最后一块：主网关
     抖动期间解题/蒸馏/advisor 不停摆。400/401 不触发切换（请求本身的问题，
@@ -111,11 +119,23 @@ class LLMClient:
         if self._fallback_client is not None:
             await self._fallback_client.aclose()
 
+    def _retry_wait(self, attempt: int, deadline: float | None) -> float | None:
+        """退避秒数；None = 预算耗尽，停止重试。"""
+        wait = min(_RETRY_WAIT_CAP_S, 2 ** attempt * 3)
+        if deadline is not None:
+            remain = deadline - time.monotonic()
+            if remain <= 0.05:
+                return None
+            wait = min(wait, remain)
+        return wait
+
     async def chat(self, messages: list[dict], tools: list[dict] | None = None,
-                   max_tokens: int | None = None, model: str = "") -> dict:
+                   max_tokens: int | None = None, model: str = "",
+                   timeout_s: float | None = None) -> dict:
         """返回 message dict：{role, content, tool_calls?}。失败重试后仍抛异常由上层兜底。
         max_tokens 覆盖全局默认（reason 决策等纯 JSON 输出场景收紧输出上限）。
-        model 覆盖本次调用的模型（advisor brief 用强模型单次调用，不动全局默认）。"""
+        model 覆盖本次调用的模型（advisor brief 用强模型单次调用，不动全局默认）。
+        timeout_s：本次调用（含重试）墙钟预算；None 用客户端默认超时。"""
         payload: dict = {
             "model": model or self.model,
             "messages": messages,
@@ -127,11 +147,19 @@ class LLMClient:
             payload["tool_choice"] = "auto"
         body: dict = {}
         last_exc: Exception | None = None
-        for attempt in range(6):
+        deadline = (time.monotonic() + timeout_s) if timeout_s is not None else None
+        got = False
+        for attempt in range(_MAX_ATTEMPTS):
+            remain = (deadline - time.monotonic()) if deadline is not None else None
+            if remain is not None and remain <= 0:
+                break
             client, chan_model = self._cur()
+            post_kw: dict = {}
+            if remain is not None:
+                post_kw["timeout"] = remain
             try:
                 r = await client.post("/chat/completions", json={
-                    **payload, "model": model or chan_model})
+                    **payload, "model": model or chan_model}, **post_kw)
                 if r.status_code == 400:
                     # 请求非法（上下文超长/结构错误）：重试无意义，带响应体快速失败
                     raise RuntimeError(f"LLM 400: {r.text[:300]}")
@@ -140,25 +168,35 @@ class LLMClient:
                 if r.status_code in (429, 500, 502, 503, 504):
                     last_exc = RuntimeError(f"LLM {r.status_code}")
                     self._note_channel_failure()
-                    wait = min(60, 2 ** attempt * 3)
-                    log.warning("LLM %s, %.1fs 后重试 (%d/6)", r.status_code, wait, attempt + 1)
+                    wait = self._retry_wait(attempt, deadline)
+                    log.warning("LLM %s, %.1fs 后重试 (%d/%d)", r.status_code,
+                                wait or 0, attempt + 1, _MAX_ATTEMPTS)
+                    if wait is None or attempt >= _MAX_ATTEMPTS - 1:
+                        break
                     await asyncio.sleep(wait)
                     continue
                 r.raise_for_status()
                 body = r.json()
+                got = True
                 break
             except (httpx.TransportError, httpx.TimeoutException) as e:
                 last_exc = e
                 self._note_channel_failure()
-                wait = min(60, 2 ** attempt * 3)
-                log.warning("LLM 调用异常 %s, %.1fs 后重试 (%d/6)", e, wait, attempt + 1)
+                wait = self._retry_wait(attempt, deadline)
+                log.warning("LLM 调用异常 %s, %.1fs 后重试 (%d/%d)", e,
+                            wait or 0, attempt + 1, _MAX_ATTEMPTS)
+                if wait is None or attempt >= _MAX_ATTEMPTS - 1:
+                    break
                 await asyncio.sleep(wait)
             except httpx.HTTPStatusError as e:
                 last_exc = e
-                wait = min(60, 2 ** attempt * 3)
-                log.warning("LLM 调用异常 %s, %.1fs 后重试 (%d/6)", e, wait, attempt + 1)
+                wait = self._retry_wait(attempt, deadline)
+                log.warning("LLM 调用异常 %s, %.1fs 后重试 (%d/%d)", e,
+                            wait or 0, attempt + 1, _MAX_ATTEMPTS)
+                if wait is None or attempt >= _MAX_ATTEMPTS - 1:
+                    break
                 await asyncio.sleep(wait)
-        else:
+        if not got:
             raise RuntimeError(f"LLM 调用连续失败: {last_exc}")
 
         self._note_channel_success()
@@ -180,10 +218,10 @@ class LLMClient:
         }
 
     def _note_channel_failure(self):
-        """网络/5xx 失败计数：连续 3 次且备用可用 → 切备用。"""
+        """网络/5xx 失败计数：连续 2 次且备用可用 → 切备用。"""
         self._fallback_ok_streak = 0
         self._fail_streak += 1
-        if (self._fail_streak >= 3 and self._active == "main"
+        if (self._fail_streak >= _SWITCH_AFTER and self._active == "main"
                 and self._fallback_client is not None):
             self._switch("fallback")
 

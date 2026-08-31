@@ -8,3 +8,10 @@ __pycache__/
 *.pyc
 .venv/
 *.tar.gz
+# 合规红线：跨轮方案/情报绝不进镜像（平台可举报恶意刷分）；仅单次 run 内记录与复用
+solutions.json
+notes.json
+intel.json
+solutions.json.new
+notes.json.new
+intel.json.new
